@@ -1,12 +1,15 @@
 mod content;
 mod datastore;
+mod error;
 mod manifest;
 mod registry;
 use datastore::Datastore;
+use error::AppError;
 use manifest::ApplicationManifest;
 use registry::ChangeRegistry;
 
 pub mod prelude {
+    pub use crate::error::AppError;
     pub use crate::manifest::ApplicationManifest;
     pub use crate::Application;
     pub use gnome::prelude::*;
