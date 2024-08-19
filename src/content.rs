@@ -16,6 +16,60 @@ pub enum Content {
 }
 
 impl Content {
+    pub fn read_data(&self, data_id: u16) -> Result<Data, AppError> {
+        match self {
+            Self::Link(g_id, s_name, c_id) => {
+                if data_id == 0 {
+                    Ok(link_to_data(*g_id, s_name.clone(), *c_id))
+                } else {
+                    Err(AppError::IndexingError)
+                }
+            }
+            Self::Data(_type, c_tree) => {
+                if data_id == 0 {
+                    c_tree.read(data_id)
+                } else {
+                    Err(AppError::IndexingError)
+                }
+            }
+        }
+    }
+    pub fn update(&mut self, data_id: u16, data: Data) -> Result<Data, AppError> {
+        let myself = std::mem::replace(self, Content::Data(0, ContentTree::Empty(0)));
+        match myself {
+            Self::Link(g_id, s_name, c_id) => {
+                if data_id != 0 {
+                    *self = Self::Link(g_id, s_name, c_id);
+                    Err(AppError::IndexingError)
+                } else {
+                    let link_result = data_to_link(data);
+                    if let Ok(link) = link_result {
+                        *self = link;
+                        Ok(link_to_data(g_id, s_name, c_id))
+                    } else {
+                        *self = Self::Link(g_id, s_name, c_id);
+                        Err(link_result.err().unwrap())
+                    }
+                }
+            }
+            Self::Data(d_type, mut c_tree) => {
+                let result = c_tree.replace(data_id, data);
+                *self = Self::Data(d_type, c_tree);
+                if let Ok((old_data, _hash)) = result {
+                    Ok(old_data)
+                } else {
+                    Err(result.err().unwrap())
+                }
+            }
+        }
+    }
+
+    pub fn shell(&self) -> Self {
+        match self {
+            Self::Link(g_id, s_name, c_id) => Self::Link(*g_id, s_name.clone(), *c_id),
+            Self::Data(d_type, c_tree) => Self::Data(*d_type, c_tree.shell()),
+        }
+    }
     pub fn hash(&self) -> u64 {
         match self {
             Self::Link(g_id, string, c_id) => {
@@ -36,6 +90,65 @@ impl Content {
             Self::Data(_type, tree) => tree.hash(),
         }
     }
+    pub fn bottom_hashes(&self) -> Vec<u64> {
+        let mut v = vec![];
+        for d_id in 0..u16::MAX {
+            if let Ok(hash) = self.get_data_hash(d_id) {
+                v.push(hash)
+            } else {
+                break;
+            }
+        }
+        v
+    }
+    fn get_data_hash(&self, d_id: u16) -> Result<u64, ()> {
+        match self {
+            Self::Link(_g, _s, _c) => {
+                if d_id == 0 {
+                    Ok(link_to_data(*_g, _s.clone(), *_c).hash())
+                } else {
+                    Err(())
+                }
+            }
+            Self::Data(_type, c_tree) => c_tree.get_data_hash(d_id),
+        }
+    }
+}
+
+fn data_to_link(data: Data) -> Result<Content, AppError> {
+    let mut bytes = data.bytes();
+    let len = bytes.len();
+    if len < 11 {
+        return Err(AppError::Smthg);
+    }
+    let first_eight = [
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ];
+    let next_two = [bytes[8], bytes[9]];
+
+    let _ = bytes.iter_mut().skip(10);
+    let g_id = GnomeId::from(first_eight);
+    let s_res = String::from_utf8(bytes);
+    if s_res.is_err() {
+        return Err(AppError::Smthg);
+    }
+    let s_name = s_res.unwrap();
+    let c_id = u16::from_be_bytes(next_two);
+    Ok(Content::Link(g_id, s_name, c_id))
+}
+
+fn link_to_data(g_id: GnomeId, s_name: String, c_id: ContentID) -> Data {
+    let mut v = vec![];
+    for b in g_id.bytes() {
+        v.push(b);
+    }
+    for b in c_id.to_be_bytes() {
+        v.push(b);
+    }
+    for b in s_name.into_bytes() {
+        v.push(b);
+    }
+    Data::new(v).unwrap()
 }
 
 // ContentTree should be a Binary Tree with Leafs containing up to
@@ -88,11 +201,37 @@ impl ContentTree {
         }
     }
 
+    pub fn shell(&self) -> Self {
+        match self {
+            Self::Empty(hash) => Self::Empty(*hash),
+            Self::Filled(data) => Self::Empty(data.hash()),
+            Self::Hashed(sub_tree) => Self::Empty(sub_tree.hash),
+        }
+    }
     pub fn hash(&self) -> u64 {
         match self {
             Self::Empty(hash) => *hash,
             Self::Filled(data) => data.hash(),
             Self::Hashed(sub_tree) => sub_tree.hash,
+        }
+    }
+    pub fn get_data_hash(&self, data_id: u16) -> Result<u64, ()> {
+        match self {
+            Self::Empty(hash) => {
+                if data_id == 0 {
+                    Ok(*hash)
+                } else {
+                    Err(())
+                }
+            }
+            Self::Filled(data) => {
+                if data_id == 0 {
+                    Ok(data.hash())
+                } else {
+                    Err(())
+                }
+            }
+            Self::Hashed(sub_tree) => sub_tree.get_data_hash(data_id),
         }
     }
 
@@ -363,6 +502,18 @@ impl Subtree {
         [self.left.hash(), self.right.hash()].hash(&mut hasher);
         self.hash = hasher.finish();
         self.hash
+    }
+    pub fn get_data_hash(&self, idx: u16) -> Result<u64, ()> {
+        if idx >= self.data_count {
+            Err(())
+        } else {
+            let left_count = self.left.len();
+            if idx >= left_count {
+                self.right.get_data_hash(idx - left_count)
+            } else {
+                self.left.get_data_hash(idx)
+            }
+        }
     }
     pub fn read(&self, idx: u16) -> Result<Data, AppError> {
         if idx >= self.data_count {
