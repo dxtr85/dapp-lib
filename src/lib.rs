@@ -3,12 +3,15 @@ mod datastore;
 mod error;
 mod manifest;
 mod registry;
+use content::{Content, ContentID};
 use datastore::Datastore;
 use error::AppError;
+use gnome::prelude::Data;
 use manifest::ApplicationManifest;
 use registry::ChangeRegistry;
 
 pub mod prelude {
+    pub use crate::content::{Content, ContentID, ContentTree};
     pub use crate::error::AppError;
     pub use crate::manifest::ApplicationManifest;
     pub use crate::Application;
@@ -21,12 +24,46 @@ pub struct Application {
 }
 
 impl Application {
+    pub fn empty() -> Self {
+        Application {
+            change_reg: ChangeRegistry::new(),
+            contents: Datastore::Empty,
+        }
+    }
     pub fn new(manifest: ApplicationManifest) -> Self {
         Application {
             change_reg: ChangeRegistry::new(),
             contents: Datastore::new(manifest),
         }
     }
+    pub fn root_hash(&self) -> u64 {
+        self.contents.hash()
+    }
+    pub fn registry(&self) -> Vec<ContentID> {
+        self.change_reg.read()
+    }
+
+    pub fn datastore_bottom_hashes(&self) -> Vec<u64> {
+        self.contents.bottom_hashes()
+    }
+    pub fn append(&mut self, content: Content) -> Result<u64, AppError> {
+        self.contents.append(content)
+    }
+    pub fn update(&mut self, c_id: ContentID, content: Content) -> Result<Content, AppError> {
+        self.contents.update(c_id, content)
+    }
+    pub fn get_all_data(&self, c_id: ContentID) -> Result<Vec<Data>, AppError> {
+        let mut data_vec = vec![];
+        for i in 0..u16::MAX {
+            if let Ok(data) = self.contents.read_data((c_id, i)) {
+                data_vec.push(data);
+            } else {
+                break;
+            }
+        }
+        Ok(data_vec)
+    }
+
     // TODO: design application level interface
 }
 

@@ -3,7 +3,6 @@ use crate::content::double_hash;
 use super::content::Content;
 use super::content::ContentID;
 use super::content::ContentTree;
-use super::manifest::manifest_to_data;
 use super::manifest::ApplicationManifest;
 use super::prelude::AppError;
 use gnome::prelude::Data;
@@ -20,9 +19,7 @@ pub enum Datastore {
 impl Datastore {
     pub fn new(manifest: ApplicationManifest) -> Datastore {
         let mut content_tree = ContentTree::empty(0);
-        for data in manifest_to_data(manifest) {
-            let _ = content_tree.append(data);
-        }
+        let _ = content_tree.append(manifest.to_data(None));
         let content = Content::Data(0, content_tree);
         Datastore::Filled(content)
     }
@@ -150,11 +147,7 @@ impl Datastore {
         }
     }
 
-    // TODO: this fn should return a Vec<u64> of all of Datastore's
-    // non-bottom layer hashes from top to almost bottom, left to right.
-    pub fn hashes(&self) {}
-
-    // TODO: this fn should return a Vec<u64> of all of Datastore's
+    // This fn should return a Vec<u64> of all of Datastore's
     // bottom layer hashes from left to right.
     // Those are also called Content root hashes.
     pub fn bottom_hashes(&self) -> Vec<u64> {
@@ -169,11 +162,15 @@ impl Datastore {
         v
     }
 
+    // TODO: this fn should return a Vec<u64> of all of Datastore's
+    // non-bottom layer hashes from top to almost bottom, left to right.
+    pub fn hashes(&self) {}
+
     // TODO: this fn should return a Vec<u64> of all of given CID's hashes
     // So only non-bottom layer hashes.
     pub fn content_hashes(&self, c_id: ContentID) {}
 
-    // TODO: this fn should return a Vec<u64> of all of given CID's data hashes
+    // This fn should return a Vec<u64> of all of given CID's data hashes
     // So only bottom layer hashes (Data hashes).
     pub fn content_bottom_hashes(&self, c_id: ContentID) -> Result<Vec<u64>, AppError> {
         match self {
