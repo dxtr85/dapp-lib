@@ -37,14 +37,14 @@ impl Application {
         }
     }
     pub fn root_hash(&self) -> u64 {
-        self.contents.hash()
+        self.contents.get_hash()
     }
     pub fn registry(&self) -> Vec<ContentID> {
         self.change_reg.read()
     }
 
-    pub fn datastore_bottom_hashes(&self) -> Vec<u64> {
-        self.contents.bottom_hashes()
+    pub fn all_content_root_hashes(&self) -> Vec<u64> {
+        self.contents.all_root_hashes()
     }
     pub fn append(&mut self, content: Content) -> Result<u64, AppError> {
         self.contents.append(content)

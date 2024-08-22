@@ -34,7 +34,10 @@ impl Content {
             }
         }
     }
-    pub fn update(&mut self, data_id: u16, data: Data) -> Result<Data, AppError> {
+    pub fn update(&mut self, content: Content) -> Content {
+        std::mem::replace(self, content)
+    }
+    pub fn update_data(&mut self, data_id: u16, data: Data) -> Result<Data, AppError> {
         let myself = std::mem::replace(self, Content::Data(0, ContentTree::Empty(0)));
         match myself {
             Self::Link(g_id, s_name, c_id) => {
@@ -90,7 +93,7 @@ impl Content {
             Self::Data(_type, tree) => tree.hash(),
         }
     }
-    pub fn bottom_hashes(&self) -> Vec<u64> {
+    pub fn data_hashes(&self) -> Vec<u64> {
         let mut v = vec![];
         for d_id in 0..u16::MAX {
             if let Ok(hash) = self.get_data_hash(d_id) {
