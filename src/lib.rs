@@ -80,8 +80,7 @@ impl Application {
 
 // Content within Datastore can be identified with ContentID.
 // First ContentID=0 should always define the ApplicationManifest
-// in a form of HashMap<u8,String(max len 63bytes)>.
-// TODO: in a form of HashMap<u8,Vec<u8: max 63 bytes>> - more general.
+// in a form of HashMap<u8,Vec<u8: max 63 bytes>>.
 
 // Once given ContentID is assigned with some specific Content constructor,
 // other than a Link, no other type of constructor can be assigned to given CID.
@@ -97,8 +96,7 @@ impl Application {
 // and set your preferred phrases to those you just created in your Data app.
 // This way users can customize apps in any way they wish.
 
-// Datastore is a binary tree storing in it's leafs references to content trees.
-// Non-leaf nodes contain hash of both it's left and right children.
+// Datastore is a binary tree storing in it's nodes references to content trees.
 // This is in order to enable fast synchronization of data between gnomes.
 // First you only exchange (CID,Hash) pairs with neighbors and when you see
 // they are different, you sync them to match with the swarm's.
@@ -178,8 +176,53 @@ impl Application {
 // CIDs, keeping less important CIDs either in Phantom mode or entirely bodyless,
 // or something in between.
 
-// In worst case scenario a single Swarm can contain up to 4Tibibytes of Data,
-// so immediate complete syncing would take forever.
+// If we decide not to download any Content only it's root hashes this will take up to
+// 65536 * 8 bytes, half a Mibibyte.
+
+// If we decide to store all the hashes and none of the Data then it will take up to
+// 65536 CIDs * 65536 data hashes * 8 bytes per hash = 32Gibibytes of data hashes,
+// and twice that much when we also count non-data hashes.
+
+// If we decide to store all Data of all Contents then it would take up to
+// 65536 CID * 65536 Data slots * 1024 bytes = 4 Tibibytes.
+
+// So it is clear that an average gnome will only store content root hashes,
+// downloading only Data chunks when necessary to provide application's functionality.
+// This requires that all messages that Gnomes are sending have to include
+// final root hashes of all Contents that given message will influence.
+// Also all the starting root hashes of Contents that are required for
+// given message to be processed by the application.
+// This way all the gnomes will always stay synced with each other.
+// Application logic will take accepted message and verify all the starting
+// root hashes declared in given message, if they are not matching, message is
+// discarded, and this event may be logged, if application supports logging.
+// If a message uses some Content, but it was not declared in starting root hashes,
+// it is also discarded.
+// After above requirements are met we can evaluate given message.
+// When evaluating application produces (CID, final hash) pairs of all the Contents
+// that will be affected by given message. Only if pairs provided by evaluator
+// are matching those contained in message by both their numbers and values given
+// message is applied to Datastore.
+// Now all provided CIDs root hashes are updated.
+// All messages are signed and authorized against defined Requirements, so it is
+// not possible for a random Gnome to mess up applications Datastore.
+
+// It is very easy to detect when someone with Capabilities is trying to
+// misbehave by any gnome that contains all required Contents and has the
+// Proof of wrongdoing.
+
+// There are two validation layers:
+// - first one only verifies that starting root-hashes of CID match those in
+//   Datastore, and application logic does not require any additional CIDs to work,
+// - second one can only be used by Gnomes containing all necessary Content Data
+//   and in addition to first validation runs application layer validation.
+
+// The Proof consists of a Data (or multiples of Data) that contains information,
+// that can be used by application's validate function to show that given message
+// should be discarded. Now every gnome can validate that given data is indeed in
+// Datastore, and can run the required validation on it's own.
+// Once given message is proven to be invalid it gets reverted and Gnome is being
+// Suspended.
 
 // When syncing, all content should be stored in byte chunks of up to 1024 bytes each.
 // Those chunks should be stored in a BHTree containing as many Leafs as needed to store
