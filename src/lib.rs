@@ -2,18 +2,25 @@ mod content;
 mod datastore;
 mod error;
 mod manifest;
+mod message;
 mod registry;
+use std::collections::HashMap;
+
 use content::{Content, ContentID};
 use datastore::Datastore;
 use error::AppError;
 use gnome::prelude::Data;
 use manifest::ApplicationManifest;
+use message::SyncMessage;
 use registry::ChangeRegistry;
 
 pub mod prelude {
     pub use crate::content::{Content, ContentID, ContentTree};
     pub use crate::error::AppError;
     pub use crate::manifest::ApplicationManifest;
+    pub use crate::message::SyncMessage;
+    pub use crate::message::SyncMessageType;
+    pub use crate::message::SyncRequirements;
     pub use crate::Application;
     pub use gnome::prelude::*;
 }
@@ -21,6 +28,8 @@ pub mod prelude {
 pub struct Application {
     change_reg: ChangeRegistry,
     contents: Datastore,
+    hash_to_temp_idx: HashMap<u64, u16>,
+    partial_data: HashMap<u16, (Vec<u64>, HashMap<u64, Data>)>,
 }
 
 impl Application {
@@ -28,16 +37,94 @@ impl Application {
         Application {
             change_reg: ChangeRegistry::new(),
             contents: Datastore::Empty,
+            hash_to_temp_idx: HashMap::new(),
+            partial_data: HashMap::new(),
         }
     }
     pub fn new(manifest: ApplicationManifest) -> Self {
         Application {
             change_reg: ChangeRegistry::new(),
             contents: Datastore::new(manifest),
+            hash_to_temp_idx: HashMap::new(),
+            partial_data: HashMap::new(),
         }
     }
+
+    pub fn next_c_id(&self) -> Option<ContentID> {
+        let next_id = self.contents.len();
+        if next_id < u16::MAX {
+            Some(next_id)
+        } else {
+            None
+        }
+    }
+
+    pub fn process(&mut self, data: Data) -> Option<SyncMessage> {
+        let mut bytes_iter = data.ref_bytes().iter();
+        bytes_iter.next();
+        let second = bytes_iter.next().unwrap();
+        let third = bytes_iter.next().unwrap();
+        // println!("[{}/{}]", second, third);
+        if *second == 0 {
+            if *third == 0 {
+                let mut hm = HashMap::new();
+                hm.insert(0, data);
+                Some(SyncMessage::from_data(vec![0], hm).unwrap())
+            } else {
+                let mut next_idx = 0;
+                for i in 0..=u16::MAX {
+                    if !self.partial_data.contains_key(&i) {
+                        next_idx = i;
+                        break;
+                    }
+                }
+                let mut all_hashes = Vec::with_capacity((*third as usize) + 1);
+                all_hashes.push(0);
+                for _i in 0..*third {
+                    let mut hash: [u8; 8] = [0; 8];
+                    for j in 0..8 {
+                        hash[j] = *bytes_iter.next().unwrap();
+                    }
+                    let hash = u64::from_be_bytes(hash);
+                    // println!("Expecting hash: {}", hash);
+                    all_hashes.push(hash);
+                    self.hash_to_temp_idx.insert(hash, next_idx);
+                }
+                drop(bytes_iter);
+                let mut new_hm = HashMap::new();
+                new_hm.insert(0, data);
+                self.partial_data.insert(next_idx, (all_hashes, new_hm));
+                None
+            }
+        } else {
+            // Second byte is non zero, so we received a non-head partial Data
+            let hash = data.hash();
+            // println!("Got hash: {}", hash);
+            if let Some(temp_idx) = self.hash_to_temp_idx.get(&hash) {
+                // println!("Oh yeah");
+                if let Some((vec, mut hm)) = self.partial_data.remove(&temp_idx) {
+                    hm.insert(hash, data);
+                    // println!("{} ==? {}", vec.len(), hm.len());
+                    if vec.len() == hm.len() {
+                        Some(SyncMessage::from_data(vec, hm).unwrap())
+                    } else {
+                        self.partial_data.insert(*temp_idx, (vec, hm));
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+    }
+
     pub fn root_hash(&self) -> u64 {
         self.contents.get_hash()
+    }
+    pub fn content_root_hash(&self, c_id: ContentID) -> Result<u64, ()> {
+        self.contents.get_root_content_hash(c_id)
     }
     pub fn registry(&self) -> Vec<ContentID> {
         self.change_reg.read()
@@ -47,7 +134,11 @@ impl Application {
         self.contents.all_root_hashes()
     }
     pub fn append(&mut self, content: Content) -> Result<u64, AppError> {
-        self.contents.append(content)
+        let index_to_add = self.contents.len();
+        if index_to_add == u16::MAX {
+            return Err(AppError::DatastoreFull);
+        }
+        self.contents.append(index_to_add, content)
     }
     pub fn update(&mut self, c_id: ContentID, content: Content) -> Result<Content, AppError> {
         self.contents.update(c_id, content)
@@ -268,7 +359,7 @@ impl Application {
 // yeah, tests... ... ...
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // use super::*;
 
     #[test]
     fn it_works() {

@@ -10,12 +10,41 @@ pub type DataType = u8;
 
 #[derive(Debug)]
 pub enum Content {
-    // TODO: Link should also contain a non-hashed description
+    // TODO: Link could also contain a non-hashed description
     Link(GnomeId, String, ContentID),
     Data(DataType, ContentTree),
 }
 
 impl Content {
+    pub fn from(data: Data) -> Result<Self, ()> {
+        let mut bytes_iter = data.bytes().into_iter();
+        match bytes_iter.next() {
+            None => return Err(()),
+            Some(255) => {
+                // first 8 bytes is GnomeId
+                let b1 = bytes_iter.next().unwrap();
+                let b2 = bytes_iter.next().unwrap();
+                let b3 = bytes_iter.next().unwrap();
+                let b4 = bytes_iter.next().unwrap();
+                let b5 = bytes_iter.next().unwrap();
+                let b6 = bytes_iter.next().unwrap();
+                let b7 = bytes_iter.next().unwrap();
+                let b8 = bytes_iter.next().unwrap();
+                let g_id = GnomeId(u64::from_be_bytes([b1, b2, b3, b4, b5, b6, b7, b8]));
+                // next 2 bytes is ContentID
+                let b1 = bytes_iter.next().unwrap();
+                let b2 = bytes_iter.next().unwrap();
+                let c_id = u16::from_be_bytes([b1, b2]);
+                // for now, remaining bytes is SwarmName
+                let swarm_name: String = String::from_utf8(bytes_iter.collect()).unwrap();
+                Ok(Content::Link(g_id, swarm_name, c_id))
+            }
+            Some(other) => {
+                let tree = ContentTree::new(Data::new(bytes_iter.collect()).unwrap());
+                Ok(Content::Data(other, tree))
+            }
+        }
+    }
     pub fn read_data(&self, data_id: u16) -> Result<Data, AppError> {
         match self {
             Self::Link(g_id, s_name, c_id) => {
@@ -186,6 +215,14 @@ pub struct Subtree {
 impl ContentTree {
     pub fn new(data: Data) -> Self {
         ContentTree::Filled(data)
+    }
+
+    pub fn from(data_vec: Vec<Data>) -> Self {
+        let mut tree = ContentTree::empty(0);
+        for data in data_vec {
+            tree.append(data);
+        }
+        tree
     }
 
     pub fn empty(hash: u64) -> Self {

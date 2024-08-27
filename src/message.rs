@@ -1,0 +1,385 @@
+use std::collections::HashMap;
+
+use gnome::prelude::Data;
+
+use crate::content::ContentID;
+use crate::Application;
+
+pub struct SyncRequirements {
+    pub pre: Vec<(ContentID, u64)>,
+    pub post: Vec<(ContentID, u64)>,
+}
+
+impl SyncRequirements {
+    pub fn bytes(self) -> Vec<u8> {
+        let mut bytes = vec![];
+        //TODO: make sure we only have up to 256 pre & 256 post reqs
+        bytes.push(self.pre.len() as u8);
+        for (c_id, hash) in self.pre {
+            let [c_one, c_two] = c_id.to_be_bytes();
+            bytes.push(c_one);
+            bytes.push(c_two);
+            for byte in hash.to_be_bytes() {
+                bytes.push(byte);
+            }
+        }
+        bytes.push(self.post.len() as u8);
+        for (c_id, hash) in self.post {
+            let [c_one, c_two] = c_id.to_be_bytes();
+            bytes.push(c_one);
+            bytes.push(c_two);
+            for byte in hash.to_be_bytes() {
+                bytes.push(byte);
+            }
+        }
+        bytes
+    }
+
+    // TODO: we need to add a read: Vec<Content_ID> argument
+    // to verify that only specified contents were read
+    // and that all specified contents were read
+    pub fn pre_validate(&self, app: &Application) -> bool {
+        for (c_id, hash) in self.pre.iter() {
+            if let Ok(d_hash) = app.content_root_hash(*c_id) {
+                if d_hash != *hash {
+                    println!("Stored  hash: {},\nmessage hash: {}", d_hash, hash);
+                    return false;
+                }
+            } else if *hash != 0 {
+                println!("Datastore has no CID: {}, hash: {}", c_id, hash);
+                return false;
+            }
+        }
+        true
+    }
+
+    // TODO: we need to add a changed: Vec<Content_ID> argument
+    // to verify that only specified contents were changed
+    // and that all specified contents were changed
+    pub fn post_validate(&self, app: &Application) -> bool {
+        for (c_id, hash) in self.post.iter() {
+            if let Ok(d_hash) = app.content_root_hash(*c_id) {
+                if d_hash != *hash {
+                    println!(
+                        "Stored  hash: {:?},\nmessage hash: {:?}",
+                        d_hash.to_be_bytes(),
+                        hash.to_be_bytes()
+                    );
+                    return false;
+                }
+            } else if *hash != 0 {
+                println!("Datastore has no CID: {}, hash: {}", c_id, hash);
+                return false;
+            }
+        }
+        true
+    }
+}
+// We need a high level way to manipulate Datastore elements.
+// Manipulation can be done at two levels: Content, and specific Data within Content
+// On Content level we can:
+// - Add Content
+// - Change Content (i.e. from Link to Data(x, _) or from Data(y, _d1) to Data(y, _d2))
+
+// All other changes should be done on Data level:
+// - Append Data to Content,
+// - Remove Data from Content,
+// - Update Data,
+// - Insert Data,
+// - Extend Data.
+
+// Update data can internally have multiple Edits like InsertBytesAt, DeleteBytesFrom,
+// ReplaceBytesAt and maybe more. These edits should always stay within one Data chunk.
+// But this is on App developer to implement.
+
+// Those messages can be split into multiple parts so we need to have them numbered
+// and also identify their parts. It is allowed for multiple different Gnomes
+// to post parts of the same message. This is to prevent stalling a Message,
+// when an originating gnome drops out of swarm.
+//
+
+#[derive(Clone, Copy)]
+pub enum SyncMessageType {
+    SetManifest, // Should this be a separate type?
+    AddContent,
+    ChangeContent,
+    AppendData,
+    RemoveData,
+    UpdateData,
+    InsertData,
+    ExtendData,
+    UserDefined(u8),
+}
+impl SyncMessageType {
+    pub fn new(value: u8) -> Self {
+        match value {
+            255 => SyncMessageType::SetManifest,
+            254 => SyncMessageType::AddContent,
+            253 => SyncMessageType::ChangeContent,
+            252 => SyncMessageType::AppendData,
+            251 => SyncMessageType::RemoveData,
+            250 => SyncMessageType::UpdateData,
+            249 => SyncMessageType::InsertData,
+            248 => SyncMessageType::ExtendData,
+            other => SyncMessageType::UserDefined(other),
+        }
+    }
+
+    pub fn as_byte(&self) -> u8 {
+        match self {
+            SyncMessageType::SetManifest => 255,
+            SyncMessageType::AddContent => 254,
+            SyncMessageType::ChangeContent => 253,
+            SyncMessageType::AppendData => 252,
+            SyncMessageType::RemoveData => 251,
+            SyncMessageType::UpdateData => 250,
+            SyncMessageType::InsertData => 249,
+            SyncMessageType::ExtendData => 248,
+            SyncMessageType::UserDefined(other) => *other,
+        }
+    }
+}
+
+pub struct SyncMessage {
+    pub m_type: SyncMessageType,
+    pub requirements: SyncRequirements,
+    pub data: Data,
+    // SetManifest(SyncRequirements, Box<ApplicationManifest>),
+    // AppDefined(Box<Data>),
+}
+
+impl SyncMessage {
+    pub fn new(m_type: SyncMessageType, requirements: SyncRequirements, data: Data) -> Self {
+        SyncMessage {
+            m_type,
+            requirements,
+            data,
+        }
+    }
+
+    pub fn into_parts(self) -> Vec<Data> {
+        //TODO: here we need to determine how many parts will given message consist of
+        // based on Data.len() and requirements size.
+        // We also need to count 10 byte pairs of (c_id, hash) for each
+        // subsequent part in part 0.
+        // First partial message should not exceed 900 bytes total, in order to
+        // carry PUBKEY DER.
+        // Every partial message will consist of
+        // - 1 byte of message type
+        // - 2 bytes of part_no and total_parts
+        let data_size = self.data.len();
+        let req_size = 10 * (self.requirements.pre.len() + self.requirements.post.len());
+        let netto_size = data_size + req_size;
+        let mut partials = vec![];
+        if netto_size < 897 {
+            let mut bytes = Vec::with_capacity(netto_size + 3);
+            bytes.push(self.m_type.as_byte());
+            bytes.push(0);
+            bytes.push(0);
+            bytes.append(&mut self.requirements.bytes());
+            bytes.append(&mut self.data.bytes());
+            let data = Data::new(bytes).unwrap();
+            partials.push(data);
+            // partials.push(PartialMessage { m_type, part_no: 0, total_parts:0, data })
+        } else {
+            let mut non_header_parts = 1;
+            let mut done = false;
+            while !done {
+                let non_header_bytes_consumed = non_header_parts * 1021;
+                if netto_size - non_header_bytes_consumed <= 897 - (8 * non_header_parts) {
+                    done = true;
+                } else {
+                    non_header_parts += 1;
+                }
+            }
+            // First we assume worst case scenario - 7 parts
+            // Maximum size of SyncMessage is:
+            // 1 byte for m_type
+            // + 1 byte for pre req size
+            // + 2560 bytes for pre reqs
+            // + 1 byte for post req size
+            // + 2560 bytes for postreqs
+            // + 1024 bytes for Data
+            // = 6147 bytes
+            // (and we can add those 18 bytes 6165)
+            // (and those 60 bytes 6225)
+            // So there should never be more than 7 parts
+            // We can reserve six 8-byte slots in first part for following parts' hashes
+            // Partial message should only contain type, Data, part_no and total_parts
+            // no other logical structures.
+            // We only assemble SyncMessage from parts and then discover
+            // hashes, Requirements and everything else.
+            let hashes_size = 8 * non_header_parts;
+            let mut header_bytes: Vec<u8> = Vec::with_capacity(900);
+            header_bytes.push(self.m_type.as_byte());
+            header_bytes.push(0);
+            header_bytes.push(non_header_parts as u8);
+            let first_chunk_size = 897 - hashes_size;
+            // later chunks have up to 1021 bytes (3 bytes for type, part_no, total_parts)
+            // First we put hashes (after we calculate them...)
+            // Then we put requirements
+            let mut req_and_data_bytes = self.requirements.bytes();
+            // And at the end we put data_bytes
+            let mut data_bytes = self.data.bytes();
+            req_and_data_bytes.append(&mut data_bytes);
+            let mut first_chunk_bytes: Vec<u8> =
+                req_and_data_bytes.drain(0..first_chunk_size).collect();
+            let mut subsequent_chunks: Vec<Data> = vec![];
+            for i in 0..non_header_parts {
+                let mut vec = vec![self.m_type.as_byte(), (i + 1) as u8, non_header_parts as u8];
+                let bytes_count = req_and_data_bytes.len();
+                let drain_count = if bytes_count >= 1021{
+                    1021
+                }else{
+                    bytes_count
+                };
+                // println!("before drain, rem bytes: {}",req_and_data_bytes.len());
+                vec.append(&mut req_and_data_bytes.drain(0..drain_count).collect());
+                let data = Data::new(vec).unwrap();
+                let hash = data.hash();
+                for byte in hash.to_be_bytes() {
+                    header_bytes.push(byte);
+                }
+                subsequent_chunks.push(data);
+            }
+            header_bytes.append(&mut first_chunk_bytes);
+            partials.push(Data::new(header_bytes).unwrap());
+            partials.append(&mut subsequent_chunks);
+        }
+
+        partials
+    }
+
+    pub fn from_data(idx: Vec<u64>, mut vec_data: HashMap<u64, Data>) -> Result<Self, ()> {
+        let idx_len = idx.len();
+        if idx.len() != vec_data.len() {
+            return Err(());
+        }
+        let mut total_bytes = Vec::with_capacity(idx_len * 1021);
+        let mut idx_iter = idx.into_iter();
+        let key = idx_iter.next().unwrap();
+        let p_data = vec_data.remove(&key).unwrap();
+        let mut header_bytes = p_data.bytes();
+        let m_type = SyncMessageType::new(header_bytes.drain(0..1).next().unwrap());
+        let _ = header_bytes.drain(0..2);
+
+        let mut non_header_bytes = Vec::with_capacity((idx_len - 1) * 1021);
+        for hash in idx_iter {
+            let p_data = vec_data.remove(&hash).unwrap();
+            let mut p_bytes = p_data.bytes();
+            let _ = p_bytes.drain(0..3);
+            let _ = header_bytes.drain(0..8);
+            non_header_bytes.append(&mut p_bytes);
+        }
+        total_bytes.append(&mut header_bytes);
+        total_bytes.append(&mut non_header_bytes);
+        let mut bytes_iter = total_bytes.into_iter();
+        // let part_no = bytes_iter.next().unwrap();
+        // let total_parts = bytes_iter.next().unwrap();
+        // let mut part_hashes = None;
+        let requirements = {
+            // Requirements are defined in following way:
+            // - first byte indicates number of pre requirements
+            // - then there is a list of two byte CID followed by eight byte hash pairs
+            // - after that there is again above procedure but for post requirements
+            let pre_count = bytes_iter.next().unwrap();
+            let mut pre = Vec::with_capacity(pre_count as usize);
+            for _i in 0..pre_count {
+                let b1 = bytes_iter.next().unwrap();
+                let b2 = bytes_iter.next().unwrap();
+                let c_id = u16::from_be_bytes([b1, b2]);
+                let b1 = bytes_iter.next().unwrap();
+                let b2 = bytes_iter.next().unwrap();
+                let b3 = bytes_iter.next().unwrap();
+                let b4 = bytes_iter.next().unwrap();
+                let b5 = bytes_iter.next().unwrap();
+                let b6 = bytes_iter.next().unwrap();
+                let b7 = bytes_iter.next().unwrap();
+                let b8 = bytes_iter.next().unwrap();
+                let hash = u64::from_be_bytes([b1, b2, b3, b4, b5, b6, b7, b8]);
+                pre.push((c_id, hash));
+            }
+            let post_count = bytes_iter.next().unwrap();
+            let mut post = Vec::with_capacity(post_count as usize);
+            for _i in 0..post_count {
+                let b1 = bytes_iter.next().unwrap();
+                let b2 = bytes_iter.next().unwrap();
+                let c_id = u16::from_be_bytes([b1, b2]);
+                let b1 = bytes_iter.next().unwrap();
+                let b2 = bytes_iter.next().unwrap();
+                let b3 = bytes_iter.next().unwrap();
+                let b4 = bytes_iter.next().unwrap();
+                let b5 = bytes_iter.next().unwrap();
+                let b6 = bytes_iter.next().unwrap();
+                let b7 = bytes_iter.next().unwrap();
+                let b8 = bytes_iter.next().unwrap();
+                let hash = u64::from_be_bytes([b1, b2, b3, b4, b5, b6, b7, b8]);
+                post.push((c_id, hash));
+            }
+            SyncRequirements { pre, post }
+        };
+        // if part_no == 0 && total_parts>0 {
+        //     let mut hashes_vec = Vec::with_capacity(total_parts as usize);
+        //     for _i in 0..total_parts{
+        //         let b1 = bytes_iter.next().unwrap();
+        //         let b2 = bytes_iter.next().unwrap();
+        //         let b3 = bytes_iter.next().unwrap();
+        //         let b4 = bytes_iter.next().unwrap();
+        //         let b5 = bytes_iter.next().unwrap();
+        //         let b6 = bytes_iter.next().unwrap();
+        //         let b7 = bytes_iter.next().unwrap();
+        //         let b8 = bytes_iter.next().unwrap();
+        //         let hash = u64::from_be_bytes([b1,b2,b3,b4,b5,b6,b7,b8]);
+        //         hashes_vec.push(hash);
+        //     }
+        //     part_hashes = Some(hashes_vec);
+
+        // }
+        let data = Data::new(bytes_iter.collect()).unwrap();
+        Ok(SyncMessage {
+            m_type,
+            requirements,
+            data,
+        })
+    }
+}
+
+// struct PartialMessage{
+//     m_type: SyncMessageType,
+//     part_no: u8,
+//     total_parts: u8,
+//     // requirements: Option<SyncRequirements>,
+//     // part_hashes: Option<Vec<u64>>, //Only part 0 may contain Some if total_parts >0
+//     data: Data,
+// }
+
+// impl PartialMessage {
+//     // pub fn from(data: Data) -> Self {
+//     pub fn from(m_type: SyncMessageType, part_no:u8,total_parts:u8, data: Data)->Self{
+//         PartialMessage { m_type, part_no, total_parts, data  }
+//     }
+
+//     pub fn into(self) -> Data {
+//         let mut bytes = Vec::with_capacity(1024);
+//         bytes.push(self.m_type.as_byte());
+//         bytes.push(self.part_no);
+//         bytes.push(self.total_parts);
+//         // if let Some(req) = self.requirements{
+//         //     bytes.append(&mut req.bytes());
+//         // }
+
+//         // if let Some(part_hashes) = self.part_hashes{
+//         //     for hash in part_hashes{
+//         //         for byte in hash.to_be_bytes(){
+//         //             bytes.push(byte);
+//         //         }
+//         //     }
+//         // }
+
+//         let mut data_bytes = self.data.bytes();
+//         bytes.append(&mut data_bytes);
+//         Data::new(bytes).unwrap()
+
+//     }
+
+// }

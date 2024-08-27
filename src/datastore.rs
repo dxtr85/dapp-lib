@@ -33,16 +33,45 @@ impl Datastore {
 
     // this fn should be used for adding new Content to Datastore,
     // failing when all possible slots are already taken
-    pub fn append(&mut self, content: Content) -> Result<u64, AppError> {
-        let index_to_add = self.len();
-        if index_to_add == u16::MAX {
-            return Err(AppError::DatastoreFull);
-        }
-        let update_res = self.update(index_to_add, content);
-        if let Ok(_prev) = update_res {
-            Ok(self.update_hash())
-        } else {
-            Err(update_res.err().unwrap())
+    pub fn append(&mut self, c_id: ContentID, content: Content) -> Result<u64, AppError> {
+        // let update_res = self.update(index_to_add, content);
+        // if let Ok(_prev) = update_res {
+        //     Ok(self.update_hash())
+        // } else {
+        //     Err(update_res.err().unwrap())
+        // }
+        let myself = std::mem::replace(self, Datastore::Empty);
+        match myself {
+            Self::Empty => {
+                if c_id == 0 {
+                    let hash = content.hash();
+                    let c_slot = ContentSlot::new(content);
+                    *self = Datastore::Hashed(hash, Box::new((c_slot, ContentSlot::empty())));
+                    Ok(hash)
+                } else {
+                    Err(AppError::IndexingError)
+                }
+            }
+            Self::Hashed(old_hash, mut boxed_slots) => {
+                let result = if c_id % 2 == 0 {
+                    boxed_slots.0.append(c_id >> 1, content)
+                } else {
+                    boxed_slots.1.append(c_id >> 1, content)
+                };
+                *self = if result.is_ok() {
+                    if boxed_slots.1.data_count == 0 {
+                        Self::Hashed(boxed_slots.0.hash, boxed_slots)
+                    } else {
+                        Self::Hashed(
+                            double_hash(boxed_slots.0.hash, boxed_slots.1.hash),
+                            boxed_slots,
+                        )
+                    }
+                } else {
+                    Self::Hashed(old_hash, boxed_slots)
+                };
+                result
+            }
         }
     }
 
@@ -212,7 +241,7 @@ impl Datastore {
         }
     }
 
-    fn get_root_content_hash(&self, c_id: ContentID) -> Result<u64, ()> {
+    pub fn get_root_content_hash(&self, c_id: ContentID) -> Result<u64, ()> {
         match self {
             Self::Empty => Err(()),
             Self::Hashed(_hash, boxed_slots) => {
@@ -304,9 +333,27 @@ impl ContentSlot {
         }
     }
 
+    pub fn append(&mut self, c_id: ContentID, content: Content) -> Result<u64, AppError> {
+        if c_id == 0 {
+            if self.data_count == 0 {
+                self.content = content;
+                self.update_hash();
+                return Ok(self.hash);
+            } else {
+                return Err(AppError::IndexingError);
+            }
+        }
+        if c_id % 2 == 0 {
+            self.left.append(c_id, content)
+        } else {
+            self.right.append(c_id, content)
+        }
+    }
+
     pub fn update(&mut self, c_id: ContentID, content: Content) -> Result<Content, AppError> {
         if c_id == 0 {
             if self.data_count == 0 {
+                // println!("data count 0");
                 return Err(AppError::ContentEmpty);
             } else {
                 let old_content = self.content.update(content);
