@@ -7,6 +7,7 @@ pub enum AppError {
     IndexingError,
     HashMismatch,
     ContentEmpty,
+    DatatypeMismatch,
     DatastoreFull,
     DatastoreInsertCalledOnFilled,
 }
@@ -18,6 +19,7 @@ impl Display for AppError {
             Self::IndexingError => write!(f, "IndexingError"),
             Self::HashMismatch => write!(f, "HashMismatch"),
             Self::ContentEmpty => write!(f, "ContentEmpty"),
+            Self::DatatypeMismatch => write!(f, "DatatypeMismatch"),
             Self::DatastoreFull => write!(f, "DatastoreFull"),
             Self::DatastoreInsertCalledOnFilled => write!(f, "DatastoreInsertCalledOnFilled"),
         }

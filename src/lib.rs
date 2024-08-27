@@ -121,7 +121,7 @@ impl Application {
     }
 
     pub fn root_hash(&self) -> u64 {
-        self.contents.get_hash()
+        self.contents.hash()
     }
     pub fn content_root_hash(&self, c_id: ContentID) -> Result<u64, ()> {
         self.contents.get_root_content_hash(c_id)
@@ -138,7 +138,7 @@ impl Application {
         if index_to_add == u16::MAX {
             return Err(AppError::DatastoreFull);
         }
-        self.contents.append(index_to_add, content)
+        self.contents.append(content)
     }
     pub fn update(&mut self, c_id: ContentID, content: Content) -> Result<Content, AppError> {
         self.contents.update(c_id, content)

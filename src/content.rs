@@ -19,7 +19,7 @@ impl Content {
     pub fn from(data: Data) -> Result<Self, ()> {
         let mut bytes_iter = data.bytes().into_iter();
         match bytes_iter.next() {
-            None => return Err(()),
+            None => Err(()),
             Some(255) => {
                 // first 8 bytes is GnomeId
                 let b1 = bytes_iter.next().unwrap();
@@ -39,10 +39,24 @@ impl Content {
                 let swarm_name: String = String::from_utf8(bytes_iter.collect()).unwrap();
                 Ok(Content::Link(g_id, swarm_name, c_id))
             }
+            // TODO: we can define instructions to create hollow Content
+            // containing only hashes of either Data or non-data hashes
+            // at certain hash pyramid floor (counted from top to bottom)
+            // TODO: we can also define additional instruction to substitute
+            // selected bottom non-data leaf with another hash pyramid that contains
+            // at it's bottom root data hashes
+            // TODO: once we have all root data hashes we can start
+            // replacing them one-by-one
             Some(other) => {
                 let tree = ContentTree::new(Data::new(bytes_iter.collect()).unwrap());
                 Ok(Content::Data(other, tree))
             }
+        }
+    }
+    pub fn data_type(&self) -> DataType {
+        match self {
+            Self::Link(_g, _sn, _c) => 255,
+            Self::Data(d_type, _ct) => *d_type,
         }
     }
     pub fn read_data(&self, data_id: u16) -> Result<Data, AppError> {

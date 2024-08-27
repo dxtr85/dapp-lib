@@ -80,13 +80,14 @@ impl SyncRequirements {
 // On Content level we can:
 // - Add Content
 // - Change Content (i.e. from Link to Data(x, _) or from Data(y, _d1) to Data(y, _d2))
+// - TODO: Swap Content (switch places of two existing Contents with same Datatype)
 
 // All other changes should be done on Data level:
 // - Append Data to Content,
 // - Remove Data from Content,
 // - Update Data,
 // - Insert Data,
-// - Extend Data.
+// - Extend Data (append to existing Data newly received Data, total can not exceed 1024).
 
 // Update data can internally have multiple Edits like InsertBytesAt, DeleteBytesFrom,
 // ReplaceBytesAt and maybe more. These edits should always stay within one Data chunk.
@@ -144,8 +145,6 @@ pub struct SyncMessage {
     pub m_type: SyncMessageType,
     pub requirements: SyncRequirements,
     pub data: Data,
-    // SetManifest(SyncRequirements, Box<ApplicationManifest>),
-    // AppDefined(Box<Data>),
 }
 
 impl SyncMessage {
@@ -228,9 +227,9 @@ impl SyncMessage {
             for i in 0..non_header_parts {
                 let mut vec = vec![self.m_type.as_byte(), (i + 1) as u8, non_header_parts as u8];
                 let bytes_count = req_and_data_bytes.len();
-                let drain_count = if bytes_count >= 1021{
+                let drain_count = if bytes_count >= 1021 {
                     1021
-                }else{
+                } else {
                     bytes_count
                 };
                 // println!("before drain, rem bytes: {}",req_and_data_bytes.len());
@@ -343,43 +342,3 @@ impl SyncMessage {
         })
     }
 }
-
-// struct PartialMessage{
-//     m_type: SyncMessageType,
-//     part_no: u8,
-//     total_parts: u8,
-//     // requirements: Option<SyncRequirements>,
-//     // part_hashes: Option<Vec<u64>>, //Only part 0 may contain Some if total_parts >0
-//     data: Data,
-// }
-
-// impl PartialMessage {
-//     // pub fn from(data: Data) -> Self {
-//     pub fn from(m_type: SyncMessageType, part_no:u8,total_parts:u8, data: Data)->Self{
-//         PartialMessage { m_type, part_no, total_parts, data  }
-//     }
-
-//     pub fn into(self) -> Data {
-//         let mut bytes = Vec::with_capacity(1024);
-//         bytes.push(self.m_type.as_byte());
-//         bytes.push(self.part_no);
-//         bytes.push(self.total_parts);
-//         // if let Some(req) = self.requirements{
-//         //     bytes.append(&mut req.bytes());
-//         // }
-
-//         // if let Some(part_hashes) = self.part_hashes{
-//         //     for hash in part_hashes{
-//         //         for byte in hash.to_be_bytes(){
-//         //             bytes.push(byte);
-//         //         }
-//         //     }
-//         // }
-
-//         let mut data_bytes = self.data.bytes();
-//         bytes.append(&mut data_bytes);
-//         Data::new(bytes).unwrap()
-
-//     }
-
-// }
