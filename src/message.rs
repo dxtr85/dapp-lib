@@ -38,7 +38,7 @@ impl SyncRequirements {
     // TODO: we need to add a read: Vec<Content_ID> argument
     // to verify that only specified contents were read
     // and that all specified contents were read
-    pub fn pre_validate(&self, app: &Application) -> bool {
+    pub fn pre_validate(&self, _c_id: ContentID, app: &Application) -> bool {
         for (c_id, hash) in self.pre.iter() {
             if let Ok(d_hash) = app.content_root_hash(*c_id) {
                 if d_hash != *hash {
@@ -56,7 +56,7 @@ impl SyncRequirements {
     // TODO: we need to add a changed: Vec<Content_ID> argument
     // to verify that only specified contents were changed
     // and that all specified contents were changed
-    pub fn post_validate(&self, app: &Application) -> bool {
+    pub fn post_validate(&self, c_id: ContentID, app: &Application) -> bool {
         for (c_id, hash) in self.post.iter() {
             if let Ok(d_hash) = app.content_root_hash(*c_id) {
                 if d_hash != *hash {
@@ -99,44 +99,119 @@ impl SyncRequirements {
 // when an originating gnome drops out of swarm.
 //
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum SyncMessageType {
     SetManifest, // Should this be a separate type?
     AddContent,
-    ChangeContent,
-    AppendData,
-    RemoveData,
-    UpdateData,
-    InsertData,
-    ExtendData,
+    ChangeContent(ContentID),
+    AppendData(ContentID),
+    RemoveData(ContentID, u16),
+    UpdateData(ContentID, u16),
+    InsertData(ContentID, u16),
+    ExtendData(ContentID, u16),
     UserDefined(u8),
 }
 impl SyncMessageType {
-    pub fn new(value: u8) -> Self {
+    pub fn new(bytes: &mut Vec<u8>) -> Self {
+        let value = bytes.drain(0..1).next().unwrap();
         match value {
             255 => SyncMessageType::SetManifest,
             254 => SyncMessageType::AddContent,
-            253 => SyncMessageType::ChangeContent,
-            252 => SyncMessageType::AppendData,
-            251 => SyncMessageType::RemoveData,
-            250 => SyncMessageType::UpdateData,
-            249 => SyncMessageType::InsertData,
-            248 => SyncMessageType::ExtendData,
+            253 => {
+                let b1 = bytes.drain(0..1).next().unwrap();
+                let b2 = bytes.drain(0..1).next().unwrap();
+                let c_id = u16::from_be_bytes([b1, b2]);
+                SyncMessageType::ChangeContent(c_id)
+            }
+            252 => {
+                let b1 = bytes.drain(0..1).next().unwrap();
+                let b2 = bytes.drain(0..1).next().unwrap();
+                let c_id = u16::from_be_bytes([b1, b2]);
+                // let b1 = bytes.drain(0..1).next().unwrap();
+                // let b2 = bytes.drain(0..1).next().unwrap();
+                // let d_id = u16::from_be_bytes([b1, b2]);
+                SyncMessageType::AppendData(c_id)
+            }
+
+            251 => {
+                let b1 = bytes.drain(0..1).next().unwrap();
+                let b2 = bytes.drain(0..1).next().unwrap();
+                let c_id = u16::from_be_bytes([b1, b2]);
+                let b1 = bytes.drain(0..1).next().unwrap();
+                let b2 = bytes.drain(0..1).next().unwrap();
+                let d_id = u16::from_be_bytes([b1, b2]);
+                SyncMessageType::RemoveData(c_id, d_id)
+            }
+            250 => {
+                let b1 = bytes.drain(0..1).next().unwrap();
+                let b2 = bytes.drain(0..1).next().unwrap();
+                let c_id = u16::from_be_bytes([b1, b2]);
+                let b1 = bytes.drain(0..1).next().unwrap();
+                let b2 = bytes.drain(0..1).next().unwrap();
+                let d_id = u16::from_be_bytes([b1, b2]);
+                SyncMessageType::UpdateData(c_id, d_id)
+            }
+            249 => {
+                let b1 = bytes.drain(0..1).next().unwrap();
+                let b2 = bytes.drain(0..1).next().unwrap();
+                let c_id = u16::from_be_bytes([b1, b2]);
+                let b1 = bytes.drain(0..1).next().unwrap();
+                let b2 = bytes.drain(0..1).next().unwrap();
+                let d_id = u16::from_be_bytes([b1, b2]);
+                SyncMessageType::InsertData(c_id, d_id)
+            }
+
+            248 => {
+                let b1 = bytes.drain(0..1).next().unwrap();
+                let b2 = bytes.drain(0..1).next().unwrap();
+                let c_id = u16::from_be_bytes([b1, b2]);
+                let b1 = bytes.drain(0..1).next().unwrap();
+                let b2 = bytes.drain(0..1).next().unwrap();
+                let d_id = u16::from_be_bytes([b1, b2]);
+                SyncMessageType::ExtendData(c_id, d_id)
+            }
+
             other => SyncMessageType::UserDefined(other),
         }
     }
 
-    pub fn as_byte(&self) -> u8 {
+    pub fn as_bytes(&self) -> Vec<u8> {
         match self {
-            SyncMessageType::SetManifest => 255,
-            SyncMessageType::AddContent => 254,
-            SyncMessageType::ChangeContent => 253,
-            SyncMessageType::AppendData => 252,
-            SyncMessageType::RemoveData => 251,
-            SyncMessageType::UpdateData => 250,
-            SyncMessageType::InsertData => 249,
-            SyncMessageType::ExtendData => 248,
-            SyncMessageType::UserDefined(other) => *other,
+            SyncMessageType::SetManifest => vec![255],
+            SyncMessageType::AddContent => vec![254],
+            SyncMessageType::ChangeContent(c_id) => {
+                let [b1, b2] = c_id.to_be_bytes();
+                vec![253, b1, b2]
+            }
+            SyncMessageType::AppendData(c_id) => {
+                let [b1, b2] = c_id.to_be_bytes();
+                // let [b3, b4] = d_id.to_be_bytes();
+                vec![252, b1, b2]
+            }
+            SyncMessageType::RemoveData(c_id, d_id) => {
+                let [b1, b2] = c_id.to_be_bytes();
+                let [b3, b4] = d_id.to_be_bytes();
+                vec![251, b1, b2, b3, b4]
+            }
+
+            SyncMessageType::UpdateData(c_id, d_id) => {
+                let [b1, b2] = c_id.to_be_bytes();
+                let [b3, b4] = d_id.to_be_bytes();
+                vec![250, b1, b2, b3, b4]
+            }
+            SyncMessageType::InsertData(c_id, d_id) => {
+                let [b1, b2] = c_id.to_be_bytes();
+                let [b3, b4] = d_id.to_be_bytes();
+                vec![249, b1, b2, b3, b4]
+            }
+
+            SyncMessageType::ExtendData(c_id, d_id) => {
+                let [b1, b2] = c_id.to_be_bytes();
+                let [b3, b4] = d_id.to_be_bytes();
+                vec![248, b1, b2, b3, b4]
+            }
+
+            SyncMessageType::UserDefined(other) => vec![*other],
         }
     }
 }
@@ -170,9 +245,15 @@ impl SyncMessage {
         let req_size = 10 * (self.requirements.pre.len() + self.requirements.post.len());
         let netto_size = data_size + req_size;
         let mut partials = vec![];
-        if netto_size < 897 {
+
+        // TODO/DONE? (was 897): recalculate how many bytes to drain, since now
+        // message type can take up to 5 bytes, not 1 as previously
+        println!("Netto: {}", netto_size);
+        if netto_size < 893 {
             let mut bytes = Vec::with_capacity(netto_size + 3);
-            bytes.push(self.m_type.as_byte());
+            for byte in self.m_type.as_bytes() {
+                bytes.push(byte);
+            }
             bytes.push(0);
             bytes.push(0);
             bytes.append(&mut self.requirements.bytes());
@@ -210,10 +291,14 @@ impl SyncMessage {
             // hashes, Requirements and everything else.
             let hashes_size = 8 * non_header_parts;
             let mut header_bytes: Vec<u8> = Vec::with_capacity(900);
-            header_bytes.push(self.m_type.as_byte());
+            // TODO/DONE? (was 897): recalculate how many bytes to drain, since now
+            // message type can take up to 5 bytes, not 1 as previously
+            for byte in self.m_type.as_bytes() {
+                header_bytes.push(byte);
+            }
             header_bytes.push(0);
             header_bytes.push(non_header_parts as u8);
-            let first_chunk_size = 897 - hashes_size;
+            let first_chunk_size = 893 - hashes_size;
             // later chunks have up to 1021 bytes (3 bytes for type, part_no, total_parts)
             // First we put hashes (after we calculate them...)
             // Then we put requirements
@@ -224,11 +309,15 @@ impl SyncMessage {
             let mut first_chunk_bytes: Vec<u8> =
                 req_and_data_bytes.drain(0..first_chunk_size).collect();
             let mut subsequent_chunks: Vec<Data> = vec![];
+            // TODO/DONE?(was 1021): recalculate how many bytes to drain, since now
+            // message type can take up to 5 bytes, not 1 as previously
             for i in 0..non_header_parts {
-                let mut vec = vec![self.m_type.as_byte(), (i + 1) as u8, non_header_parts as u8];
+                let mut vec = self.m_type.as_bytes();
+                vec.push((i + 1) as u8);
+                vec.push(non_header_parts as u8);
                 let bytes_count = req_and_data_bytes.len();
-                let drain_count = if bytes_count >= 1021 {
-                    1021
+                let drain_count = if bytes_count >= 1017 {
+                    1017
                 } else {
                     bytes_count
                 };
@@ -249,6 +338,7 @@ impl SyncMessage {
         partials
     }
 
+    // TODO: this needs rework
     pub fn from_data(idx: Vec<u64>, mut vec_data: HashMap<u64, Data>) -> Result<Self, ()> {
         let idx_len = idx.len();
         if idx.len() != vec_data.len() {
@@ -259,7 +349,8 @@ impl SyncMessage {
         let key = idx_iter.next().unwrap();
         let p_data = vec_data.remove(&key).unwrap();
         let mut header_bytes = p_data.bytes();
-        let m_type = SyncMessageType::new(header_bytes.drain(0..1).next().unwrap());
+        let m_type = SyncMessageType::new(&mut header_bytes);
+        // drop part_no & total_parts
         let _ = header_bytes.drain(0..2);
 
         let mut non_header_bytes = Vec::with_capacity((idx_len - 1) * 1021);

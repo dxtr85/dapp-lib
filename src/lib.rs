@@ -11,7 +11,7 @@ use datastore::Datastore;
 use error::AppError;
 use gnome::prelude::Data;
 use manifest::ApplicationManifest;
-use message::SyncMessage;
+use message::{SyncMessage, SyncMessageType, SyncRequirements};
 use registry::ChangeRegistry;
 
 pub mod prelude {
@@ -59,16 +59,22 @@ impl Application {
         }
     }
 
+    // TODO: this needs rework as well as SyncMessage::from_data
     pub fn process(&mut self, data: Data) -> Option<SyncMessage> {
-        let mut bytes_iter = data.ref_bytes().iter();
-        bytes_iter.next();
-        let second = bytes_iter.next().unwrap();
-        let third = bytes_iter.next().unwrap();
-        // println!("[{}/{}]", second, third);
-        if *second == 0 {
-            if *third == 0 {
+        // let mut bytes_iter = data.ref_bytes().iter();
+        let mut bytes = data.bytes();
+        let m_type = SyncMessageType::new(&mut bytes);
+        let mut drained_bytes = m_type.as_bytes();
+        let part_no = bytes.drain(0..1).next().unwrap();
+        let total_parts = bytes.drain(0..1).next().unwrap();
+        drained_bytes.push(part_no);
+        drained_bytes.push(total_parts);
+        println!("[{}/{}]", part_no, total_parts);
+        if part_no == 0 {
+            if total_parts == 0 {
                 let mut hm = HashMap::new();
-                hm.insert(0, data);
+                drained_bytes.append(&mut bytes);
+                hm.insert(0, Data::new(drained_bytes).unwrap());
                 Some(SyncMessage::from_data(vec![0], hm).unwrap())
             } else {
                 let mut next_idx = 0;
@@ -78,26 +84,31 @@ impl Application {
                         break;
                     }
                 }
-                let mut all_hashes = Vec::with_capacity((*third as usize) + 1);
+                let mut all_hashes = Vec::with_capacity((total_parts as usize) + 1);
                 all_hashes.push(0);
-                for _i in 0..*third {
+                for _i in 0..total_parts {
                     let mut hash: [u8; 8] = [0; 8];
                     for j in 0..8 {
-                        hash[j] = *bytes_iter.next().unwrap();
+                        hash[j] = bytes.drain(0..1).next().unwrap();
+                        drained_bytes.push(hash[j]);
                     }
                     let hash = u64::from_be_bytes(hash);
                     // println!("Expecting hash: {}", hash);
                     all_hashes.push(hash);
                     self.hash_to_temp_idx.insert(hash, next_idx);
                 }
-                drop(bytes_iter);
+                // drop(bytes_iter);
                 let mut new_hm = HashMap::new();
+                drained_bytes.append(&mut bytes);
+                let data = Data::new(drained_bytes).unwrap();
                 new_hm.insert(0, data);
                 self.partial_data.insert(next_idx, (all_hashes, new_hm));
                 None
             }
         } else {
             // Second byte is non zero, so we received a non-head partial Data
+            drained_bytes.append(&mut bytes);
+            let data = Data::new(drained_bytes).unwrap();
             let hash = data.hash();
             // println!("Got hash: {}", hash);
             if let Some(temp_idx) = self.hash_to_temp_idx.get(&hash) {
@@ -139,6 +150,24 @@ impl Application {
             return Err(AppError::DatastoreFull);
         }
         self.contents.append(content)
+    }
+    pub fn insert_data(
+        &mut self,
+        c_id: ContentID,
+        d_id: u16,
+        data: Data,
+        overwrite: bool,
+    ) -> Result<u64, AppError> {
+        self.contents.insert_data(c_id, d_id, data, overwrite)
+    }
+    pub fn append_data(&mut self, c_id: ContentID, data: Data) -> Result<u64, AppError> {
+        self.contents.append_data(c_id, data)
+    }
+    pub fn pop_data(&mut self, c_id: ContentID) -> Result<Data, AppError> {
+        self.contents.pop_data(c_id)
+    }
+    pub fn remove_data(&mut self, c_id: ContentID, d_id: u16) -> Result<Data, AppError> {
+        self.contents.remove_data(c_id, d_id)
     }
     pub fn update(&mut self, c_id: ContentID, content: Content) -> Result<Content, AppError> {
         self.contents.update(c_id, content)

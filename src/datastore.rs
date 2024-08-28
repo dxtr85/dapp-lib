@@ -24,6 +24,62 @@ impl Datastore {
         Datastore::Filled(content)
     }
 
+    // this fn should be used for inserting new Data into existing Content,
+    // failing when all possible slots are already taken
+    pub fn insert_data(
+        &mut self,
+        c_id: ContentID,
+        d_id: u16,
+        data: Data,
+        overwrite: bool,
+    ) -> Result<u64, AppError> {
+        let take_result = self.take(c_id);
+        if let Err(e) = take_result {
+            return Err(e);
+        }
+        let mut content = take_result.unwrap();
+        let insert_result = content.insert(d_id, data, overwrite);
+        let _ = self.update(c_id, content);
+        insert_result
+    }
+
+    // this fn should be used for adding new Data to existing Content,
+    // failing when all possible slots are already taken
+    pub fn append_data(&mut self, c_id: ContentID, data: Data) -> Result<u64, AppError> {
+        let take_result = self.take(c_id);
+        if let Err(e) = take_result {
+            return Err(e);
+        }
+        let mut content = take_result.unwrap();
+        let append_result = content.push_data(data);
+        let _ = self.update(c_id, content);
+        append_result
+    }
+
+    // this fn should be used for removing last Data chunk from existing Content,
+    pub fn pop_data(&mut self, c_id: ContentID) -> Result<Data, AppError> {
+        let take_result = self.take(c_id);
+        if let Err(e) = take_result {
+            return Err(e);
+        }
+        let mut content = take_result.unwrap();
+        let pop_result = content.pop_data();
+        let _ = self.update(c_id, content);
+        pop_result
+    }
+
+    // this fn should be used for removing a Data chunk from existing Content,
+    pub fn remove_data(&mut self, c_id: ContentID, d_id: u16) -> Result<Data, AppError> {
+        let take_result = self.take(c_id);
+        if let Err(e) = take_result {
+            return Err(e);
+        }
+        let mut content = take_result.unwrap();
+        let remove_result = content.remove_data(d_id);
+        let _ = self.update(c_id, content);
+        remove_result
+    }
+
     // this fn should be used for adding new Content to Datastore,
     // failing when all possible slots are already taken
     pub fn append(&mut self, content: Content) -> Result<u64, AppError> {
@@ -309,7 +365,7 @@ impl Substore {
             return Err(());
         }
         let left_len = self.left.len();
-        println!("c_id: {}, left_len: {}", c_id, left_len);
+        // println!("c_id: {}, left_len: {}", c_id, left_len);
         if c_id >= left_len {
             self.right.get_root_content_hash(c_id - left_len)
         } else {
