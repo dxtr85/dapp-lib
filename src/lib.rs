@@ -151,14 +151,8 @@ impl Application {
         }
         self.contents.append(content)
     }
-    pub fn insert_data(
-        &mut self,
-        c_id: ContentID,
-        d_id: u16,
-        data: Data,
-        overwrite: bool,
-    ) -> Result<u64, AppError> {
-        self.contents.insert_data(c_id, d_id, data, overwrite)
+    pub fn insert_data(&mut self, c_id: ContentID, d_id: u16, data: Data) -> Result<u64, AppError> {
+        self.contents.insert_data(c_id, d_id, data)
     }
     pub fn append_data(&mut self, c_id: ContentID, data: Data) -> Result<u64, AppError> {
         self.contents.append_data(c_id, data)

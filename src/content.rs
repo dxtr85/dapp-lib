@@ -1,5 +1,4 @@
 use gnome::prelude::*;
-use std::cmp::Ordering;
 use std::hash::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -100,10 +99,10 @@ impl Content {
         }
     }
 
-    pub fn insert(&mut self, d_id: u16, data: Data, overwrite: bool) -> Result<u64, AppError> {
+    pub fn insert(&mut self, d_id: u16, data: Data) -> Result<u64, AppError> {
         match self {
             Self::Link(_g, _s, _c) => Err(AppError::DatatypeMismatch),
-            Self::Data(_dt, tree) => tree.insert(d_id, data, overwrite),
+            Self::Data(_dt, tree) => tree.insert(d_id, data),
         }
     }
     pub fn update_data(&mut self, data_id: u16, data: Data) -> Result<Data, AppError> {
@@ -267,7 +266,7 @@ impl ContentTree {
     pub fn from(data_vec: Vec<Data>) -> Self {
         let mut tree = ContentTree::empty(0);
         for data in data_vec {
-            tree.append(data);
+            let _ = tree.append(data);
         }
         tree
     }
@@ -419,38 +418,46 @@ impl ContentTree {
         }
     }
 
-    pub fn insert(&mut self, idx: u16, data: Data, overwrite: bool) -> Result<u64, AppError> {
+    pub fn insert(&mut self, idx: u16, data: Data) -> Result<u64, AppError> {
         // Use append in this case
         if idx >= self.len() {
             return Err(AppError::IndexingError);
         }
-        let remove_last = !overwrite && self.len() == u16::MAX;
+        let remove_last = self.len() == u16::MAX;
         let result = match self {
-            Self::Empty(_hash) => Err(AppError::Smthg),
+            Self::Empty(_hash) => {
+                if idx == 0 {
+                    let hash = data.hash();
+                    *self = Self::Filled(data);
+                    Ok(hash)
+                } else {
+                    Err(AppError::IndexingError)
+                }
+            }
             Self::Filled(old_data) => {
                 if idx == 0 {
-                    if overwrite {
-                        let hash = data.hash();
-                        *self = Self::Filled(data);
-                        Ok(hash)
-                    } else {
-                        let left_hash = data.hash();
-                        let right_hash = old_data.hash();
-                        let hash = double_hash(left_hash, right_hash);
-                        *self = Self::Hashed(Box::new(Subtree {
-                            data_count: 2,
-                            hash,
-                            left: ContentTree::Filled(data),
-                            right: ContentTree::Filled(old_data.clone()),
-                        }));
-                        Ok(hash)
-                    }
+                    // if overwrite {
+                    //     let hash = data.hash();
+                    //     *self = Self::Filled(data);
+                    //     Ok(hash)
+                    // } else {
+                    let left_hash = data.hash();
+                    let right_hash = old_data.hash();
+                    let hash = double_hash(left_hash, right_hash);
+                    *self = Self::Hashed(Box::new(Subtree {
+                        data_count: 2,
+                        hash,
+                        left: ContentTree::Filled(data),
+                        right: ContentTree::Filled(old_data.clone()),
+                    }));
+                    Ok(hash)
+                    // }
                 } else {
                     // This should not happen, but anyway...
                     Err(AppError::IndexingError)
                 }
             }
-            Self::Hashed(subtree) => subtree.insert(idx, data, overwrite),
+            Self::Hashed(subtree) => subtree.insert(idx, data),
         };
         if remove_last && result.is_ok() {
             let _ = self.pop();
@@ -500,53 +507,6 @@ impl ContentTree {
         }
     }
 
-    // fn balance_tree(&mut self) -> Result<u64, ()> {
-    //     match self {
-    //         Self::Empty(_hash) => Ok(0),
-    //         Self::Filled(data) => Ok(data.hash()),
-    //         Self::Hashed(subtree) => subtree.balance_tree(),
-    //     }
-    // }
-
-    fn take_first_n(&mut self, count: u16) -> Self {
-        match self {
-            Self::Empty(hash) => Self::Empty(*hash),
-            Self::Filled(_data) => std::mem::replace(self, Self::Empty(0)),
-            Self::Hashed(subtree) => {
-                let taken = subtree.take_first_n(count);
-                if subtree.len() == 0 {
-                    *self = Self::Empty(0);
-                } else if subtree.len() == 1 {
-                    if let Ok(data) = subtree.replace(0, Data::empty()) {
-                        *self = Self::Filled(data);
-                    } else {
-                        println!("Something went wrong in take_first_n")
-                    }
-                }
-                taken
-            }
-        }
-    }
-    fn take_last_n(&mut self, count: u16) -> Self {
-        match self {
-            Self::Empty(hash) => Self::Empty(*hash),
-            Self::Filled(_data) => std::mem::replace(self, Self::Empty(0)),
-            Self::Hashed(subtree) => {
-                let taken = subtree.take_last_n(count);
-                if subtree.len() == 0 {
-                    *self = Self::Empty(0);
-                } else if subtree.len() == 1 {
-                    if let Ok(data) = subtree.replace(0, Data::empty()) {
-                        *self = Self::Filled(data);
-                    } else {
-                        println!("Something went wrong in take_last_n")
-                    }
-                }
-                taken
-            }
-        }
-    }
-
     fn pop(&mut self) -> Data {
         let myself = std::mem::replace(self, Self::Empty(0));
         match myself {
@@ -569,36 +529,6 @@ impl ContentTree {
                 }
                 taken
             }
-        }
-    }
-
-    fn append_tree(&mut self, mut tree: ContentTree) -> Result<u64, ()> {
-        match self {
-            Self::Empty(_hash) => {
-                *self = tree;
-                Ok(self.hash())
-            }
-            Self::Filled(data) => {
-                let _ = tree.insert(0, data.clone(), true);
-                *self = tree;
-                Ok(self.hash())
-            }
-            Self::Hashed(subtree) => subtree.append_tree(tree),
-        }
-    }
-
-    fn prepend_tree(&mut self, mut tree: Self) -> Result<u64, ()> {
-        match self {
-            Self::Empty(_hash) => {
-                *self = tree;
-                Ok(self.hash())
-            }
-            Self::Filled(data) => {
-                let _ = tree.append(data.clone());
-                *self = tree;
-                Ok(self.hash())
-            }
-            Self::Hashed(subtree) => subtree.prepend_tree(tree),
         }
     }
 }
@@ -690,7 +620,7 @@ impl Subtree {
     pub fn pop(&mut self) -> Data {
         if self.data_count == 0 {
             Data::empty()
-        } else if self.right.len() > 0 {
+        } else if !self.right.is_empty() {
             self.data_count -= 1;
             self.right.pop()
         } else {
@@ -701,26 +631,26 @@ impl Subtree {
         }
     }
 
-    pub fn insert(&mut self, idx: u16, data: Data, overwrite: bool) -> Result<u64, AppError> {
+    pub fn insert(&mut self, idx: u16, mut data: Data) -> Result<u64, AppError> {
         if idx >= self.data_count {
             return Err(AppError::IndexingError);
         }
         let left_count = self.left.len();
-        if idx >= left_count {
-            let ins_res = self.right.insert(idx - left_count, data, overwrite);
-            if let Ok(_hash) = ins_res {
-                Ok(self.hash())
-            } else {
-                ins_res
+        let right_count = self.left.len();
+
+        if idx < left_count {
+            for i in idx..left_count {
+                data = self.replace(i, data).unwrap();
+            }
+            for i in 0..right_count {
+                data = self.replace(i, data).unwrap();
             }
         } else {
-            let ins_res = self.left.insert(idx, data, overwrite);
-            if let Ok(_hash) = ins_res {
-                Ok(self.hash())
-            } else {
-                ins_res
+            for i in idx..right_count {
+                data = self.replace(i, data).unwrap();
             }
         }
+        self.append(data)
     }
 
     /// We remove element from a Subtree
@@ -744,201 +674,6 @@ impl Subtree {
             shifted_data = self.replace(i, shifted_data).unwrap();
         }
         Ok(shifted_data)
-    }
-
-    // OLD REMOVE
-    // pub fn remove(&mut self, idx: u16) -> Result<Data, AppError> {
-    //     if idx >= self.data_count {
-    //         println!(
-    //             "(index to remove)  {} >= {} (data len) ",
-    //             idx, self.data_count
-    //         );
-    //         Err(AppError::IndexingError)
-    //     } else {
-    //         let left_count = self.left.len();
-    //         self.data_count -= 1;
-    //         if idx >= left_count {
-    //             let rem_result = self.right.remove(idx - left_count);
-    //             if self.right.is_empty() {
-    //                 let curr_left = std::mem::replace(&mut self.left, ContentTree::empty(0));
-    //                 match curr_left {
-    //                     ContentTree::Empty(_hash) => {
-    //                         // this case is not expected to happen
-    //                         // but if it does nothing should happen ;P
-    //                         Err(AppError::ContentEmpty)
-    //                     }
-    //                     ContentTree::Filled(data) => Err(Some(data)),
-    //                     ContentTree::Hashed(boxed_subtree) => {
-    //                         let _ = std::mem::replace(self, *boxed_subtree);
-    //                         rem_result
-    //                     }
-    //                 }
-    //             } else if let Ok(data) = rem_result {
-    //                 self.hash();
-    //                 Ok(data)
-    //             } else {
-    //                 Err(None)
-    //             }
-    //         } else {
-    //             let rem_result = self.left.remove(idx);
-    //             if self.left.is_empty() {
-    //                 let curr_right = std::mem::replace(&mut self.right, ContentTree::empty(0));
-    //                 match curr_right {
-    //                     ContentTree::Empty(_hash) => {
-    //                         // this case is not expected to happen
-    //                         Err(Some(Data::empty()))
-    //                     }
-    //                     ContentTree::Filled(data) => Err(Some(data)),
-    //                     ContentTree::Hashed(boxed_subtree) => {
-    //                         *self = *boxed_subtree;
-    //                         rem_result
-    //                     }
-    //                 }
-    //             } else if let Ok(data) = rem_result {
-    //                 self.hash();
-    //                 Ok(data)
-    //             } else {
-    //                 Err(None)
-    //             }
-    //         }
-    //     }
-    // }
-
-    // In order to make hashing work we can never balance a tree!
-    // fn balance_tree(&mut self) -> Result<u64, ()> {
-    //     let left_len = self.left.len();
-    //     let right_len = self.right.len();
-    //     let diff = u16::abs_diff(left_len, right_len);
-    //     if diff >= 2 {
-    //         let take_count = if diff % 2 != 0 {
-    //             1 + (diff >> 1)
-    //         } else {
-    //             diff >> 1
-    //         };
-    //         if right_len > left_len {
-    //             let taken = self.right.take_first_n(take_count);
-    //             let _ = self.left.append_tree(taken);
-    //         } else {
-    //             let taken = self.left.take_last_n(take_count);
-    //             let _ = self.right.prepend_tree(taken);
-    //         }
-    //         // We could use results from following expressions...
-    //         let _ = self.left.balance_tree();
-    //         let _ = self.right.balance_tree();
-    //         // but for now we simply recalculate hash
-    //         Ok(self.hash())
-    //     } else {
-    //         // Do not recalculate hash
-    //         Ok(self.hash)
-    //     }
-    // }
-    fn take_first_n(&mut self, count: u16) -> ContentTree {
-        let left_count = self.left.len();
-        match left_count.cmp(&count) {
-            Ordering::Greater => {
-                let taken = self.left.take_first_n(count);
-                self.hash();
-                taken
-            }
-            Ordering::Less => {
-                let mut tmp = std::mem::replace(&mut self.left, ContentTree::empty(0));
-                let more = self.right.take_first_n(count - left_count);
-                let curr_right = std::mem::replace(&mut self.right, ContentTree::empty(0));
-                match curr_right {
-                    ContentTree::Empty(_hash) => {
-                        // self.hash = hash;
-                        self.data_count = 0;
-                    }
-                    ContentTree::Filled(_data) => {
-                        // self.hash=data.hash();
-                        self.data_count = 1;
-                    }
-                    ContentTree::Hashed(subtree) => *self = *subtree,
-                };
-                let _ = tmp.append_tree(more);
-                tmp
-            }
-            Ordering::Equal => {
-                let tmp = std::mem::replace(&mut self.left, ContentTree::empty(0));
-                let curr_right = std::mem::replace(&mut self.right, ContentTree::empty(0));
-                match curr_right {
-                    ContentTree::Empty(_hash) => {
-                        // Not sure about those hashes
-                        // self.hash = hash;
-                        self.data_count = 0;
-                    }
-                    ContentTree::Filled(_data) => {
-                        // Not sure about those hashes
-                        // self.hash = data.hash();
-                        self.data_count = 1;
-                    }
-                    ContentTree::Hashed(subtree) => *self = *subtree,
-                };
-                tmp
-            }
-        }
-    }
-
-    fn take_last_n(&mut self, count: u16) -> ContentTree {
-        let right_count = self.right.len();
-        match right_count.cmp(&count) {
-            Ordering::Greater => {
-                let taken = self.right.take_last_n(count);
-                self.hash();
-                taken
-            }
-            Ordering::Less => {
-                let tmp = std::mem::replace(&mut self.right, ContentTree::empty(0));
-                let mut more = self.left.take_last_n(count - right_count);
-                let curr_left = std::mem::replace(&mut self.left, ContentTree::empty(0));
-                match curr_left {
-                    ContentTree::Empty(_hash) => {
-                        // self.hash = hash;
-                        self.data_count = 0;
-                    }
-                    ContentTree::Filled(_data) => {
-                        // self.hash = data.hash();
-                        self.data_count = 1;
-                    }
-                    ContentTree::Hashed(subtree) => *self = *subtree,
-                };
-                let _ = more.append_tree(tmp);
-                more
-            }
-            Ordering::Equal => {
-                let tmp = std::mem::replace(&mut self.right, ContentTree::empty(0));
-                let curr_left = std::mem::replace(&mut self.left, ContentTree::empty(0));
-                match curr_left {
-                    ContentTree::Empty(_hash) => {
-                        // self.hash = hash;
-                        self.data_count = 0;
-                    }
-                    ContentTree::Filled(_data) => {
-                        // self.hash = data.hash();
-                        self.data_count = 1;
-                    }
-                    ContentTree::Hashed(subtree) => *self = *subtree,
-                };
-                tmp
-            }
-        }
-    }
-
-    fn append_tree(&mut self, tree: ContentTree) -> Result<u64, ()> {
-        let result = self.right.append_tree(tree);
-        if let Ok(_h) = result {
-            Ok(self.hash())
-        } else {
-            result
-        }
-    }
-    fn prepend_tree(&mut self, tree: ContentTree) -> Result<u64, ()> {
-        let result = self.left.prepend_tree(tree);
-        if let Ok(_h) = result {
-            Ok(self.hash())
-        } else {
-            result
-        }
     }
 }
 

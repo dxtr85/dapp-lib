@@ -26,19 +26,13 @@ impl Datastore {
 
     // this fn should be used for inserting new Data into existing Content,
     // failing when all possible slots are already taken
-    pub fn insert_data(
-        &mut self,
-        c_id: ContentID,
-        d_id: u16,
-        data: Data,
-        overwrite: bool,
-    ) -> Result<u64, AppError> {
+    pub fn insert_data(&mut self, c_id: ContentID, d_id: u16, data: Data) -> Result<u64, AppError> {
         let take_result = self.take(c_id);
         if let Err(e) = take_result {
             return Err(e);
         }
         let mut content = take_result.unwrap();
-        let insert_result = content.insert(d_id, data, overwrite);
+        let insert_result = content.insert(d_id, data);
         let _ = self.update(c_id, content);
         insert_result
     }
@@ -46,6 +40,7 @@ impl Datastore {
     // this fn should be used for adding new Data to existing Content,
     // failing when all possible slots are already taken
     pub fn append_data(&mut self, c_id: ContentID, data: Data) -> Result<u64, AppError> {
+        println!("Append {}", c_id);
         let take_result = self.take(c_id);
         if let Err(e) = take_result {
             return Err(e);
@@ -86,6 +81,7 @@ impl Datastore {
         let myself = std::mem::replace(self, Datastore::Empty);
         match myself {
             Self::Empty => {
+                // println!("Append to empty");
                 // This is not expected to happen,
                 // Empty is only a temp constructor.
                 let hash = content.hash();
@@ -93,6 +89,7 @@ impl Datastore {
                 Ok(hash)
             }
             Self::Filled(prev_content) => {
+                // println!("Append to Filled");
                 let hash = double_hash(prev_content.hash(), content.hash());
                 let substore = Substore {
                     data_count: 2,
@@ -104,6 +101,7 @@ impl Datastore {
                 Ok(hash)
             }
             Self::Hashed(mut substore) => {
+                // println!("Append to Hashed");
                 let result = substore.append(content);
                 *self = Datastore::Hashed(substore);
                 result
@@ -207,6 +205,7 @@ impl Datastore {
     // bottom layer hashes from left to right.
     // Those are also called Content root hashes.
     pub fn all_root_hashes(&self) -> Vec<u64> {
+        // println!("Next")
         let mut v = vec![];
         for c_id in 0..u16::MAX {
             if let Ok(hash) = self.get_root_content_hash(c_id) {
@@ -215,6 +214,7 @@ impl Datastore {
                 break;
             }
         }
+        println!("All root hashes count: {}", v.len());
         v
     }
 
@@ -282,9 +282,11 @@ struct Substore {
 
 impl Substore {
     pub fn append(&mut self, content: Content) -> Result<u64, AppError> {
+        // println!("Substore count: {}", self.data_count);
         if self.data_count < u16::MAX {
             let result = self.right.append(content);
             if let Ok(_h) = result {
+                self.data_count += 1;
                 Ok(self.hash())
             } else {
                 result
@@ -322,12 +324,15 @@ impl Substore {
             return Err(AppError::IndexingError);
         }
         let left_len = self.left.len();
-        if c_id >= left_len {
+        let result = if c_id >= left_len {
             self.right.update(c_id - left_len, content)
         } else {
             self.left.update(c_id, content)
-        }
+        };
+        self.hash();
+        result
     }
+
     pub fn update_data(
         &mut self,
         (c_id, data_id): (ContentID, u16),
