@@ -141,7 +141,7 @@ impl Application {
         self.change_reg.read()
     }
 
-    pub fn all_content_root_hashes(&self) -> Vec<u64> {
+    pub fn all_content_root_hashes(&self) -> Vec<Vec<u64>> {
         self.contents.all_root_hashes()
     }
     pub fn append(&mut self, content: Content) -> Result<u64, AppError> {

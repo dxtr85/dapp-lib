@@ -204,18 +204,30 @@ impl Datastore {
     // This fn should return a Vec<u64> of all of Datastore's
     // bottom layer hashes from left to right.
     // Those are also called Content root hashes.
-    pub fn all_root_hashes(&self) -> Vec<u64> {
+    pub fn all_root_hashes(&self) -> Vec<Vec<u64>> {
         // println!("Next")
+
+        let mut count = 0;
+        let mut total = vec![];
         let mut v = vec![];
         for c_id in 0..u16::MAX {
             if let Ok(hash) = self.get_root_content_hash(c_id) {
-                v.push(hash)
+                v.push(hash);
+                count += 1;
+                if count == 128 {
+                    total.push(v);
+                    v = vec![];
+                    count = 0;
+                }
             } else {
                 break;
             }
         }
-        println!("All root hashes count: {}", v.len());
-        v
+        if !v.is_empty() {
+            total.push(v);
+        }
+        println!("All root hashes count: ~{}", total.len() * 128);
+        total
     }
 
     // TODO: this fn should return a Vec<u64> of all of Datastore's
