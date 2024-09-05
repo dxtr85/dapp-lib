@@ -236,7 +236,7 @@ impl Datastore {
 
     // TODO: this fn should return a Vec<u64> of all of given CID's hashes
     // So only non-bottom layer hashes.
-    pub fn content_hashes(&self, c_id: ContentID) {}
+    pub fn content_hashes(&self, _c_id: ContentID) {}
 
     // This fn should return a Vec<u64> of all of given CID's data hashes
     // So only bottom layer hashes (Data hashes).
@@ -261,14 +261,14 @@ impl Datastore {
             Self::Hashed(s_store) => s_store.hash,
         }
     }
-    pub fn get_root_content_hash(&self, c_id: ContentID) -> Result<u64, ()> {
+    pub fn get_root_content_hash(&self, c_id: ContentID) -> Result<u64, AppError> {
         match self {
-            Self::Empty => Err(()),
+            Self::Empty => Err(AppError::ContentEmpty),
             Self::Filled(content) => {
                 if c_id == 0 {
                     Ok(content.hash())
                 } else {
-                    Err(())
+                    Err(AppError::IndexingError)
                 }
             }
             Self::Hashed(s_store) => s_store.get_root_content_hash(c_id),
@@ -377,9 +377,9 @@ impl Substore {
             self.left.content_bottom_hashes(c_id)
         }
     }
-    fn get_root_content_hash(&self, c_id: ContentID) -> Result<u64, ()> {
+    fn get_root_content_hash(&self, c_id: ContentID) -> Result<u64, AppError> {
         if c_id >= self.data_count {
-            return Err(());
+            return Err(AppError::IndexingError);
         }
         let left_len = self.left.len();
         // println!("c_id: {}, left_len: {}", c_id, left_len);

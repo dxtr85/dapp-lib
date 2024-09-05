@@ -1,4 +1,5 @@
 use gnome::prelude::*;
+use std::collections::HashMap;
 use std::hash::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -10,15 +11,143 @@ pub type DataType = u8;
 #[derive(Debug)]
 pub enum Content {
     // TODO: Link could also contain a non-hashed description
-    Link(GnomeId, String, ContentID),
+    Link(GnomeId, String, ContentID, Option<TransformInfo>),
     Data(DataType, ContentTree),
 }
 
+//TODO: We need to implement a mechanism that will allow for synchronization
+// of larger data structures.
+// One way to do it is to use regular AppendData SyncMessage, but it has many
+// downsides:
+// 1 - not everybody is interested in given Content, and is totally happy with
+//     only storing a single hash of it
+// 2 - during synchronization bandwith is drained so other messages have it
+//     difficult to get synced
+//
+// As a solution we could extend Content::Link with some additional info
+// that will inform everyone about given link's nature - that this is just
+// a seed to be converted into actual Data.
+
+// TODO: Tags should be synced into Datastore
+type Tag = HashMap<u8, String>;
+
+#[derive(Debug, Clone)]
+pub struct TransformInfo {
+    pub d_type: DataType,
+    pub tags: Vec<u8>,
+    pub size: u16,
+    pub root_hash: u64,
+    pub broadcast_id: CastID,
+    pub description: String,
+    pub missing_hashes: Vec<u16>,
+    pub data_hashes: Vec<Data>,
+}
+
+// To find how many Datahashes there is:
+//     size >> 7 + if (size<<9).count_ones() > 0 {
+//         1
+//     }else{
+//         0
+//     }
+// Of course if we start indexing from zero we have to substract one from above.
+
+// If size <= 128 then we can send all Data Hashes within signle Data block
+//         <= 256             2 Datablocks
+//         <= 512             4 Datablocks
+//         <= 1024            8 Datablocks
+//         <= 2048           16 Datablocks
+//         <= 4096           32 Datablocks
+//         <= 8192           64 Datablocks
+//         <= 16384         128 Datablocks
+//         <= 32768         256 Datablocks
+//         <= 65536         512 Datablocks
+// We should also store a local u16 number pointing to first hash data index that is
+// missing. This way if we receive hashes with index different from what we were
+// expecting we immediately ask a Neighbor to send us this missing block.
+// It is possible that this procedure will fail and a SyncMessage calling to Transform
+// comes. Now we have no choice but to execute it. If we have all hashes - no problem.
+// But if we are still missing some, we simply put a Data::Empty(root_hash) into
+// Datastore.
+// In cache we keep all datablocks with hashes and keep requesting for missing ones.
+// Also in cache we should store Content's Data that's incoming for later.
+// Once we have all hashes, we construct BinaryTree from them, and move what Data
+// we have stored in cache into place.
+// Now we can replace that placeholder containing only root_hash with entire tree,
+// and keep adding whatever Data comes from broadcast.
+
+impl TransformInfo {
+    pub fn from(bytes: Vec<u8>) -> Option<Self> {
+        let mut bytes_iter = bytes.into_iter();
+        if let Some(d_type) = bytes_iter.next() {
+            let b1 = bytes_iter.next().unwrap();
+            let b2 = bytes_iter.next().unwrap();
+            let size = u16::from_be_bytes([b1, b2]);
+            let tags_len = bytes_iter.next().unwrap();
+            let mut tags = Vec::with_capacity(tags_len as usize);
+            for _i in 0..tags_len {
+                tags.push(bytes_iter.next().unwrap());
+            }
+            // now goes root hash
+            let b1 = bytes_iter.next().unwrap();
+            let b2 = bytes_iter.next().unwrap();
+            let b3 = bytes_iter.next().unwrap();
+            let b4 = bytes_iter.next().unwrap();
+            let b5 = bytes_iter.next().unwrap();
+            let b6 = bytes_iter.next().unwrap();
+            let b7 = bytes_iter.next().unwrap();
+            let b8 = bytes_iter.next().unwrap();
+            let root_hash = u64::from_be_bytes([b1, b2, b3, b4, b5, b6, b7, b8]);
+            let broadcast_id = CastID(bytes_iter.next().unwrap());
+            let description = String::from_utf8(bytes_iter.collect()).unwrap();
+            Some(TransformInfo {
+                d_type,
+                tags,
+                size,
+                root_hash,
+                broadcast_id,
+                description,
+                missing_hashes: vec![],
+                data_hashes: vec![],
+            })
+        } else {
+            None
+        }
+    }
+}
+// That information will contain DataType, Tags, Description, Size, Root hash
+// and some other stuff like BroadcastID.
+// Now everyone sees what is about to happen - in future this Link will get
+// converted into Data and it will contain Data with specific DataType and Tags.
+// Now everyone can decide whether or not he is interested in syncing that Data
+// to his Datastore, or maybe just syncing all Data hashes, or nothing at all.
+// Once everyone is on the same page about nature of given link a Broadcast is
+// initiated for everyone interested to join.
+// That broadcast is used in two tiers:
+// 1 - first all Data hashes are being transmitted so that everyone knows what
+//     Data goes where and confirm that Data is a match to overall tree and it's
+//     root hash.
+//     All this Data is stored as an Appendix to given Link.
+//     After this first stage is completed a SyncMessage is sent for everyone
+//     to transform given Link into Data and use that stored hashes to create
+//     a shell of actual Data tree.
+// 2 - now Data is being transmitted over a broadcast channel and everyone
+//     subscribed can update his Content without syncing with the Swarm, since
+//     all the hashes stay intact. It's just Data::Empty(hash) being
+//     converted to Data::Filled with the same exact hash.
+//
+// Everything described above happens in parallel to SyncMessages being
+// transmitted, so application operates as always.
+// We can have up to 256 such synchronizations occur simultaneously per swarm
+// and still stay in Sync and update Datastore.
 impl Content {
-    pub fn from(data: Data) -> Result<Self, ()> {
-        let mut bytes_iter = data.bytes().into_iter();
-        match bytes_iter.next() {
-            None => Err(()),
+    pub fn from(data: Data) -> Result<Self, AppError> {
+        let bytes = data.bytes();
+        println!("Bytes: {:?}", bytes);
+        let mut bytes_iter = bytes.into_iter();
+        let first_byte = bytes_iter.next();
+        println!("First byte: {:?}", first_byte);
+        match first_byte {
+            None => Err(AppError::Smthg),
             Some(255) => {
                 // first 8 bytes is GnomeId
                 let b1 = bytes_iter.next().unwrap();
@@ -34,9 +163,15 @@ impl Content {
                 let b1 = bytes_iter.next().unwrap();
                 let b2 = bytes_iter.next().unwrap();
                 let c_id = u16::from_be_bytes([b1, b2]);
+                let name_len = bytes_iter.next().unwrap();
+                let mut name_vec = Vec::with_capacity(name_len as usize);
+                for _i in 0..name_len {
+                    name_vec.push(bytes_iter.next().unwrap());
+                }
                 // for now, remaining bytes is SwarmName
-                let swarm_name: String = String::from_utf8(bytes_iter.collect()).unwrap();
-                Ok(Content::Link(g_id, swarm_name, c_id))
+                let swarm_name: String = String::from_utf8(name_vec).unwrap();
+                let ti = TransformInfo::from(bytes_iter.collect());
+                Ok(Content::Link(g_id, swarm_name, c_id, ti))
             }
             // TODO: we can define instructions to create hollow Content
             // containing only hashes of either Data or non-data hashes
@@ -54,15 +189,23 @@ impl Content {
     }
     pub fn data_type(&self) -> DataType {
         match self {
-            Self::Link(_g, _sn, _c) => 255,
+            Self::Link(_g, _sn, _c, _ti) => 255,
             Self::Data(d_type, _ct) => *d_type,
+        }
+    }
+    pub fn link_to_data(&self) -> Option<Data> {
+        match self {
+            Content::Link(g_id, s_name, c_id, ti_opt) => {
+                Some(link_to_data(*g_id, s_name.clone(), *c_id, &ti_opt))
+            }
+            Content::Data(_d_type, _c_tree) => None,
         }
     }
     pub fn read_data(&self, data_id: u16) -> Result<Data, AppError> {
         match self {
-            Self::Link(g_id, s_name, c_id) => {
+            Self::Link(g_id, s_name, c_id, ti) => {
                 if data_id == 0 {
-                    Ok(link_to_data(*g_id, s_name.clone(), *c_id))
+                    Ok(link_to_data(*g_id, s_name.clone(), *c_id, &ti))
                 } else {
                     Err(AppError::IndexingError)
                 }
@@ -82,13 +225,13 @@ impl Content {
 
     pub fn push_data(&mut self, data: Data) -> Result<u64, AppError> {
         match self {
-            Self::Link(_g, _s, _c) => Err(AppError::DatatypeMismatch),
+            Self::Link(_g, _s, _c, _ti) => Err(AppError::DatatypeMismatch),
             Self::Data(_dt, tree) => tree.append(data),
         }
     }
     pub fn pop_data(&mut self) -> Result<Data, AppError> {
         match self {
-            Self::Link(_g, _s, _c) => Err(AppError::DatatypeMismatch),
+            Self::Link(_g, _s, _c, _ti) => Err(AppError::DatatypeMismatch),
             Self::Data(_dt, tree) => {
                 if tree.is_empty() {
                     Err(AppError::ContentEmpty)
@@ -101,24 +244,24 @@ impl Content {
 
     pub fn insert(&mut self, d_id: u16, data: Data) -> Result<u64, AppError> {
         match self {
-            Self::Link(_g, _s, _c) => Err(AppError::DatatypeMismatch),
+            Self::Link(_g, _s, _c, _ti) => Err(AppError::DatatypeMismatch),
             Self::Data(_dt, tree) => tree.insert(d_id, data),
         }
     }
     pub fn update_data(&mut self, data_id: u16, data: Data) -> Result<Data, AppError> {
         let myself = std::mem::replace(self, Content::Data(0, ContentTree::Empty(0)));
         match myself {
-            Self::Link(g_id, s_name, c_id) => {
+            Self::Link(g_id, s_name, c_id, ti) => {
                 if data_id != 0 {
-                    *self = Self::Link(g_id, s_name, c_id);
+                    *self = Self::Link(g_id, s_name, c_id, ti);
                     Err(AppError::IndexingError)
                 } else {
                     let link_result = data_to_link(data);
                     if let Ok(link) = link_result {
                         *self = link;
-                        Ok(link_to_data(g_id, s_name, c_id))
+                        Ok(link_to_data(g_id, s_name, c_id, &ti))
                     } else {
-                        *self = Self::Link(g_id, s_name, c_id);
+                        *self = Self::Link(g_id, s_name, c_id, ti);
                         Err(link_result.err().unwrap())
                     }
                 }
@@ -137,20 +280,22 @@ impl Content {
     }
     pub fn remove_data(&mut self, d_id: u16) -> Result<Data, AppError> {
         match self {
-            Self::Link(_g, _s, _c) => Err(AppError::DatatypeMismatch),
+            Self::Link(_g, _s, _c, _ti) => Err(AppError::DatatypeMismatch),
             Self::Data(_dt, tree) => tree.remove_data(d_id),
         }
     }
 
     pub fn shell(&self) -> Self {
         match self {
-            Self::Link(g_id, s_name, c_id) => Self::Link(*g_id, s_name.clone(), *c_id),
+            Self::Link(g_id, s_name, c_id, ti) => {
+                Self::Link(*g_id, s_name.clone(), *c_id, ti.clone())
+            }
             Self::Data(d_type, c_tree) => Self::Data(*d_type, c_tree.shell()),
         }
     }
     pub fn hash(&self) -> u64 {
         match self {
-            Self::Link(g_id, string, c_id) => {
+            Self::Link(g_id, string, c_id, _ti) => {
                 let mut b_vec = vec![];
                 for byte in g_id.bytes() {
                     b_vec.push(byte);
@@ -179,13 +324,13 @@ impl Content {
         }
         v
     }
-    fn get_data_hash(&self, d_id: u16) -> Result<u64, ()> {
+    fn get_data_hash(&self, d_id: u16) -> Result<u64, AppError> {
         match self {
-            Self::Link(_g, _s, _c) => {
+            Self::Link(_g, _s, _c, _ti) => {
                 if d_id == 0 {
-                    Ok(link_to_data(*_g, _s.clone(), *_c).hash())
+                    Ok(link_to_data(*_g, _s.clone(), *_c, &_ti).hash())
                 } else {
-                    Err(())
+                    Err(AppError::IndexingError)
                 }
             }
             Self::Data(_type, c_tree) => c_tree.get_data_hash(d_id),
@@ -194,36 +339,53 @@ impl Content {
 }
 
 fn data_to_link(data: Data) -> Result<Content, AppError> {
-    let mut bytes = data.bytes();
-    let len = bytes.len();
+    let mut bytes_iter = data.bytes().into_iter();
+    let len = bytes_iter.len();
     if len < 11 {
         return Err(AppError::Smthg);
     }
     let first_eight = [
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes_iter.next().unwrap(),
+        bytes_iter.next().unwrap(),
+        bytes_iter.next().unwrap(),
+        bytes_iter.next().unwrap(),
+        bytes_iter.next().unwrap(),
+        bytes_iter.next().unwrap(),
+        bytes_iter.next().unwrap(),
+        bytes_iter.next().unwrap(),
     ];
-    let next_two = [bytes[8], bytes[9]];
+    let next_two = [bytes_iter.next().unwrap(), bytes_iter.next().unwrap()];
 
-    let _ = bytes.iter_mut().skip(10);
-    let g_id = GnomeId::from(first_eight);
-    let s_res = String::from_utf8(bytes);
-    if s_res.is_err() {
-        return Err(AppError::Smthg);
+    let name_len = bytes_iter.next().unwrap();
+    let mut name_vec = Vec::with_capacity(name_len as usize);
+    for _i in 0..name_len {
+        name_vec.push(bytes_iter.next().unwrap());
     }
-    let s_name = s_res.unwrap();
+    let g_id = GnomeId::from(first_eight);
+    let s_name = String::from_utf8(name_vec).unwrap();
     let c_id = u16::from_be_bytes(next_two);
-    Ok(Content::Link(g_id, s_name, c_id))
+
+    let ti = TransformInfo::from(bytes_iter.collect());
+    Ok(Content::Link(g_id, s_name, c_id, ti))
 }
 
-fn link_to_data(g_id: GnomeId, s_name: String, c_id: ContentID) -> Data {
-    let mut v = vec![];
+fn link_to_data(
+    g_id: GnomeId,
+    s_name: String,
+    c_id: ContentID,
+    // TODO: append this
+    ti: &Option<TransformInfo>,
+) -> Data {
+    let mut v = vec![255];
     for b in g_id.bytes() {
         v.push(b);
     }
     for b in c_id.to_be_bytes() {
         v.push(b);
     }
-    for b in s_name.into_bytes() {
+    let s_bytes = s_name.into_bytes();
+    v.push(s_bytes.len() as u8);
+    for b in s_bytes {
         v.push(b);
     }
     Data::new(v).unwrap()
@@ -301,20 +463,20 @@ impl ContentTree {
             Self::Hashed(sub_tree) => sub_tree.hash,
         }
     }
-    pub fn get_data_hash(&self, data_id: u16) -> Result<u64, ()> {
+    pub fn get_data_hash(&self, data_id: u16) -> Result<u64, AppError> {
         match self {
             Self::Empty(hash) => {
                 if data_id == 0 {
                     Ok(*hash)
                 } else {
-                    Err(())
+                    Err(AppError::IndexingError)
                 }
             }
             Self::Filled(data) => {
                 if data_id == 0 {
                     Ok(data.hash())
                 } else {
-                    Err(())
+                    Err(AppError::IndexingError)
                 }
             }
             Self::Hashed(sub_tree) => sub_tree.get_data_hash(data_id),
@@ -556,9 +718,9 @@ impl Subtree {
         self.hash = hasher.finish();
         self.hash
     }
-    pub fn get_data_hash(&self, idx: u16) -> Result<u64, ()> {
+    pub fn get_data_hash(&self, idx: u16) -> Result<u64, AppError> {
         if idx >= self.data_count {
-            Err(())
+            Err(AppError::IndexingError)
         } else {
             let left_count = self.left.len();
             if idx >= left_count {

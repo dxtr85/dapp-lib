@@ -11,11 +11,11 @@ use datastore::Datastore;
 use error::AppError;
 use gnome::prelude::Data;
 use manifest::ApplicationManifest;
-use message::{SyncMessage, SyncMessageType, SyncRequirements};
+use message::{SyncMessage, SyncMessageType};
 use registry::ChangeRegistry;
 
 pub mod prelude {
-    pub use crate::content::{Content, ContentID, ContentTree};
+    pub use crate::content::{double_hash, Content, ContentID, ContentTree, TransformInfo};
     pub use crate::error::AppError;
     pub use crate::manifest::ApplicationManifest;
     pub use crate::message::SyncMessage;
@@ -88,9 +88,11 @@ impl Application {
                 all_hashes.push(0);
                 for _i in 0..total_parts {
                     let mut hash: [u8; 8] = [0; 8];
-                    for j in 0..8 {
-                        hash[j] = bytes.drain(0..1).next().unwrap();
-                        drained_bytes.push(hash[j]);
+                    // for j in 0..8 {
+                    for item in &mut hash {
+                        // hash[j] = bytes.drain(0..1).next().unwrap();
+                        *item = bytes.drain(0..1).next().unwrap();
+                        drained_bytes.push(*item);
                     }
                     let hash = u64::from_be_bytes(hash);
                     // println!("Expecting hash: {}", hash);
@@ -113,7 +115,7 @@ impl Application {
             // println!("Got hash: {}", hash);
             if let Some(temp_idx) = self.hash_to_temp_idx.get(&hash) {
                 // println!("Oh yeah");
-                if let Some((vec, mut hm)) = self.partial_data.remove(&temp_idx) {
+                if let Some((vec, mut hm)) = self.partial_data.remove(temp_idx) {
                     hm.insert(hash, data);
                     // println!("{} ==? {}", vec.len(), hm.len());
                     if vec.len() == hm.len() {
@@ -134,7 +136,7 @@ impl Application {
     pub fn root_hash(&self) -> u64 {
         self.contents.hash()
     }
-    pub fn content_root_hash(&self, c_id: ContentID) -> Result<u64, ()> {
+    pub fn content_root_hash(&self, c_id: ContentID) -> Result<u64, AppError> {
         self.contents.get_root_content_hash(c_id)
     }
     pub fn registry(&self) -> Vec<ContentID> {
