@@ -5,7 +5,7 @@ use super::content::ContentID;
 use super::content::ContentTree;
 use super::manifest::ApplicationManifest;
 use super::prelude::AppError;
-use gnome::prelude::Data;
+use crate::Data;
 
 // A Datastore is an append-only data structure built as a binary tree,
 // that should never be actively balanced.

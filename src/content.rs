@@ -5,6 +5,7 @@ use std::hash::Hash;
 use std::hash::Hasher;
 
 use crate::prelude::AppError;
+use crate::prelude::Data;
 pub type ContentID = u16;
 pub type DataType = u8;
 

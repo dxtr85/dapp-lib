@@ -1,5 +1,5 @@
 use super::content::DataType;
-use gnome::prelude::Data;
+use crate::Data;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hasher};
 use std::{fmt, hash::Hash};

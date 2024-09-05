@@ -1,4 +1,5 @@
 mod content;
+mod data;
 mod datastore;
 mod error;
 mod manifest;
@@ -6,16 +7,19 @@ mod message;
 mod registry;
 use std::collections::HashMap;
 
+use crate::prelude::CastData;
+use crate::prelude::SyncData;
 use content::{Content, ContentID};
+pub use data::Data;
 use datastore::Datastore;
 use error::AppError;
-use gnome::prelude::Data;
 use manifest::ApplicationManifest;
 use message::{SyncMessage, SyncMessageType};
 use registry::ChangeRegistry;
 
 pub mod prelude {
     pub use crate::content::{double_hash, Content, ContentID, ContentTree, TransformInfo};
+    pub use crate::data::Data;
     pub use crate::error::AppError;
     pub use crate::manifest::ApplicationManifest;
     pub use crate::message::SyncMessage;
@@ -60,7 +64,7 @@ impl Application {
     }
 
     // TODO: this needs rework as well as SyncMessage::from_data
-    pub fn process(&mut self, data: Data) -> Option<SyncMessage> {
+    pub fn process(&mut self, data: SyncData) -> Option<SyncMessage> {
         // let mut bytes_iter = data.ref_bytes().iter();
         let mut bytes = data.bytes();
         let m_type = SyncMessageType::new(&mut bytes);

@@ -1,6 +1,7 @@
+use crate::SyncData;
 use std::collections::HashMap;
 
-use gnome::prelude::Data;
+use crate::Data;
 
 use crate::content::ContentID;
 use crate::Application;
@@ -231,7 +232,7 @@ impl SyncMessage {
         }
     }
 
-    pub fn into_parts(self) -> Vec<Data> {
+    pub fn into_parts(self) -> Vec<SyncData> {
         //TODO: here we need to determine how many parts will given message consist of
         // based on Data.len() and requirements size.
         // We also need to count 10 byte pairs of (c_id, hash) for each
@@ -258,7 +259,7 @@ impl SyncMessage {
             bytes.push(0);
             bytes.append(&mut self.requirements.bytes());
             bytes.append(&mut self.data.bytes());
-            let data = Data::new(bytes).unwrap();
+            let data = SyncData::new(bytes).unwrap();
             partials.push(data);
             // partials.push(PartialMessage { m_type, part_no: 0, total_parts:0, data })
         } else {
@@ -308,7 +309,7 @@ impl SyncMessage {
             req_and_data_bytes.append(&mut data_bytes);
             let mut first_chunk_bytes: Vec<u8> =
                 req_and_data_bytes.drain(0..first_chunk_size).collect();
-            let mut subsequent_chunks: Vec<Data> = vec![];
+            let mut subsequent_chunks: Vec<SyncData> = vec![];
             // TODO/DONE?(was 1021): recalculate how many bytes to drain, since now
             // message type can take up to 5 bytes, not 1 as previously
             for i in 0..non_header_parts {
@@ -323,7 +324,7 @@ impl SyncMessage {
                 };
                 // println!("before drain, rem bytes: {}",req_and_data_bytes.len());
                 vec.append(&mut req_and_data_bytes.drain(0..drain_count).collect());
-                let data = Data::new(vec).unwrap();
+                let data = SyncData::new(vec).unwrap();
                 let hash = data.hash();
                 for byte in hash.to_be_bytes() {
                     header_bytes.push(byte);
@@ -331,7 +332,7 @@ impl SyncMessage {
                 subsequent_chunks.push(data);
             }
             header_bytes.append(&mut first_chunk_bytes);
-            partials.push(Data::new(header_bytes).unwrap());
+            partials.push(SyncData::new(header_bytes).unwrap());
             partials.append(&mut subsequent_chunks);
         }
 
