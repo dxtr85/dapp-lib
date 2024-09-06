@@ -1,11 +1,12 @@
-use crate::content::double_hash;
-
 use super::content::Content;
 use super::content::ContentID;
 use super::content::ContentTree;
 use super::manifest::ApplicationManifest;
 use super::prelude::AppError;
+use crate::content::double_hash;
+use crate::prelude::TransformInfo;
 use crate::Data;
+use std::collections::HashSet;
 
 // A Datastore is an append-only data structure built as a binary tree,
 // that should never be actively balanced.
@@ -134,6 +135,71 @@ impl Datastore {
             }
         }
     }
+    pub fn take_transform_info(&mut self, c_id: ContentID) -> Result<TransformInfo, AppError> {
+        let myself = std::mem::replace(self, Datastore::Empty);
+        match myself {
+            Self::Empty => Err(AppError::IndexingError),
+            Self::Filled(content) => {
+                if c_id == 0 {
+                    match content {
+                        Content::Link(g_id, s_name, c_id, ti) => {
+                            let result = if let Some(ti) = ti {
+                                Ok(ti)
+                            } else {
+                                Err(AppError::LinkNonTransformative)
+                            };
+                            *self = Self::Filled(Content::Link(g_id, s_name, c_id, None));
+                            result
+                        }
+                        other => {
+                            *self = Self::Filled(other);
+                            Err(AppError::DatatypeMismatch)
+                        }
+                    }
+                } else {
+                    Err(AppError::IndexingError)
+                }
+            }
+            Self::Hashed(mut s_store) => {
+                let result = s_store.take_transform_info(c_id);
+                *self = Self::Hashed(s_store);
+                result
+            }
+        }
+    }
+
+    pub fn restore_transform_info(
+        &mut self,
+        c_id: ContentID,
+        ti: TransformInfo,
+    ) -> Result<(), AppError> {
+        //TODO
+        let myself = std::mem::replace(self, Datastore::Empty);
+        match myself {
+            Self::Empty => Err(AppError::IndexingError),
+            Self::Filled(content) => {
+                if c_id == 0 {
+                    match content {
+                        Content::Link(g_id, s_name, c_id, _ti) => {
+                            *self = Self::Filled(Content::Link(g_id, s_name, c_id, Some(ti)));
+                            Ok(())
+                        }
+                        other => {
+                            *self = Self::Filled(other);
+                            Err(AppError::DatatypeMismatch)
+                        }
+                    }
+                } else {
+                    Err(AppError::IndexingError)
+                }
+            }
+            Self::Hashed(mut s_store) => {
+                let result = s_store.restore_transform_info(c_id, ti);
+                *self = Self::Hashed(s_store);
+                result
+            }
+        }
+    }
 
     // This fn should be used for updating content of existing item.
     // This can fail only when we are trying to change to Content with
@@ -144,8 +210,21 @@ impl Datastore {
             Self::Empty => Err(AppError::IndexingError),
             Self::Filled(old_content) => {
                 if c_id == 0 {
-                    *self = Self::Filled(content);
-                    Ok(old_content)
+                    match old_content {
+                        Content::Link(_g_id, ref _s_name, _c_id, ref ti_opt) => {
+                            if ti_opt.is_some() {
+                                *self = Self::Filled(old_content);
+                                Err(AppError::Smthg)
+                            } else {
+                                *self = Self::Filled(content);
+                                Ok(old_content)
+                            }
+                        }
+                        other => {
+                            *self = Self::Filled(content);
+                            Ok(other)
+                        }
+                    }
                 } else {
                     Err(AppError::IndexingError)
                 }
@@ -184,6 +263,39 @@ impl Datastore {
                 result
             }
         }
+    }
+
+    // This fn should be used when uploading content
+    pub fn update_transformative_link(
+        &mut self,
+        is_hash: bool,
+        content_id: ContentID,
+        part_no: u16,
+        total_parts: u16,
+        data: Data,
+    ) -> Result<HashSet<u16>, AppError> {
+        // let content = self.take(content_id).unwrap();
+        // println!("Update: {} is_hash: {}", content_id, is_hash);
+        // if let Content::Link(g_id, s_name, lc_id, ti) = content {
+        // if let Some(mut tiu) = ti {
+        if let Ok(mut tiu) = self.take_transform_info(content_id) {
+            if is_hash {
+                tiu.add_hash(part_no, total_parts, data);
+            } else {
+                tiu.add_data(part_no, total_parts, data);
+            }
+            let missing_hashes = tiu.whats_missing();
+            let res = self.restore_transform_info(content_id, tiu);
+            println!("Update res: {:?}", res);
+            Ok(missing_hashes)
+        } else {
+            // let _ = self.update(content_id, Content::Link(g_id, s_name, lc_id, ti));
+            Err(AppError::LinkNonTransformative)
+        }
+        // } else {
+        //     let _ = self.update(content_id, content);
+        //     Err(AppError::DatatypeMismatch)
+        // }
     }
 
     // This fn should be used for reading selected datachunk
@@ -285,7 +397,7 @@ impl Datastore {
 }
 
 #[derive(Debug)]
-struct Substore {
+pub struct Substore {
     data_count: u16,
     hash: u64,
     left: Datastore,
@@ -317,6 +429,32 @@ impl Substore {
             self.right.take(c_id - left_len)
         } else {
             self.left.take(c_id)
+        }
+    }
+    pub fn take_transform_info(&mut self, c_id: ContentID) -> Result<TransformInfo, AppError> {
+        if c_id >= self.data_count {
+            return Err(AppError::IndexingError);
+        }
+        let left_len = self.left.len();
+        if c_id >= left_len {
+            self.right.take_transform_info(c_id - left_len)
+        } else {
+            self.left.take_transform_info(c_id)
+        }
+    }
+    pub fn restore_transform_info(
+        &mut self,
+        c_id: ContentID,
+        ti: TransformInfo,
+    ) -> Result<(), AppError> {
+        if c_id >= self.data_count {
+            return Err(AppError::IndexingError);
+        }
+        let left_len = self.left.len();
+        if c_id >= left_len {
+            self.right.restore_transform_info(c_id - left_len, ti)
+        } else {
+            self.left.restore_transform_info(c_id, ti)
         }
     }
     pub fn read_data(&self, (c_id, data_id): (ContentID, u16)) -> Result<Data, AppError> {

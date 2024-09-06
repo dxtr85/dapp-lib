@@ -1,5 +1,6 @@
 use gnome::prelude::*;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::hash::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -30,7 +31,7 @@ pub enum Content {
 // a seed to be converted into actual Data.
 
 // TODO: Tags should be synced into Datastore
-type Tag = HashMap<u8, String>;
+// type Tag = HashMap<u8, String>;
 
 #[derive(Debug, Clone)]
 pub struct TransformInfo {
@@ -40,8 +41,9 @@ pub struct TransformInfo {
     pub root_hash: u64,
     pub broadcast_id: CastID,
     pub description: String,
-    pub missing_hashes: Vec<u16>,
+    pub missing_hashes: HashSet<u16>,
     pub data_hashes: Vec<Data>,
+    pub data: HashMap<u16, Data>,
 }
 
 // To find how many Datahashes there is:
@@ -78,12 +80,14 @@ pub struct TransformInfo {
 
 impl TransformInfo {
     pub fn from(bytes: Vec<u8>) -> Option<Self> {
+        println!("TI from: {:?}", bytes);
         let mut bytes_iter = bytes.into_iter();
         if let Some(d_type) = bytes_iter.next() {
             let b1 = bytes_iter.next().unwrap();
             let b2 = bytes_iter.next().unwrap();
             let size = u16::from_be_bytes([b1, b2]);
             let tags_len = bytes_iter.next().unwrap();
+            println!("tag len: {}", tags_len);
             let mut tags = Vec::with_capacity(tags_len as usize);
             for _i in 0..tags_len {
                 tags.push(bytes_iter.next().unwrap());
@@ -99,7 +103,30 @@ impl TransformInfo {
             let b8 = bytes_iter.next().unwrap();
             let root_hash = u64::from_be_bytes([b1, b2, b3, b4, b5, b6, b7, b8]);
             let broadcast_id = CastID(bytes_iter.next().unwrap());
-            let description = String::from_utf8(bytes_iter.collect()).unwrap();
+            let b1 = bytes_iter.next().unwrap();
+            let b2 = bytes_iter.next().unwrap();
+            let descr_len = u16::from_be_bytes([b1, b2]);
+            let mut descr_vec = Vec::with_capacity(descr_len as usize);
+            for _i in 0..descr_len {
+                descr_vec.push(bytes_iter.next().unwrap());
+            }
+            let description = String::from_utf8(descr_vec).unwrap();
+            let b1 = bytes_iter.next().unwrap();
+            let b2 = bytes_iter.next().unwrap();
+            let missing_len = u16::from_be_bytes([b1, b2]);
+            let mut missing_hashes = HashSet::with_capacity(missing_len as usize);
+            for _i in 0..missing_len {
+                let b1 = bytes_iter.next().unwrap();
+                let b2 = bytes_iter.next().unwrap();
+                missing_hashes.insert(u16::from_be_bytes([b1, b2]));
+            }
+            let b1 = bytes_iter.next().unwrap();
+            let b2 = bytes_iter.next().unwrap();
+            let hashes_len = u16::from_be_bytes([b1, b2]);
+            let b1 = bytes_iter.next().unwrap();
+            let b2 = bytes_iter.next().unwrap();
+            let data_len = u16::from_be_bytes([b1, b2]);
+
             Some(TransformInfo {
                 d_type,
                 tags,
@@ -107,12 +134,115 @@ impl TransformInfo {
                 root_hash,
                 broadcast_id,
                 description,
-                missing_hashes: vec![],
-                data_hashes: vec![],
+                missing_hashes,
+                data_hashes: Vec::with_capacity(hashes_len as usize),
+                data: HashMap::with_capacity(data_len as usize),
             })
         } else {
             None
         }
+    }
+    pub fn bytes(self) -> Vec<u8> {
+        // pub d_type: DataType,
+        let mut bytes = vec![self.d_type];
+        // pub size: u16,
+        for byte in self.size.to_be_bytes() {
+            bytes.push(byte);
+        }
+        // pub tags: Vec<u8>,
+        bytes.push(self.tags.len() as u8);
+        for tag in self.tags {
+            bytes.push(tag);
+        }
+        // pub root_hash: u64,
+        for byte in self.root_hash.to_be_bytes() {
+            bytes.push(byte);
+        }
+        // pub broadcast_id: CastID,
+        bytes.push(self.broadcast_id.0);
+        // pub description: String,
+        for byte in (self.description.len() as u16).to_be_bytes() {
+            bytes.push(byte);
+        }
+        for byte in self.description.bytes() {
+            bytes.push(byte);
+        }
+        // pub missing_hashes: Vec<u16>,
+        for byte in (self.missing_hashes.len() as u16).to_be_bytes() {
+            bytes.push(byte);
+        }
+        for m_id in self.missing_hashes {
+            for byte in m_id.to_be_bytes() {
+                bytes.push(byte);
+            }
+        }
+        // pub data_hashes: Vec<Data>,
+        for byte in (self.data_hashes.len() as u16).to_be_bytes() {
+            bytes.push(byte);
+        }
+        // pub data: Vec<Data>,
+        for byte in (self.data.len() as u16).to_be_bytes() {
+            bytes.push(byte);
+        }
+        bytes
+    }
+    pub fn add_hash(&mut self, part_no: u16, _total_parts: u16, data: Data) {
+        //TODO
+        if self.missing_hashes.contains(&part_no) {
+            self.missing_hashes.remove(&part_no);
+            self.data_hashes[part_no as usize] = data;
+        } else {
+            let current_len = self.data_hashes.len() as u16;
+            if current_len < part_no {
+                for i in current_len..part_no {
+                    self.missing_hashes.insert(i);
+                    self.data_hashes.push(Data::empty());
+                }
+            }
+            self.data_hashes.push(data);
+        }
+    }
+
+    pub fn add_data(&mut self, part_no: u16, _total_parts: u16, data: Data) {
+        println!(
+            "add_data: [{}/{}] {}",
+            part_no,
+            _total_parts,
+            self.data.len()
+        );
+        // TODO: check if this is correct
+        // let hash_data_id = if part_no < 128 { 0 } else { part_no >> 7 };
+        let hash_data_id = part_no >> 7;
+        if self.missing_hashes.contains(&hash_data_id) {
+            println!("Missing hash, adding unconditionally");
+            let _res = self.data.insert(part_no, data);
+        } else {
+            // TODO: check if this is correct
+            let hidx = ((part_no % 128) * 8) as usize;
+            let b = self.data_hashes[hash_data_id as usize].ref_bytes();
+            let hash = u64::from_be_bytes([
+                b[hidx],
+                b[hidx + 1],
+                b[hidx + 2],
+                b[hidx + 3],
+                b[hidx + 4],
+                b[hidx + 5],
+                b[hidx + 6],
+                b[hidx + 7],
+            ]);
+            if hash == data.hash() {
+                let _res = self.data.insert(part_no, data);
+            } else {
+                println!("Hashes do not match, not adding");
+            }
+        }
+        // println!("Data len before: {}", self.data.len());
+        // let res = self.data.insert(part_no, Data::empty());
+        // self.data.len()
+        println!("Data len: {}", self.data.len());
+    }
+    pub fn whats_missing(&self) -> HashSet<u16> {
+        self.missing_hashes.clone()
     }
 }
 // That information will contain DataType, Tags, Description, Size, Root hash
@@ -169,7 +299,6 @@ impl Content {
                 for _i in 0..name_len {
                     name_vec.push(bytes_iter.next().unwrap());
                 }
-                // for now, remaining bytes is SwarmName
                 let swarm_name: String = String::from_utf8(name_vec).unwrap();
                 let ti = TransformInfo::from(bytes_iter.collect());
                 Ok(Content::Link(g_id, swarm_name, c_id, ti))
@@ -194,19 +323,19 @@ impl Content {
             Self::Data(d_type, _ct) => *d_type,
         }
     }
-    pub fn link_to_data(&self) -> Option<Data> {
+    pub fn to_data(self) -> Result<Data, Self> {
         match self {
             Content::Link(g_id, s_name, c_id, ti_opt) => {
-                Some(link_to_data(*g_id, s_name.clone(), *c_id, &ti_opt))
+                Ok(link_to_data(g_id, s_name, c_id, ti_opt))
             }
-            Content::Data(_d_type, _c_tree) => None,
+            other => Err(other),
         }
     }
     pub fn read_data(&self, data_id: u16) -> Result<Data, AppError> {
         match self {
             Self::Link(g_id, s_name, c_id, ti) => {
                 if data_id == 0 {
-                    Ok(link_to_data(*g_id, s_name.clone(), *c_id, &ti))
+                    Ok(link_to_data(*g_id, s_name.clone(), *c_id, ti.clone()))
                 } else {
                     Err(AppError::IndexingError)
                 }
@@ -223,7 +352,6 @@ impl Content {
     pub fn update(&mut self, content: Content) -> Content {
         std::mem::replace(self, content)
     }
-
     pub fn push_data(&mut self, data: Data) -> Result<u64, AppError> {
         match self {
             Self::Link(_g, _s, _c, _ti) => Err(AppError::DatatypeMismatch),
@@ -260,7 +388,7 @@ impl Content {
                     let link_result = data_to_link(data);
                     if let Ok(link) = link_result {
                         *self = link;
-                        Ok(link_to_data(g_id, s_name, c_id, &ti))
+                        Ok(link_to_data(g_id, s_name, c_id, ti))
                     } else {
                         *self = Self::Link(g_id, s_name, c_id, ti);
                         Err(link_result.err().unwrap())
@@ -329,7 +457,8 @@ impl Content {
         match self {
             Self::Link(_g, _s, _c, _ti) => {
                 if d_id == 0 {
-                    Ok(link_to_data(*_g, _s.clone(), *_c, &_ti).hash())
+                    // Ok(link_to_data(*_g, _s.clone(), *_c, &_ti).hash())
+                    Ok(self.hash())
                 } else {
                     Err(AppError::IndexingError)
                 }
@@ -370,13 +499,7 @@ fn data_to_link(data: Data) -> Result<Content, AppError> {
     Ok(Content::Link(g_id, s_name, c_id, ti))
 }
 
-fn link_to_data(
-    g_id: GnomeId,
-    s_name: String,
-    c_id: ContentID,
-    // TODO: append this
-    ti: &Option<TransformInfo>,
-) -> Data {
+fn link_to_data(g_id: GnomeId, s_name: String, c_id: ContentID, ti: Option<TransformInfo>) -> Data {
     let mut v = vec![255];
     for b in g_id.bytes() {
         v.push(b);
@@ -388,6 +511,9 @@ fn link_to_data(
     v.push(s_bytes.len() as u8);
     for b in s_bytes {
         v.push(b);
+    }
+    if let Some(ti) = ti {
+        v.append(&mut ti.bytes());
     }
     Data::new(v).unwrap()
 }

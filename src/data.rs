@@ -28,8 +28,9 @@ impl Data {
         SyncData::new(self.0).unwrap()
     }
 
-    pub fn to_cast(self) -> CastData {
-        CastData::new(self.0).unwrap()
+    pub fn to_cast(self, mut prefix: Vec<u8>) -> CastData {
+        prefix.append(&mut self.bytes());
+        CastData::new(prefix).unwrap()
     }
 
     pub fn bytes(self) -> Vec<u8> {

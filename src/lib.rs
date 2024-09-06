@@ -6,8 +6,9 @@ mod manifest;
 mod message;
 mod registry;
 use std::collections::HashMap;
+use std::collections::HashSet;
 
-use crate::prelude::CastData;
+// use crate::prelude::CastData;
 use crate::prelude::SyncData;
 use content::{Content, ContentID};
 pub use data::Data;
@@ -149,6 +150,17 @@ impl Application {
 
     pub fn all_content_root_hashes(&self) -> Vec<Vec<u64>> {
         self.contents.all_root_hashes()
+    }
+    pub fn update_transformative_link(
+        &mut self,
+        is_hash: bool,
+        content_id: ContentID,
+        part_no: u16,
+        total_parts: u16,
+        data: Data,
+    ) -> Result<HashSet<u16>, AppError> {
+        self.contents
+            .update_transformative_link(is_hash, content_id, part_no, total_parts, data)
     }
     pub fn append(&mut self, content: Content) -> Result<u64, AppError> {
         let index_to_add = self.contents.len();
