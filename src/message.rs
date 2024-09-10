@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use crate::Data;
 
 use crate::content::ContentID;
-use crate::Application;
+use crate::ApplicationData;
 
 pub struct SyncRequirements {
     pub pre: Vec<(ContentID, u64)>,
@@ -39,7 +39,7 @@ impl SyncRequirements {
     // TODO: we need to add a read: Vec<Content_ID> argument
     // to verify that only specified contents were read
     // and that all specified contents were read
-    pub fn pre_validate(&self, _c_id: ContentID, app: &Application) -> bool {
+    pub fn pre_validate(&self, _c_id: ContentID, app: &ApplicationData) -> bool {
         for (c_id, hash) in self.pre.iter() {
             if let Ok(d_hash) = app.content_root_hash(*c_id) {
                 if d_hash != *hash {
@@ -57,7 +57,7 @@ impl SyncRequirements {
     // TODO: we need to add a changed: Vec<Content_ID> argument
     // to verify that only specified contents were changed
     // and that all specified contents were changed
-    pub fn post_validate(&self, c_id: ContentID, app: &Application) -> bool {
+    pub fn post_validate(&self, c_id: ContentID, app: &ApplicationData) -> bool {
         for (c_id, hash) in self.post.iter() {
             if let Ok(d_hash) = app.content_root_hash(*c_id) {
                 if d_hash != *hash {

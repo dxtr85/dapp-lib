@@ -188,19 +188,31 @@ impl TransformInfo {
     }
     pub fn add_hash(&mut self, part_no: u16, _total_parts: u16, data: Data) {
         //TODO
+        println!(
+            "Adding hash: [{}/{}], len: {}",
+            part_no,
+            _total_parts,
+            data.len()
+        );
         if self.missing_hashes.contains(&part_no) {
             self.missing_hashes.remove(&part_no);
             self.data_hashes[part_no as usize] = data;
         } else {
+            println!("not missing");
             let current_len = self.data_hashes.len() as u16;
             if current_len < part_no {
                 for i in current_len..part_no {
                     self.missing_hashes.insert(i);
                     self.data_hashes.push(Data::empty());
                 }
+            } else if current_len > part_no {
+                // Overwrite unconditionally
+                self.data_hashes[part_no as usize] = data;
+            } else {
+                self.data_hashes.push(data);
             }
-            self.data_hashes.push(data);
         }
+        // panic!("just to see");
     }
 
     pub fn add_data(&mut self, part_no: u16, _total_parts: u16, data: Data) {
@@ -213,12 +225,16 @@ impl TransformInfo {
         // TODO: check if this is correct
         // let hash_data_id = if part_no < 128 { 0 } else { part_no >> 7 };
         let hash_data_id = part_no >> 7;
-        if self.missing_hashes.contains(&hash_data_id) {
+        println!("hID: {}, DHlen: {}", hash_data_id, self.data_hashes.len());
+        if self.missing_hashes.contains(&hash_data_id)
+            || hash_data_id as usize >= self.data_hashes.len()
+        {
             println!("Missing hash, adding unconditionally");
             let _res = self.data.insert(part_no, data);
         } else {
             // TODO: check if this is correct
             let hidx = ((part_no % 128) * 8) as usize;
+            // println!("DHlen: {}", self.data_hashes.len());
             let b = self.data_hashes[hash_data_id as usize].ref_bytes();
             let hash = u64::from_be_bytes([
                 b[hidx],
