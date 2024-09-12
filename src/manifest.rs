@@ -35,7 +35,7 @@ impl ApplicationManifest {
     pub fn hash(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
         let mut bytes = Vec::from(self.0.clone());
-        println!("mani hash len1: {}", bytes.len());
+        // println!("mani hash len1: {}", bytes.len());
         for i in 0..=255 {
             // bytes.push(i);
             if let Some(value) = self.1.get(&i) {
@@ -47,7 +47,7 @@ impl ApplicationManifest {
                 bytes.push(0);
             }
         }
-        println!("mani hash len: {}", bytes.len());
+        // println!("mani hash len: {}", bytes.len());
         bytes.hash(&mut hasher);
         hasher.finish()
     }

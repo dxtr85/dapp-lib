@@ -249,7 +249,7 @@ impl SyncMessage {
 
         // TODO/DONE? (was 897): recalculate how many bytes to drain, since now
         // message type can take up to 5 bytes, not 1 as previously
-        println!("Netto: {}", netto_size);
+        // println!("Netto: {}", netto_size);
         if netto_size < 893 {
             let mut bytes = Vec::with_capacity(netto_size + 3);
             for byte in self.m_type.as_bytes() {

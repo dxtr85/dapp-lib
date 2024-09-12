@@ -16,7 +16,6 @@ use std::collections::HashSet;
 use crate::content::double_hash;
 use async_std::task::sleep;
 use async_std::task::spawn;
-use async_std::task::yield_now;
 pub use config::Configuration;
 use content::ContentTree;
 use content::{Content, ContentID};
@@ -128,9 +127,10 @@ async fn serve_gnome_manager(
     // TODO: AppMgr should hold state
     let mut app_mgr = ApplicationManager::new();
 
+    let sleep_time = Duration::from_millis(128);
     loop {
-        yield_now().await;
-        if let Ok(ManagerResponse::SwarmJoined(s_id, _s_name, to_swarm, from_swarm)) =
+        sleep(sleep_time).await;
+        while let Ok(ManagerResponse::SwarmJoined(s_id, _s_name, to_swarm, from_swarm)) =
             recv.try_recv()
         {
             // println!("recv swarm joined");
@@ -144,14 +144,14 @@ async fn serve_gnome_manager(
             let app_data = ApplicationData::empty();
             spawn(serve_app_data(app_data, to_app_data_recv, to_swarm));
             spawn(serve_swarm(
-                Duration::from_millis(30),
+                Duration::from_millis(64),
                 from_swarm,
                 to_app_data_send.clone(),
             ));
             // } else {
             //     return;
         }
-        if let Ok(message) = to_app_mgr_recv.try_recv() {
+        while let Ok(message) = to_app_mgr_recv.try_recv() {
             match message {
                 ToAppMgr::UploadData => {
                     let _ = app_mgr.active_app_data.send(ToAppData::UploadData);
@@ -176,7 +176,6 @@ async fn serve_gnome_manager(
                 }
             }
         }
-        yield_now().await;
     }
 }
 
@@ -188,9 +187,10 @@ async fn serve_app_data(
     let mut b_cast_origin: Option<(CastID, Sender<CastData>)> = None;
     let mut b_req_sent = false;
     let mut next_val = 0;
+    let sleep_time = Duration::from_millis(128);
     loop {
-        yield_now().await;
-        if let Ok(resp) = app_data_recv.try_recv() {
+        sleep(sleep_time).await;
+        while let Ok(resp) = app_data_recv.try_recv() {
             match resp {
                 ToAppData::StartUnicast => {
                     let res =
@@ -369,12 +369,12 @@ async fn serve_app_data(
                             println!("spawning serve_broadcast_origin");
                             spawn(serve_broadcast_origin(
                                 broadcast_id,
-                                Duration::from_millis(400),
+                                Duration::from_millis(1000),
                                 bcast_send.clone(),
                                 hash_bytes,
                                 done_send.clone(),
                             ));
-                            yield_now().await;
+                            sleep(sleep_time).await;
                             let _done_res = done_recv.recv();
                             println!("Hashes sent: {}", _done_res.is_ok());
                             // TODO
@@ -391,7 +391,7 @@ async fn serve_app_data(
                             }
                             spawn(serve_broadcast_origin(
                                 broadcast_id,
-                                Duration::from_millis(200),
+                                Duration::from_millis(1000),
                                 bcast_send.clone(),
                                 c_data_vec,
                                 done_send.clone(),
@@ -415,7 +415,7 @@ async fn serve_app_data(
                     } = process_result.unwrap();
 
                     // let b_type = data.first_byte();
-                    println!("Received m_type: {:?}", m_type);
+                    // println!("Received m_type: {:?}", m_type);
                     match m_type {
                         SyncMessageType::SetManifest => {
                             let old_manifest = app_data.get_all_data(0);
@@ -429,7 +429,7 @@ async fn serve_app_data(
                                 } else {
                                     app_data.update(0, content).is_ok()
                                 };
-                                println!("Manifest result: {:?}", res);
+                                // println!("Manifest result: {:?}", res);
                                 if !requirements.post_validate(0, &app_data) {
                                     println!("POST validation failed");
                                     if let Ok(data_vec) = old_manifest {
@@ -467,10 +467,10 @@ async fn serve_app_data(
                                     continue;
                                 }
                                 let content = Content::from(data).unwrap();
-                                println!("Content: {:?}", content);
+                                // println!("Content: {:?}", content);
                                 let (recv_id, recv_hash) = requirements.post[0];
-                                println!("Recv id: {}, next id: {}", recv_id, next_id);
-                                println!("Recv hash: {}, next hash: {}", recv_hash, content.hash());
+                                // println!("Recv id: {}, next id: {}", recv_id, next_id);
+                                // println!("Recv hash: {}, next hash: {}", recv_hash, content.hash());
                                 if recv_id == next_id && recv_hash == content.hash() {
                                     let res = app_data.append(content);
                                     println!("Content added: {:?}", res);
@@ -481,7 +481,7 @@ async fn serve_app_data(
                             }
                         }
                         SyncMessageType::ChangeContent(c_id) => {
-                            println!("ChangeContent");
+                            // println!("ChangeContent");
                             if !requirements.pre_validate(c_id, &app_data) {
                                 println!("PRE validation failed for ChangeContent");
                                 continue;
@@ -728,7 +728,7 @@ async fn serve_app_data(
                             a_msg.data,
                         );
                         if let Ok(missing) = upd_res {
-                            println!("Missing hashes: {:?}", missing);
+                            // println!("Missing hashes: {:?}", missing);
                             //TODO: request hashes if missing not empty
                         } else {
                             println!("Unable to update: {:?}", upd_res);
@@ -753,9 +753,9 @@ async fn serve_swarm(
     to_app_data_send: Sender<ToAppData>,
 ) {
     loop {
-        yield_now().await;
-        let data = user_res.try_recv();
-        if let Ok(resp) = data {
+        sleep(sleep_time).await;
+        // let data = user_res.try_recv();
+        while let Ok(resp) = user_res.try_recv() {
             // println!("SUR: {:?}", resp);
             match resp {
                 Response::AppDataSynced(synced) => {
@@ -797,10 +797,10 @@ async fn serve_swarm(
                     let _ = to_app_data_send.send(ToAppData::Response(resp));
                 }
             }
-        } else {
+            // } else {
             // println!("{:?}", data);
         }
-        sleep(sleep_time).await;
+        // sleep(sleep_time).await;
     }
 }
 
@@ -825,19 +825,18 @@ async fn serve_broadcast_origin(
     sleep(Duration::from_secs(4)).await;
     println!("Initial sleep is over");
     // TODO: indexing
-    for data in data_vec {
+    for (i, data) in data_vec.into_iter().enumerate() {
         // loop {
         let send_res = user_res.send(data);
         if send_res.is_ok() {
-            println!("Broadcasted ",);
+            print!("BCed: {}\t", i + 1);
         } else {
             println!(
                 "Error while trying to broadcast: {:?}",
                 send_res.err().unwrap()
             );
         }
-        // i = i.wrapping_add(1);
-
+        // println!("About to go to sleep for: {:?}", sleep_time);
         sleep(sleep_time).await;
     }
     let _ = done.send(());
@@ -1014,7 +1013,7 @@ impl ApplicationData {
         let total_parts = bytes.drain(0..1).next().unwrap();
         drained_bytes.push(part_no);
         drained_bytes.push(total_parts);
-        println!("[{}/{}]", part_no, total_parts);
+        // println!("[{}/{}]", part_no, total_parts);
         if part_no == 0 {
             if total_parts == 0 {
                 let mut hm = HashMap::new();

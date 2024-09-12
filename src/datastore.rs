@@ -286,7 +286,7 @@ impl Datastore {
             }
             let missing_hashes = tiu.whats_missing();
             let res = self.restore_transform_info(content_id, tiu);
-            println!("Update res: {:?}", res);
+            // println!("Update res: {:?}", res);
             Ok(missing_hashes)
         } else {
             // let _ = self.update(content_id, Content::Link(g_id, s_name, lc_id, ti));

@@ -216,16 +216,16 @@ impl TransformInfo {
     }
 
     pub fn add_data(&mut self, part_no: u16, _total_parts: u16, data: Data) {
-        println!(
-            "add_data: [{}/{}] {}",
-            part_no,
-            _total_parts,
-            self.data.len()
-        );
+        // println!(
+        //     "add_data: [{}/{}] {}",
+        //     part_no,
+        //     _total_parts,
+        //     self.data.len()
+        // );
         // TODO: check if this is correct
         // let hash_data_id = if part_no < 128 { 0 } else { part_no >> 7 };
         let hash_data_id = part_no >> 7;
-        println!("hID: {}, DHlen: {}", hash_data_id, self.data_hashes.len());
+        // println!("hID: {}, DHlen: {}", hash_data_id, self.data_hashes.len());
         if self.missing_hashes.contains(&hash_data_id)
             || hash_data_id as usize >= self.data_hashes.len()
         {
@@ -255,7 +255,7 @@ impl TransformInfo {
         // println!("Data len before: {}", self.data.len());
         // let res = self.data.insert(part_no, Data::empty());
         // self.data.len()
-        println!("Data len: {}", self.data.len());
+        print!("L:{}\t", self.data.len());
     }
     pub fn whats_missing(&self) -> HashSet<u16> {
         self.missing_hashes.clone()
@@ -289,10 +289,10 @@ impl TransformInfo {
 impl Content {
     pub fn from(data: Data) -> Result<Self, AppError> {
         let bytes = data.bytes();
-        println!("Bytes: {:?}", bytes);
+        // println!("Bytes: {:?}", bytes);
         let mut bytes_iter = bytes.into_iter();
         let first_byte = bytes_iter.next();
-        println!("First byte: {:?}", first_byte);
+        // println!("First byte: {:?}", first_byte);
         match first_byte {
             None => Err(AppError::Smthg),
             Some(255) => {
