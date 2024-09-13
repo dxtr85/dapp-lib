@@ -1,6 +1,8 @@
+use async_std::channel;
+use async_std::channel::Sender;
 use gnome::prelude::SwarmID;
 use std::collections::HashMap;
-use std::sync::mpsc::{channel, Sender};
+// use std::sync::mpsc::{channel, Sender};
 
 use crate::ToAppData;
 
@@ -11,7 +13,7 @@ pub struct ApplicationManager {
 
 impl ApplicationManager {
     pub fn new() -> ApplicationManager {
-        let (active_app_data, _recv) = channel();
+        let (active_app_data, _recv) = channel::bounded(32);
         ApplicationManager {
             app_data_store: HashMap::new(),
             active_app_data,
