@@ -70,6 +70,8 @@ pub enum ToAppMgr {
     UploadData,
     StartUnicast,
     StartBroadcast,
+    EndBroadcast,
+    UnsubscribeBroadcast,
     SendManifest,
     ListNeighbors,
     ChangeContent,
@@ -83,6 +85,8 @@ pub enum ToAppData {
     UploadData,
     StartUnicast,
     StartBroadcast,
+    EndBroadcast,
+    UnsubscribeBroadcast,
     SendManifest,
     ListNeighbors,
     AppDataSynced(bool),
@@ -168,6 +172,17 @@ async fn serve_gnome_manager(
                         .send(ToAppData::StartBroadcast)
                         .await;
                 }
+                ToAppMgr::EndBroadcast => {
+                    println!("ToAppMgr::EndBroadcast");
+                    let _ = app_mgr.active_app_data.send(ToAppData::EndBroadcast).await;
+                }
+                ToAppMgr::UnsubscribeBroadcast => {
+                    println!("ToAppMgr::UnsubscribeBroadcast");
+                    let _ = app_mgr
+                        .active_app_data
+                        .send(ToAppData::UnsubscribeBroadcast)
+                        .await;
+                }
                 ToAppMgr::SendManifest => {
                     let _ = app_mgr.active_app_data.send(ToAppData::SendManifest).await;
                 }
@@ -193,7 +208,7 @@ async fn serve_app_data(
     let mut b_cast_origin: Option<(CastID, Sender<CastData>)> = None;
     let mut b_req_sent = false;
     let mut next_val = 0;
-    let sleep_time = Duration::from_millis(128);
+    let sleep_time = Duration::from_millis(32);
     while let Ok(resp) = app_data_recv.recv().await {
         match resp {
             ToAppData::AppDataSynced(is_synced) => {
@@ -213,6 +228,23 @@ async fn serve_app_data(
             ToAppData::StartBroadcast => {
                 let res = to_gnome_sender.send(ToGnome::StartBroadcast);
                 b_req_sent = res.is_ok();
+            }
+            ToAppData::UnsubscribeBroadcast => {
+                // TODO: get this from app's logic
+                let c_id = CastID(0);
+                let res = to_gnome_sender.send(ToGnome::UnsubscribeBroadcast(c_id));
+                b_req_sent = res.is_ok();
+            }
+            ToAppData::EndBroadcast => {
+                println!("ToAppData::EndBroadcast");
+                if let Some((c_id, sender)) = b_cast_origin {
+                    println!("Some");
+                    let res = to_gnome_sender.send(ToGnome::EndBroadcast(c_id));
+                    b_req_sent = res.is_ok();
+                    b_cast_origin = None;
+                } else {
+                    println!("None");
+                }
             }
             ToAppData::AddContent => {
                 if let Some(next_id) = app_data.next_c_id() {
@@ -377,7 +409,7 @@ async fn serve_app_data(
                         println!("spawning serve_broadcast_origin");
                         spawn(serve_broadcast_origin(
                             broadcast_id,
-                            Duration::from_millis(1000),
+                            Duration::from_millis(512),
                             bcast_send.clone(),
                             hash_bytes,
                             done_send.clone(),
@@ -399,7 +431,7 @@ async fn serve_app_data(
                         }
                         spawn(serve_broadcast_origin(
                             broadcast_id,
-                            Duration::from_millis(1000),
+                            Duration::from_millis(512),
                             bcast_send.clone(),
                             c_data_vec,
                             done_send.clone(),
@@ -780,7 +812,13 @@ async fn serve_swarm(
                 GnomeToApp::Unicast(_s_id, c_id, recv_d) => {
                     spawn(serve_unicast(c_id, Duration::from_millis(100), recv_d));
                 }
-                GnomeToApp::BroadcastOrigin(_s_id, ref c_id, cast_data_send) => {
+                GnomeToApp::BroadcastOrigin(_s_id, ref c_id, cast_data_send, cast_data_recv) => {
+                    spawn(serve_broadcast(
+                        *c_id,
+                        Duration::from_millis(100),
+                        cast_data_recv,
+                        to_app_data_send.clone(),
+                    ));
                     let _ = to_app_data_send
                         .send(ToAppData::BCastOrigin(*c_id, cast_data_send))
                         .await;
@@ -836,7 +874,7 @@ async fn serve_broadcast_origin(
     done: Sender<()>,
 ) {
     println!("Originating broadcast {:?}", c_id);
-    sleep(Duration::from_secs(4)).await;
+    sleep(Duration::from_secs(2)).await;
     println!("Initial sleep is over");
     // TODO: indexing
     for (i, data) in data_vec.into_iter().enumerate() {
@@ -848,6 +886,7 @@ async fn serve_broadcast_origin(
                 "Error while trying to broadcast: {:?}",
                 send_res.err().unwrap()
             );
+            break;
         }
         // println!("About to go to sleep for: {:?}", sleep_time);
         sleep(sleep_time).await;
