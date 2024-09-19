@@ -1,5 +1,7 @@
+use crate::content::data_to_link;
 use crate::prelude::SyncRequirements;
 use crate::prelude::TransformInfo;
+use crate::sync_message::serialize_requests;
 use std::time::Duration;
 mod config;
 mod content;
@@ -10,14 +12,19 @@ mod manager;
 mod manifest;
 mod message;
 mod registry;
+mod sync_message;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use sync_message::deserialize_requests;
+use sync_message::SyncRequest;
+use sync_message::SyncResponse;
 
 use crate::content::double_hash;
 use async_std::task::sleep;
 use async_std::task::spawn;
 pub use config::Configuration;
 use content::ContentTree;
+use content::DataType;
 use content::{Content, ContentID};
 pub use data::Data;
 use datastore::Datastore;
@@ -214,9 +221,22 @@ async fn serve_app_data(
             ToAppData::AppDataSynced(is_synced) => {
                 if !is_synced {
                     println!("\n\n\nApp not synced!\n\n\n");
+                    let sync_requests: Vec<SyncRequest> = vec![
+                        SyncRequest::Datastore,
+                        SyncRequest::AllFirstPages,
+                        SyncRequest::AllPages(vec![0]),
+                    ];
+                    // let sync_requests: Vec<u8> = vec![
+                    //     0, // We want all root hashes from Datastore
+                    //     1, // We want all first pages of every Content in Datastore
+                    //     2, 0, 0, // We want all pages of specified ContentID (here CID(0))
+                    // ];
                     let _ = to_gnome_sender.send(ToGnome::AskData(
                         GnomeId::any(),
-                        NeighborRequest::Custom(0, CastData::empty()),
+                        NeighborRequest::Custom(
+                            0,
+                            CastData::new(serialize_requests(sync_requests)).unwrap(),
+                        ),
                     ));
                 }
             }
@@ -615,138 +635,434 @@ async fn serve_app_data(
                 }
             }
             ToAppData::CustomRequest(m_type, neighbor_id, cast_data) => {
-                //TODO: move logic here, and add some new
-                //TODO: ideally this should be allowed to be served by dapp-lib's user
+                //TODO: Cases not cover here should be allowed to be served by dapp-lib's user
+                // We need to cover different bootstrap sync requests:
+                // - root hashes only of all Contents
+                // - data/page hashes of specified ContentIDs
+                //  In future we could define a generic sync request to send
+                //   back Contents that have been tagged with specific tags.
+                // - actual Content Data (aka future: Pages) for specified ContentIDs
+                //   Here we should distinguish between sending all pages or only specific
+                //   ones like only first page that usually consists of description of a
+                //   content.
+                // In order to do so, we should only take a single m_type value,
+                // following bytes should be used to further specify our request
+                //
+                // When sending Response we should also cover the same cases as above,
+                // also by using a single m_type value.
+                // Special case to consider is when we are sending main Page of a Link.
+                // Link has optional TransformInfo attribute, and it is necessary
+                // when sideloading Pages via broadcast or other means than SyncMessages.
                 match m_type {
                     0 => {
-                        // Datastore sync root hashes
-                        println!("Request 0, {}", cast_data);
+                        let sync_requests = deserialize_requests(cast_data.bytes());
+                        // println!("Sync Request: {:?}", sync_requests);
                         // println!("Got AppSync inquiry");
-                        let hashes = app_data.all_content_root_hashes();
-                        let sync_type = 0;
-                        let c_id = 0;
-                        let content_id_1 = 0;
-                        let content_id_2 = 0;
-                        let data_type = 0;
-                        let [total_1, total_2] = (hashes.len() as u16 - 1).to_be_bytes();
-                        for (part_no, group) in hashes.into_iter().enumerate() {
-                            let [part_no_1, part_no_2] = (part_no as u16).to_be_bytes();
-                            let mut byte_hashes = vec![];
-                            for hash in group.iter() {
-                                for byte in hash.to_be_bytes() {
-                                    byte_hashes.push(byte);
+                        let mut sync_req_iter = sync_requests.into_iter();
+                        while let Some(req) = sync_req_iter.next() {
+                            match req {
+                                SyncRequest::Datastore => {
+                                    // TODO: here we should trigger a separate task for sending
+                                    // all root hashes to specified Neighbor
+                                    let sync_type = 0;
+                                    let hashes = app_data.all_content_typed_root_hashes();
+                                    let hashes_len = hashes.len() as u16;
+                                    for (part_no, group) in hashes.into_iter().enumerate() {
+                                        let sync_response = SyncResponse::Datastore(
+                                            part_no as u16,
+                                            hashes_len - 1,
+                                            group,
+                                        );
+                                        let _ = to_gnome_sender.send(ToGnome::SendData(
+                                            neighbor_id,
+                                            NeighborResponse::Custom(
+                                                sync_type,
+                                                CastData::new(sync_response.serialize()).unwrap(),
+                                            ),
+                                        ));
+                                    }
+                                    println!("Sent Datastore response");
+                                }
+                                SyncRequest::AllFirstPages => {
+                                    // TODO: here we should trigger a separate task for sending
+                                    // all Content's main pages to specified Neighbor
+                                    println!(
+                                        "We are requested to send all main pages to neighbor."
+                                    );
+                                    let sync_type = 0;
+                                    for c_id in 1..app_data.next_c_id().unwrap() {
+                                        println!("We need to send main page of ContentID-{}", c_id);
+                                        if let Ok(data) = app_data.read_data(c_id, 0) {
+                                            let (data_type, len) =
+                                                app_data.get_type_and_len(c_id).unwrap();
+                                            let sync_response =
+                                                SyncResponse::Page(c_id, data_type, 0, len, data);
+                                            // println!("Sending bytes: {:?}", bytes);
+                                            let res = to_gnome_sender.send(ToGnome::SendData(
+                                                neighbor_id,
+                                                NeighborResponse::Custom(
+                                                    sync_type,
+                                                    CastData::new(sync_response.serialize())
+                                                        .unwrap(),
+                                                ),
+                                            ));
+                                            if res.is_ok() {
+                                                println!(
+                                                    "Main page of {} sent successfully.",
+                                                    c_id,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                SyncRequest::Hashes(c_id, d_type, h_ids) => {
+                                    //TODO
+                                    println!(
+                                        "We should send some page hashes of Contents: {:?}",
+                                        c_id
+                                    );
+                                    let hash_res = if let Ok((data_type, len)) =
+                                        app_data.get_type_and_len(c_id)
+                                    {
+                                        if data_type == d_type {
+                                            app_data.get_all_page_hashes(c_id)
+                                        } else if data_type == 255 {
+                                            app_data.get_all_transform_info_hashes(c_id, d_type)
+                                        } else {
+                                            Err(AppError::DatatypeMismatch)
+                                        }
+                                    } else {
+                                        Err(AppError::IndexingError)
+                                    };
+                                    if let Ok(mut hashes) = hash_res {
+                                        if !hashes.is_empty() {
+                                            let sync_type = 0;
+                                            let hashes_len = hashes.len() as u16 - 1;
+                                            for h_id in h_ids {
+                                                if h_id <= hashes_len {
+                                                    let hash_data = std::mem::replace(
+                                                        &mut hashes[h_id as usize],
+                                                        Data::empty(),
+                                                    );
+                                                    let sync_response = SyncResponse::Hashes(
+                                                        c_id, h_id, hashes_len, hash_data,
+                                                    );
+                                                    let res =
+                                                        to_gnome_sender.send(ToGnome::SendData(
+                                                            neighbor_id,
+                                                            NeighborResponse::Custom(
+                                                                sync_type,
+                                                                CastData::new(
+                                                                    sync_response.serialize(),
+                                                                )
+                                                                .unwrap(),
+                                                            ),
+                                                        ));
+                                                    if res.is_ok() {
+                                                        println!(
+                                                            "Hashes [{}/{}] of {} sent",
+                                                            h_id, hashes_len, c_id
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                SyncRequest::Pages(c_id, d_type, _p_ids) => {
+                                    //TODO
+                                    println!(
+                                        "We are requested to send some pages to neighbor ({:?}: {:?}).",c_id,
+                                        _p_ids
+                                    );
+                                    if let Ok((data_type, len)) = app_data.get_type_and_len(c_id) {
+                                        if data_type == d_type {
+                                            if len > 0 {
+                                                let total = len as u16 - 1;
+                                                let sync_type = 0;
+                                                for p_id in _p_ids {
+                                                    if let Ok(data) = app_data.read_data(c_id, p_id)
+                                                    {
+                                                        let sync_response = SyncResponse::Page(
+                                                            c_id, data_type, p_id, total, data,
+                                                        );
+                                                        let r = to_gnome_sender.send(
+                                                            ToGnome::SendData(
+                                                                neighbor_id,
+                                                                NeighborResponse::Custom(
+                                                                    sync_type,
+                                                                    CastData::new(
+                                                                        sync_response.serialize(),
+                                                                    )
+                                                                    .unwrap(),
+                                                                ),
+                                                            ),
+                                                        );
+                                                        if r.is_ok() {
+                                                            println!(
+                                                                "Sent {}[{}/{}]",
+                                                                c_id, p_id, total
+                                                            );
+                                                        }
+                                                    } else {
+                                                        println!("No Data read.");
+                                                    }
+                                                }
+                                            }
+                                        } else if data_type == 255 {
+                                            println!("Link len: {}", len);
+                                            if len > 0 {
+                                                let total = len as u16 - 1;
+                                                let sync_type = 0;
+                                                for p_id in _p_ids {
+                                                    if let Ok((data, size)) = app_data
+                                                        .read_link_ti_data(c_id, p_id, d_type)
+                                                    {
+                                                        let sync_response = SyncResponse::Page(
+                                                            c_id, d_type, p_id, size, data,
+                                                        );
+                                                        let r = to_gnome_sender.send(
+                                                            ToGnome::SendData(
+                                                                neighbor_id,
+                                                                NeighborResponse::Custom(
+                                                                    sync_type,
+                                                                    CastData::new(
+                                                                        sync_response.serialize(),
+                                                                    )
+                                                                    .unwrap(),
+                                                                ),
+                                                            ),
+                                                        );
+                                                        if r.is_ok() {
+                                                            println!(
+                                                                "Sent {}[{}/{}]",
+                                                                c_id, p_id, total
+                                                            );
+                                                        }
+                                                    } else {
+                                                        println!("No Data read.");
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            // Err(AppError::DatatypeMismatch)
+                                        };
+                                    }
+                                }
+                                SyncRequest::AllPages(c_ids) => {
+                                    // TODO: here we should trigger a separate task for
+                                    // each ContentID received in order to send
+                                    // all Content's pages to specified Neighbor
+                                    println!(
+                                        "We are requested to send all pages to neighbor ({:?}).",
+                                        c_ids
+                                    );
+                                    let sync_type = 0;
+                                    for c_id in c_ids {
+                                        if let Ok(data_vec) = app_data.get_all_data(c_id) {
+                                            if data_vec.is_empty() {
+                                                continue;
+                                            }
+                                            let (data_type, len) =
+                                                app_data.get_type_and_len(c_id).unwrap();
+                                            let total = len - 1;
+
+                                            for (part_no, data) in data_vec.into_iter().enumerate()
+                                            {
+                                                let sync_response = SyncResponse::Page(
+                                                    c_id,
+                                                    data_type,
+                                                    part_no as u16,
+                                                    total,
+                                                    data,
+                                                );
+                                                let _ = to_gnome_sender.send(ToGnome::SendData(
+                                                    neighbor_id,
+                                                    NeighborResponse::Custom(
+                                                        sync_type,
+                                                        CastData::new(sync_response.serialize())
+                                                            .unwrap(),
+                                                    ),
+                                                ));
+                                            }
+                                            println!("Sent CID response");
+                                        }
+                                    }
                                 }
                             }
-                            // TODO: make it Custom
-                            let mut bytes = vec![
-                                data_type,
-                                content_id_1,
-                                content_id_2,
-                                part_no_1,
-                                part_no_2,
-                                total_1,
-                                total_2,
-                            ];
-                            bytes.append(&mut byte_hashes);
-                            let _ = to_gnome_sender.send(ToGnome::SendData(
-                                neighbor_id,
-                                NeighborResponse::Custom(sync_type, CastData::new(bytes).unwrap()),
-                            ));
                         }
-                        println!("Sent Datastore response");
-
-                        let content_id_1 = 0;
-                        let content_id_2 = 0;
-                        if let Ok(data_vec) = app_data.get_all_data(0) {
-                            let sync_type = 1;
-                            let data_type = 0;
-                            let [total_1, total_2] = (data_vec.len() as u16).to_be_bytes();
-
-                            for (part_no, data) in data_vec.into_iter().enumerate() {
-                                let [part_no_1, part_no_2] = (part_no as u16).to_be_bytes();
-                                let mut bytes = vec![
-                                    data_type,
-                                    content_id_1,
-                                    content_id_2,
-                                    part_no_1,
-                                    part_no_2,
-                                    total_1,
-                                    total_2,
-                                ];
-                                bytes.append(&mut data.bytes());
-                                let _ = to_gnome_sender.send(ToGnome::SendData(
-                                    neighbor_id,
-                                    NeighborResponse::Custom(
-                                        sync_type,
-                                        CastData::new(bytes).unwrap(),
-                                    ),
-                                ));
-                            }
-                            println!("Sent CID response");
-                        }
-                    }
-                    1 => {
-                        // Datastore sync Content
-                        println!("Request 1");
-                    }
-                    2 => {
-                        println!("Request 2");
                     }
                     other => {
                         println!("Request {}", other);
                     }
                 }
             }
-            ToAppData::CustomResponse(m_type, neighbor_id, cast_data) => {
+            ToAppData::CustomResponse(m_type, _neighbor_id, cast_data) => {
                 match m_type {
                     0 => {
-                        // Datastore sync root hashes
-                        println!("Response 0, {}", cast_data);
-                        let mut bytes = cast_data.bytes().into_iter();
-                        let data_type = bytes.next().unwrap();
-                        let _content_id_1 = bytes.next().unwrap();
-                        let _content_id_2 = bytes.next().unwrap();
-                        let _part_no_1 = bytes.next().unwrap();
-                        let _part_no_2 = bytes.next().unwrap();
-                        let _total_1 = bytes.next().unwrap();
-                        let _total_2 = bytes.next().unwrap();
-                        let bytes: Vec<u8> = bytes.collect();
+                        if let Ok(response) = SyncResponse::deserialize(cast_data.bytes()) {
+                            //TODO:
+                            // println!("Deserialized response!: {:?}", response);
+                            match response {
+                                SyncResponse::Datastore(part_no, total, hashes) => {
+                                    //TODO: we need to cover case where parts come out of order
+                                    for (data_type, hash) in hashes {
+                                        let tree = ContentTree::empty(hash);
+                                        let content = Content::Data(data_type, tree);
+                                        let res = app_data.append(content);
+                                        println!("Datastore add: {:?}", res);
+                                    }
+                                }
+                                SyncResponse::Hashes(c_id, part_no, total, hashes) => {
+                                    //TODO: not yet implemented
+                                    println!(
+                                        "Received hashes [{}/{}] of {} (len: {})!",
+                                        part_no,
+                                        total,
+                                        c_id,
+                                        hashes.len()
+                                    );
+                                    let upd_res = app_data.update_transformative_link(
+                                        true, c_id, part_no, total, hashes,
+                                    );
+                                    println!("Update res: {:?}", upd_res);
+                                }
+                                SyncResponse::Page(c_id, data_type, page_no, total, data) => {
+                                    //TODO: make it proper
+                                    if page_no == 0 {
+                                        println!(
+                                            "We've got main page of {}, data type: {}",
+                                            c_id, data_type
+                                        );
+                                        if let Ok((d_type, len)) = app_data.get_type_and_len(c_id) {
+                                            println!("CID already exists");
+                                            if d_type == 255 {
+                                                if len > 0 {
+                                                    println!("Update existing Link");
+                                                    let _ = app_data.update_transformative_link(
+                                                        false, c_id, page_no, total, data,
+                                                    );
+                                                } else {
+                                                    println!("Create new Link");
+                                                    let res = app_data
+                                                        .update(c_id, data_to_link(data).unwrap());
+                                                    println!("Update result: {:?}", res);
+                                                }
+                                            } else {
+                                                println!("Update existing Data");
+                                                let _res =
+                                                    app_data.insert_data(c_id, page_no, data);
+                                            }
+                                        } else if data_type < 255 {
+                                            println!("Create new Data");
+                                            let _res = app_data.update(
+                                                c_id,
+                                                Content::Data(data_type, ContentTree::Filled(data)),
+                                            );
+                                        } else {
+                                            println!("Create new Link 2");
+                                            let res =
+                                                app_data.update(c_id, data_to_link(data).unwrap());
+                                            println!("Update result: {:?}", res);
+                                        }
 
-                        for chunk in bytes.chunks(8) {
-                            let hash = u64::from_be_bytes(chunk[0..8].try_into().unwrap());
-                            let tree = ContentTree::empty(hash);
-                            let content = Content::Data(data_type, tree);
-                            let res = app_data.append(content);
-                            println!("Datastore add: {:?}", res);
+                                        // if data_type < 255 {
+                                        // } else {
+                                        //     //TODO if we received data for existinglink with TransformInfo
+                                        // };
+                                    } else if let Ok((d_type, len)) =
+                                        app_data.get_type_and_len(c_id)
+                                    {
+                                        if d_type == data_type {
+                                            let res = app_data.append_data(c_id, data);
+                                            println!("Page #{} add result: {:?}", page_no, res);
+                                        } else if d_type == 255 {
+                                            let res = app_data.update_transformative_link(
+                                                false, c_id, page_no, total, data,
+                                            );
+                                            // println!("Update TI result: {:?}", res);
+                                        } else {
+                                            println!(
+                                                "Error: Stored:{} len:{}\nreceived:{} len:{}",
+                                                d_type, len, data_type, total
+                                            );
+                                        }
+                                    } else {
+                                        println!("Datastore couldn't find ContentID {}", c_id);
+                                    }
+                                }
+                            }
                         }
+                        // Datastore sync root hashes
+                        // println!("Response 0, {}", cast_data);
+                        // let mut bytes = cast_data.bytes().into_iter();
+                        // let data_type = bytes.next().unwrap();
+                        // let _content_id_1 = bytes.next().unwrap();
+                        // let _content_id_2 = bytes.next().unwrap();
+                        // let _part_no_1 = bytes.next().unwrap();
+                        // let _part_no_2 = bytes.next().unwrap();
+                        // let _total_1 = bytes.next().unwrap();
+                        // let _total_2 = bytes.next().unwrap();
+                        // let bytes: Vec<u8> = bytes.collect();
+
+                        // for chunk in bytes.chunks(8) {
+                        //     let hash = u64::from_be_bytes(chunk[0..8].try_into().unwrap());
+                        //     let tree = ContentTree::empty(hash);
+                        //     let content = Content::Data(data_type, tree);
+                        //     let res = app_data.append(content);
+                        //     println!("Datastore add: {:?}", res);
+                        // }
                     }
-                    1 => {
-                        // Datastore sync Content
-                        println!("Response 1");
-                        let mut bytes = cast_data.bytes().into_iter();
-                        let data_type = bytes.next().unwrap();
-                        let content_id_1 = bytes.next().unwrap();
-                        let content_id_2 = bytes.next().unwrap();
-                        let c_id = u16::from_be_bytes([content_id_1, content_id_2]);
-                        let _part_no_1 = bytes.next().unwrap();
-                        let _part_no_2 = bytes.next().unwrap();
-                        let _total_1 = bytes.next().unwrap();
-                        let _total_2 = bytes.next().unwrap();
-                        let bytes: Vec<u8> = bytes.collect();
-                        // println!("Content {} add part {} of {}", c_id, part_no, total);
-                        if c_id == 0 {
-                            println!("App manifest to add");
-                            let content = Content::Data(
-                                data_type,
-                                ContentTree::Filled(Data::new(bytes).unwrap()),
-                            );
-                            let res = app_data.update(0, content);
-                            println!("App manifest add result: {:?}", res);
-                        }
-                    }
-                    2 => {
-                        println!("Response 2");
-                    }
+                    // 1 => {
+                    // // Datastore sync Content
+                    // println!("Response 1");
+                    //     let mut bytes = cast_data.bytes().into_iter();
+                    //     // println!("bytes: {:?}", bytes);
+                    //     let data_subtype = bytes.next().unwrap();
+                    //     let data_type = bytes.next().unwrap();
+                    //     println!("subtype: {}", data_subtype);
+                    //     let content_id_1 = bytes.next().unwrap();
+                    //     let content_id_2 = bytes.next().unwrap();
+                    //     let c_id = u16::from_be_bytes([content_id_1, content_id_2]);
+                    //     let part_no_1 = bytes.next().unwrap();
+                    //     let part_no_2 = bytes.next().unwrap();
+                    //     let part_no = u16::from_be_bytes([part_no_1, part_no_2]);
+                    //     let total_1 = bytes.next().unwrap();
+                    //     let total_2 = bytes.next().unwrap();
+                    //     let total = u16::from_be_bytes([total_1, total_2]);
+                    //     let bytes: Vec<u8> = bytes.collect();
+                    //     if data_subtype == 1 {
+                    //         // println!("Content {} add part {} of {}", c_id, part_no, total);
+                    //         if c_id == 0 {
+                    //             println!("App manifest to add");
+                    //             let content = Content::Data(
+                    //                 data_type,
+                    //                 ContentTree::Filled(Data::new(bytes).unwrap()),
+                    //             );
+                    //             let res = app_data.update(0, content);
+                    //             println!("App manifest add result: {:?}", res);
+                    //         } else {
+                    //             println!("Content {} of type {} to add", c_id, data_type);
+                    //         }
+                    //     } else if data_subtype == 0 {
+                    //         println!(
+                    //             "We have page #{} out of {} belonging to ContentID {}({}).",
+                    //             part_no, total, c_id, data_type
+                    //         );
+                    //         let data = Data::new(bytes).unwrap();
+                    //         let content = if data_type < 255 {
+                    //             Content::Data(data_type, ContentTree::Filled(data))
+                    //         } else {
+                    //             data_to_link(data).unwrap()
+                    //         };
+
+                    //         let res = app_data.update(c_id, content);
+                    //         println!("Page #{} add result: {:?}", part_no, res);
+                    //     }
+                    // }
+                    // 2 => {
+                    //     println!("Response 2");
+                    // }
                     other => {
                         println!("Response {}", other);
                     }
@@ -756,7 +1072,7 @@ async fn serve_app_data(
                 //TODO: we need an option to also receive what we have broadcasted!
                 b_cast_origin = Some((c_id, send))
             }
-            ToAppData::BCastData(c_id, c_data) => {
+            ToAppData::BCastData(_c_id, c_data) => {
                 // TODO: serve this
                 let a_msg_res = parse_cast(c_data);
                 if let Ok(a_msg) = a_msg_res {
@@ -767,9 +1083,41 @@ async fn serve_app_data(
                         a_msg.total_parts,
                         a_msg.data,
                     );
-                    if let Ok(missing) = upd_res {
-                        // println!("Missing hashes: {:?}", missing);
+                    // println!("update_transformative_link result: {:?}", upd_res);
+                    if let Ok((d_type, missing_hashes, missing_data)) = upd_res {
                         //TODO: request hashes if missing not empty
+                        if !missing_hashes.is_empty() {
+                            //TODO: there can be multiple SyncRequests
+                            println!("Missing hashes: {:?}", missing_hashes);
+                            let sync_request =
+                                SyncRequest::Hashes(a_msg.content_id, d_type, missing_hashes);
+                            to_gnome_sender
+                                .send(ToGnome::AskData(
+                                    GnomeId::any(),
+                                    NeighborRequest::Custom(
+                                        0,
+                                        CastData::new(serialize_requests(vec![sync_request]))
+                                            .unwrap(),
+                                    ),
+                                ))
+                                .unwrap();
+                        }
+                        if !missing_data.is_empty() {
+                            //TODO: there can be multiple SyncRequests
+                            println!("Missing data: {:?}", missing_data);
+                            let sync_request =
+                                SyncRequest::Pages(a_msg.content_id, d_type, missing_data);
+                            to_gnome_sender
+                                .send(ToGnome::AskData(
+                                    GnomeId::any(),
+                                    NeighborRequest::Custom(
+                                        0,
+                                        CastData::new(serialize_requests(vec![sync_request]))
+                                            .unwrap(),
+                                    ),
+                                ))
+                                .unwrap();
+                        }
                     } else {
                         println!("Unable to update: {:?}", upd_res);
                     }
@@ -936,6 +1284,7 @@ async fn serve_unicast_origin(c_id: CastID, sleep_time: Duration, user_res: Send
 struct AppMessage {
     pub is_hash: bool,
     pub content_id: ContentID,
+    // pub d_type: DataType,
     pub part_no: u16,
     pub total_parts: u16,
     pub data: Data,
@@ -1131,14 +1480,19 @@ impl ApplicationData {
         self.contents.hash()
     }
     pub fn content_root_hash(&self, c_id: ContentID) -> Result<u64, AppError> {
-        self.contents.get_root_content_hash(c_id)
+        let result = self.contents.get_root_content_typed_hash(c_id);
+        if let Ok((_d_type, hash)) = result {
+            Ok(hash)
+        } else {
+            Err(result.err().unwrap())
+        }
     }
     pub fn registry(&self) -> Vec<ContentID> {
         self.change_reg.read()
     }
 
-    pub fn all_content_root_hashes(&self) -> Vec<Vec<u64>> {
-        self.contents.all_root_hashes()
+    pub fn all_content_typed_root_hashes(&self) -> Vec<Vec<(u8, u64)>> {
+        self.contents.all_typed_root_hashes()
     }
     pub fn update_transformative_link(
         &mut self,
@@ -1147,7 +1501,8 @@ impl ApplicationData {
         part_no: u16,
         total_parts: u16,
         data: Data,
-    ) -> Result<HashSet<u16>, AppError> {
+    ) -> Result<(DataType, Vec<u16>, Vec<u16>), AppError> {
+        // println!("Call update_transformative_link");
         self.contents
             .update_transformative_link(is_hash, content_id, part_no, total_parts, data)
     }
@@ -1157,6 +1512,20 @@ impl ApplicationData {
             return Err(AppError::DatastoreFull);
         }
         self.contents.append(content)
+    }
+    pub fn get_type_and_len(&self, c_id: ContentID) -> Result<(DataType, u16), AppError> {
+        self.contents.type_and_len(c_id)
+    }
+    pub fn read_data(&self, c_id: ContentID, data_id: u16) -> Result<Data, AppError> {
+        self.contents.read_data((c_id, data_id))
+    }
+    pub fn read_link_ti_data(
+        &self,
+        c_id: ContentID,
+        data_id: u16,
+        d_type: DataType,
+    ) -> Result<(Data, u16), AppError> {
+        self.contents.read_link_data((c_id, data_id), d_type)
     }
     pub fn insert_data(&mut self, c_id: ContentID, d_id: u16, data: Data) -> Result<u64, AppError> {
         self.contents.insert_data(c_id, d_id, data)
@@ -1183,6 +1552,54 @@ impl ApplicationData {
             }
         }
         Ok(data_vec)
+    }
+    pub fn get_all_page_hashes(&self, c_id: ContentID) -> Result<Vec<Data>, AppError> {
+        let hashes_vec = self.contents.content_bottom_hashes(c_id)?;
+        println!("Got hashes vec");
+        let mut results = vec![];
+        let mut hash_iter = hashes_vec.into_iter();
+        let mut i = 0;
+        let mut bytes = Vec::with_capacity(1024);
+        while let Some(hash) = hash_iter.next() {
+            if i == 128 {
+                i = 0;
+                let ready_bytes = std::mem::replace(&mut bytes, Vec::with_capacity(1024));
+                results.push(Data::new(ready_bytes).unwrap());
+            }
+            for byte in hash.to_be_bytes() {
+                bytes.push(byte);
+            }
+            i += 1;
+        }
+        results.push(Data::new(bytes).unwrap());
+        Ok(results)
+    }
+
+    pub fn get_all_transform_info_hashes(
+        &self,
+        c_id: ContentID,
+        d_type: DataType,
+    ) -> Result<Vec<Data>, AppError> {
+        self.contents.link_transform_info_hashes(c_id, d_type)
+        // let hashes_vec = self.contents.link_transform_info_hashes(c_id,d_type)?;
+        // println!("Got hashes vec");
+        // let mut results = vec![];
+        // let mut hash_iter = hashes_vec.into_iter();
+        // let mut i = 0;
+        // let mut bytes = Vec::with_capacity(1024);
+        // while let Some(hash) = hash_iter.next() {
+        //     if i == 128 {
+        //         i = 0;
+        //         let ready_bytes = std::mem::replace(&mut bytes, Vec::with_capacity(1024));
+        //         results.push(Data::new(ready_bytes).unwrap());
+        //     }
+        //     for byte in hash.to_be_bytes() {
+        //         bytes.push(byte);
+        //     }
+        //     i += 1;
+        // }
+        // results.push(Data::new(bytes).unwrap());
+        // Ok(results)
     }
 
     // TODO: design application level interface

@@ -4,6 +4,7 @@ use super::content::ContentTree;
 use super::manifest::ApplicationManifest;
 use super::prelude::AppError;
 use crate::content::double_hash;
+use crate::content::DataType;
 use crate::prelude::TransformInfo;
 use crate::Data;
 use std::collections::HashSet;
@@ -23,6 +24,20 @@ impl Datastore {
         let _ = content_tree.append(manifest.to_data(None));
         let content = Content::Data(0, content_tree);
         Datastore::Filled(content)
+    }
+
+    pub fn type_and_len(&self, c_id: ContentID) -> Result<(DataType, u16), AppError> {
+        match self {
+            Self::Empty => Err(AppError::IndexingError),
+            Self::Filled(content) => {
+                if c_id == 0 {
+                    Ok((content.data_type(), content.len()))
+                } else {
+                    Err(AppError::IndexingError)
+                }
+            }
+            Self::Hashed(s_store) => s_store.type_and_len(c_id),
+        }
     }
 
     // this fn should be used for inserting new Data into existing Content,
@@ -273,22 +288,27 @@ impl Datastore {
         part_no: u16,
         total_parts: u16,
         data: Data,
-    ) -> Result<HashSet<u16>, AppError> {
+    ) -> Result<(DataType, Vec<u16>, Vec<u16>), AppError> {
         // let content = self.take(content_id).unwrap();
         // println!("Update: {} is_hash: {}", content_id, is_hash);
         // if let Content::Link(g_id, s_name, lc_id, ti) = content {
         // if let Some(mut tiu) = ti {
         if let Ok(mut tiu) = self.take_transform_info(content_id) {
+            // println!("Link has transform info");
+            // let missing_parts;
             if is_hash {
                 tiu.add_hash(part_no, total_parts, data);
             } else {
                 tiu.add_data(part_no, total_parts, data);
             }
-            let missing_hashes = tiu.whats_missing();
-            let res = self.restore_transform_info(content_id, tiu);
-            // println!("Update res: {:?}", res);
-            Ok(missing_hashes)
+            let missing_hashes = tiu.what_hashes_are_missing();
+            let missing_parts = tiu.what_data_is_missing(part_no);
+            let d_type = tiu.d_type;
+            let _res = self.restore_transform_info(content_id, tiu);
+            // println!("Update res: {:?}", _res);
+            Ok((d_type, missing_hashes, missing_parts))
         } else {
+            println!("Link has no TI");
             // let _ = self.update(content_id, Content::Link(g_id, s_name, lc_id, ti));
             Err(AppError::LinkNonTransformative)
         }
@@ -313,18 +333,37 @@ impl Datastore {
         }
     }
 
+    // This fn should be used for reading selected datachunk
+    pub fn read_link_data(
+        &self,
+        (c_id, data_id): (ContentID, u16),
+        d_type: DataType,
+    ) -> Result<(Data, u16), AppError> {
+        match self {
+            Self::Empty => Err(AppError::IndexingError),
+            Self::Filled(content) => {
+                if c_id == 0 {
+                    content.read_link_data(d_type, data_id)
+                } else {
+                    Err(AppError::IndexingError)
+                }
+            }
+            Self::Hashed(s_store) => s_store.read_link_data((c_id, data_id), d_type),
+        }
+    }
+
     // This fn should return a Vec<u64> of all of Datastore's
     // bottom layer hashes from left to right.
     // Those are also called Content root hashes.
-    pub fn all_root_hashes(&self) -> Vec<Vec<u64>> {
+    pub fn all_typed_root_hashes(&self) -> Vec<Vec<(u8, u64)>> {
         // println!("Next")
 
         let mut count = 0;
         let mut total = vec![];
         let mut v = vec![];
         for c_id in 0..u16::MAX {
-            if let Ok(hash) = self.get_root_content_hash(c_id) {
-                v.push(hash);
+            if let Ok(typed_hash) = self.get_root_content_typed_hash(c_id) {
+                v.push(typed_hash);
                 count += 1;
                 if count == 128 {
                     total.push(v);
@@ -352,15 +391,32 @@ impl Datastore {
 
     // This fn should return a Vec<u64> of all of given CID's data hashes
     // So only bottom layer hashes (Data hashes).
+
+    pub fn link_transform_info_hashes(
+        &self,
+        c_id: ContentID,
+        d_type: DataType,
+    ) -> Result<Vec<Data>, AppError> {
+        match self {
+            Self::Empty => Err(AppError::ContentEmpty),
+            Self::Filled(content) => {
+                println!("Sending bottom hashes up");
+                if c_id == 0 {
+                    content.link_ti_hashes()
+                } else {
+                    Err(AppError::IndexingError)
+                }
+            }
+            Self::Hashed(s_store) => s_store.link_transform_info_hashes(c_id, d_type),
+        }
+    }
+
     pub fn content_bottom_hashes(&self, c_id: ContentID) -> Result<Vec<u64>, AppError> {
         match self {
-            Self::Empty => Err(AppError::Smthg),
+            Self::Empty => Err(AppError::ContentEmpty),
             Self::Filled(content) => {
-                if c_id == 0 {
-                    Ok(content.data_hashes())
-                } else {
-                    Err(AppError::Smthg)
-                }
+                println!("Sending bottom hashes up");
+                Ok(content.data_hashes())
             }
             Self::Hashed(s_store) => s_store.content_bottom_hashes(c_id),
         }
@@ -373,12 +429,12 @@ impl Datastore {
             Self::Hashed(s_store) => s_store.hash,
         }
     }
-    pub fn get_root_content_hash(&self, c_id: ContentID) -> Result<u64, AppError> {
+    pub fn get_root_content_typed_hash(&self, c_id: ContentID) -> Result<(u8, u64), AppError> {
         match self {
             Self::Empty => Err(AppError::ContentEmpty),
             Self::Filled(content) => {
                 if c_id == 0 {
-                    Ok(content.hash())
+                    Ok((content.data_type(), content.hash()))
                 } else {
                     Err(AppError::IndexingError)
                 }
@@ -419,7 +475,17 @@ impl Substore {
             Err(AppError::DatastoreFull)
         }
     }
-
+    pub fn type_and_len(&self, c_id: ContentID) -> Result<(DataType, u16), AppError> {
+        if c_id >= self.data_count {
+            return Err(AppError::IndexingError);
+        }
+        let left_len = self.left.len();
+        if c_id >= left_len {
+            self.right.type_and_len(c_id - left_len)
+        } else {
+            self.left.type_and_len(c_id)
+        }
+    }
     pub fn take(&mut self, c_id: ContentID) -> Result<Content, AppError> {
         if c_id >= self.data_count {
             return Err(AppError::IndexingError);
@@ -455,6 +521,22 @@ impl Substore {
             self.right.restore_transform_info(c_id - left_len, ti)
         } else {
             self.left.restore_transform_info(c_id, ti)
+        }
+    }
+    pub fn read_link_data(
+        &self,
+        (c_id, data_id): (ContentID, u16),
+        d_type: DataType,
+    ) -> Result<(Data, u16), AppError> {
+        if c_id >= self.data_count {
+            return Err(AppError::IndexingError);
+        }
+        let left_len = self.left.len();
+        if c_id >= left_len {
+            self.right
+                .read_link_data((c_id - left_len, data_id), d_type)
+        } else {
+            self.left.read_link_data((c_id, data_id), d_type)
         }
     }
     pub fn read_data(&self, (c_id, data_id): (ContentID, u16)) -> Result<Data, AppError> {
@@ -504,6 +586,22 @@ impl Substore {
         self.hash
     }
 
+    pub fn link_transform_info_hashes(
+        &self,
+        c_id: ContentID,
+        d_type: DataType,
+    ) -> Result<Vec<Data>, AppError> {
+        if c_id >= self.data_count {
+            return Err(AppError::IndexingError);
+        }
+        let left_len = self.left.len();
+        if c_id >= left_len {
+            self.right
+                .link_transform_info_hashes(c_id - left_len, d_type)
+        } else {
+            self.left.link_transform_info_hashes(c_id, d_type)
+        }
+    }
     pub fn content_bottom_hashes(&self, c_id: ContentID) -> Result<Vec<u64>, AppError> {
         if c_id >= self.data_count {
             return Err(AppError::Smthg);
@@ -515,16 +613,16 @@ impl Substore {
             self.left.content_bottom_hashes(c_id)
         }
     }
-    fn get_root_content_hash(&self, c_id: ContentID) -> Result<u64, AppError> {
+    fn get_root_content_hash(&self, c_id: ContentID) -> Result<(u8, u64), AppError> {
         if c_id >= self.data_count {
             return Err(AppError::IndexingError);
         }
         let left_len = self.left.len();
         // println!("c_id: {}, left_len: {}", c_id, left_len);
         if c_id >= left_len {
-            self.right.get_root_content_hash(c_id - left_len)
+            self.right.get_root_content_typed_hash(c_id - left_len)
         } else {
-            self.left.get_root_content_hash(c_id)
+            self.left.get_root_content_typed_hash(c_id)
         }
     }
 }
