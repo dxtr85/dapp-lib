@@ -83,6 +83,7 @@ pub enum ToAppMgr {
     ListNeighbors,
     ChangeContent,
     AddContent,
+    TransformLinkRequest(Box<SyncData>),
 }
 // enum ToApp {}
 
@@ -103,6 +104,8 @@ pub enum ToAppData {
     AddContent,
     CustomRequest(u8, GnomeId, CastData),
     CustomResponse(u8, GnomeId, CastData),
+    TransformLinkRequest(SyncData),
+    TransformLink(SyncData),
 }
 // enum ToSwarm {}
 
@@ -170,6 +173,12 @@ async fn serve_gnome_manager(
                 ToAppMgr::UploadData => {
                     let _ = app_mgr.active_app_data.send(ToAppData::UploadData).await;
                 }
+                ToAppMgr::TransformLinkRequest(boxed_s_data) => {
+                    let _ = app_mgr
+                        .active_app_data
+                        .send(ToAppData::TransformLinkRequest(*boxed_s_data))
+                        .await;
+                }
                 ToAppMgr::StartUnicast => {
                     let _ = app_mgr.active_app_data.send(ToAppData::StartUnicast).await;
                 }
@@ -213,6 +222,7 @@ async fn serve_app_data(
     to_gnome_sender: Sender<ToGnome>,
 ) {
     let mut b_cast_origin: Option<(CastID, Sender<CastData>)> = None;
+    let mut link_with_transform_info: Option<ContentID> = None;
     let mut b_req_sent = false;
     let mut next_val = 0;
     let sleep_time = Duration::from_millis(32);
@@ -238,6 +248,8 @@ async fn serve_app_data(
                             CastData::new(serialize_requests(sync_requests)).unwrap(),
                         ),
                     ));
+                } else {
+                    println!("App synced");
                 }
             }
             ToAppData::StartUnicast => {
@@ -270,7 +282,7 @@ async fn serve_app_data(
                 if let Some(next_id) = app_data.next_c_id() {
                     let pre: Vec<(ContentID, u64)> = vec![(next_id, 0)];
                     let data = Data::new(vec![next_val]).unwrap();
-                    let post: Vec<(ContentID, u64)> = vec![(next_id, data.hash())];
+                    let post: Vec<(ContentID, u64)> = vec![(next_id, data.get_hash())];
                     let data = Data::new(vec![0, next_val]).unwrap();
                     let reqs = SyncRequirements { pre, post };
                     let msg = SyncMessage::new(SyncMessageType::AddContent, reqs, data);
@@ -288,7 +300,7 @@ async fn serve_app_data(
                 if let Ok(pre_hash) = pre_hash_result {
                     let pre: Vec<(ContentID, u64)> = vec![(c_id, pre_hash)];
                     let data = Data::new(vec![next_val]).unwrap();
-                    let post: Vec<(ContentID, u64)> = vec![(c_id, data.hash())];
+                    let post: Vec<(ContentID, u64)> = vec![(c_id, data.get_hash())];
                     // We prepend 0 to indicate it is not a Link
                     let data = Data::new(vec![0, next_val]).unwrap();
                     let reqs = SyncRequirements { pre, post };
@@ -331,6 +343,23 @@ async fn serve_app_data(
             ToAppData::ListNeighbors => {
                 let _ = to_gnome_sender.send(ToGnome::ListNeighbors);
             }
+            ToAppData::TransformLinkRequest(_sync_data) => {
+                println!("Sending TransformLinkRequest to gnome");
+                if let Some(c_id) = link_with_transform_info {
+                    let sync_data = SyncData::new(c_id.to_be_bytes().into()).unwrap();
+                    let _ = to_gnome_sender.send(ToGnome::Reconfigure(0, sync_data));
+                    link_with_transform_info = None;
+                } else {
+                    println!("No link with TransformInfo defined for transformation to begin");
+                }
+            }
+            ToAppData::TransformLink(s_data) => {
+                println!("Received TransformLink from gnome");
+                let s_bytes = s_data.bytes();
+                let c_id = u16::from_be_bytes([s_bytes[0], s_bytes[1]]);
+                let result = app_data.transform_link(c_id);
+                println!("Link transformation result: {:?}", result);
+            }
             ToAppData::UploadData => {
                 //TODO: send to AppMgr UploadData message
                 // this logic should be moved to app mgr
@@ -361,7 +390,7 @@ async fn serve_app_data(
                     println!("// 3. Split big-chunk into 1024byte small-chunks");
                     while let Some(small_chunk) = big_chunk.next() {
                         // 4. Compute hash for each small-chunk
-                        hashes.push(small_chunk.hash());
+                        hashes.push(small_chunk.get_hash());
                         // TODO: build proper CastData from Data
                         data_vec.push(small_chunk);
                     }
@@ -392,7 +421,7 @@ async fn serve_app_data(
                         println!("Link hash: {}", link_hash);
                         let data = link.to_data().unwrap();
                         println!("Link data: {:?}", data);
-                        println!("Data hash: {}", data.hash());
+                        println!("Data hash: {}", data.get_hash());
                         let post: Vec<(ContentID, u64)> = vec![(content_id, link_hash)];
                         let reqs = SyncRequirements { pre, post };
                         let msg = SyncMessage::new(SyncMessageType::AddContent, reqs, data);
@@ -400,6 +429,8 @@ async fn serve_app_data(
                         for part in parts {
                             let _ = to_gnome_sender.send(ToGnome::AddData(part));
                         }
+                        //TODO: we need to set this upon receiving Gnome's confirmation
+                        link_with_transform_info = Some(content_id);
                         next_val += 1;
                         println!("// 8. For each Link Send computed Hashes via broadcast");
                         let (done_send, done_recv) = channel();
@@ -531,6 +562,10 @@ async fn serve_app_data(
                             if recv_id == next_id && recv_hash == content.hash() {
                                 let res = app_data.append(content);
                                 println!("Content added: {:?}", res);
+                                let hash = app_data.root_hash();
+                                println!("Sending updated hash: {}", hash);
+                                let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
+                                println!("Send res: {:?}", res);
                             } else {
                                 println!("POST validation failed for AddContent two");
                             }
@@ -551,10 +586,11 @@ async fn serve_app_data(
                                 println!("POST validation failed on ChangeContent");
                                 println!("Restore result: {:?}", restore_res);
                             } else {
-                                println!(
-                                    "ChangeContent completed successfully ({})",
-                                    app_data.root_hash()
-                                );
+                                let hash = app_data.root_hash();
+                                println!("Sending updated hash: {}", hash);
+                                let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
+                                println!("Send res: {:?}", res);
+                                println!("ChangeContent completed successfully ({})", hash);
                             }
                         } else {
                             println!("Update procedure failed: {:?}", res);
@@ -576,7 +612,11 @@ async fn serve_app_data(
                                 let res = app_data.pop_data(c_id);
                                 println!("Restore result: {:?}", res);
                             } else {
-                                println!("Data appended successfully ({})", app_data.root_hash());
+                                let hash = app_data.root_hash();
+                                println!("Sending updated hash: {}", hash);
+                                let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
+                                println!("Send res: {:?}", res);
+                                println!("Data appended successfully ({})", hash);
                             }
                         }
                     }
@@ -616,7 +656,11 @@ async fn serve_app_data(
                                 let res = app_data.insert_data(c_id, d_id, removed_data);
                                 println!("Restore result: {:?}", res);
                             } else {
-                                println!("Data appended successfully ({})", app_data.root_hash());
+                                let hash = app_data.root_hash();
+                                println!("Sending updated hash: {}", hash);
+                                let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
+                                println!("Send res: {:?}", res);
+                                println!("Data appended successfully ({})", hash);
                             }
                         }
                     }
@@ -742,7 +786,7 @@ async fn serve_app_data(
                                                 if h_id <= hashes_len {
                                                     let hash_data = std::mem::replace(
                                                         &mut hashes[h_id as usize],
-                                                        Data::empty(),
+                                                        Data::empty(0),
                                                     );
                                                     let sync_response = SyncResponse::Hashes(
                                                         c_id, h_id, hashes_len, hash_data,
@@ -1181,7 +1225,7 @@ async fn serve_swarm(
                 GnomeToApp::BCastData(c_id, _data) => {
                     // TODO: convert it to local BCastMessage
                     // and apply to app_data
-                    println!("Got data from {}", c_id.0);
+                    // println!("Got data from {}", c_id.0);
                 }
                 GnomeToApp::Custom(is_request, m_type, gnome_id, data) => {
                     if is_request {
@@ -1193,8 +1237,18 @@ async fn serve_swarm(
                             .send(ToAppData::CustomResponse(m_type, gnome_id, data))
                             .await;
                     }
-                    println!("Got data from {}", gnome_id);
+                    // println!("Got data from {}", gnome_id);
                 }
+                GnomeToApp::Reconfig(id, sync_data) => match id {
+                    0 => {
+                        let _ = to_app_data_send
+                            .send(ToAppData::TransformLink(sync_data))
+                            .await;
+                    }
+                    other => {
+                        println!("Unserved Reconfig from Gnome: {}", id);
+                    }
+                },
                 _ => {
                     // println!("UNserved swarm data: {:?}", _res);
                     let _ = to_app_data_send.send(ToAppData::Response(resp)).await;
@@ -1345,7 +1399,7 @@ fn parse_cast(cast_data: CastData) -> Result<AppMessage, Data> {
             let is_hash = match bytes_iter.next() {
                 Some(0) => false,
                 Some(255) => true,
-                _other => return Err(Data::empty()),
+                _other => return Err(Data::empty(0)),
             };
             let b1 = bytes_iter.next().unwrap();
             let b2 = bytes_iter.next().unwrap();
@@ -1454,7 +1508,7 @@ impl ApplicationData {
             // Second byte is non zero, so we received a non-head partial Data
             drained_bytes.append(&mut bytes);
             let data = Data::new(drained_bytes).unwrap();
-            let hash = data.hash();
+            let hash = data.get_hash();
             // println!("Got hash: {}", hash);
             if let Some(temp_idx) = self.hash_to_temp_idx.get(&hash) {
                 // println!("Oh yeah");
@@ -1493,6 +1547,14 @@ impl ApplicationData {
 
     pub fn all_content_typed_root_hashes(&self) -> Vec<Vec<(u8, u64)>> {
         self.contents.all_typed_root_hashes()
+    }
+    pub fn transform_link(&mut self, content_id: ContentID) -> Result<Content, AppError> {
+        //TODO
+        let ti = self.contents.take_transform_info(content_id)?;
+        let d_type = ti.d_type;
+        let c_tree = ti.into_tree();
+        let new_content = Content::Data(d_type, c_tree);
+        self.contents.update(content_id, new_content)
     }
     pub fn update_transformative_link(
         &mut self,

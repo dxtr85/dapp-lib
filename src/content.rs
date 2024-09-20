@@ -142,6 +142,42 @@ impl TransformInfo {
             None
         }
     }
+    pub fn into_tree(mut self) -> ContentTree {
+        if !self.missing_hashes.is_empty() || self.data_hashes.is_empty() {
+            return ContentTree::Empty(self.root_hash);
+        }
+        // First we need to build a Vec<u64> of hashes,
+        let mut hashes = Vec::with_capacity(128 * self.data_hashes.len());
+        for data_hash in self.data_hashes {
+            let mut bytes_iter = data_hash.bytes().into_iter();
+            while let Some(b1) = bytes_iter.next() {
+                let b2 = bytes_iter.next().unwrap();
+                let b3 = bytes_iter.next().unwrap();
+                let b4 = bytes_iter.next().unwrap();
+                let b5 = bytes_iter.next().unwrap();
+                let b6 = bytes_iter.next().unwrap();
+                let b7 = bytes_iter.next().unwrap();
+                let b8 = bytes_iter.next().unwrap();
+                hashes.push(u64::from_be_bytes([b1, b2, b3, b4, b5, b6, b7, b8]));
+            }
+        }
+        // Then for each hash we take corresponding Data and compare hashes
+        // If they are the same we push Data, otherwise we push empty Data shell with hash only
+        let mut c_tree = ContentTree::Empty(self.root_hash);
+        for (i, hash) in hashes.into_iter().enumerate() {
+            if let Some(mut data) = self.data.remove(&(i as u16)) {
+                if data.hash() == hash {
+                    let _ = c_tree.append(data);
+                } else {
+                    println!("Hash mismatch data's: {}, announced: {}", data.hash(), hash);
+                    let _ = c_tree.append(Data::empty(hash));
+                }
+            } else {
+                let _ = c_tree.append(Data::empty(hash));
+            }
+        }
+        c_tree
+    }
     pub fn bytes(self) -> Vec<u8> {
         // pub d_type: DataType,
         let mut bytes = vec![self.d_type];
@@ -213,7 +249,7 @@ impl TransformInfo {
             if current_len < part_no {
                 for i in current_len..part_no {
                     self.missing_hashes.insert(i);
-                    self.data_hashes.push(Data::empty());
+                    self.data_hashes.push(Data::empty(0));
                 }
             } else if current_len > part_no {
                 // Overwrite unconditionally
@@ -259,7 +295,7 @@ impl TransformInfo {
                 b[hidx + 6],
                 b[hidx + 7],
             ]);
-            if hash == data.hash() {
+            if hash == data.get_hash() {
                 let _res = self.data.insert(part_no, data);
             } else {
                 println!("Hashes do not match, not adding");
@@ -703,14 +739,14 @@ impl ContentTree {
     pub fn shell(&self) -> Self {
         match self {
             Self::Empty(hash) => Self::Empty(*hash),
-            Self::Filled(data) => Self::Empty(data.hash()),
+            Self::Filled(data) => Self::Empty(data.get_hash()),
             Self::Hashed(sub_tree) => Self::Empty(sub_tree.hash),
         }
     }
     pub fn hash(&self) -> u64 {
         match self {
             Self::Empty(hash) => *hash,
-            Self::Filled(data) => data.hash(),
+            Self::Filled(data) => data.get_hash(),
             Self::Hashed(sub_tree) => sub_tree.hash,
         }
     }
@@ -725,7 +761,7 @@ impl ContentTree {
             }
             Self::Filled(data) => {
                 if data_id == 0 {
-                    Ok(data.hash())
+                    Ok(data.get_hash())
                 } else {
                     Err(AppError::IndexingError)
                 }
@@ -748,7 +784,7 @@ impl ContentTree {
         }
     }
 
-    pub fn replace(&mut self, idx: u16, new_data: Data) -> Result<Data, AppError> {
+    pub fn replace(&mut self, idx: u16, mut new_data: Data) -> Result<Data, AppError> {
         match self {
             Self::Filled(data) => {
                 if idx == 0 {
@@ -764,7 +800,7 @@ impl ContentTree {
                 let new_hash = new_data.hash();
                 if idx == 0 && *hash == new_hash {
                     *self = Self::Filled(new_data);
-                    Ok(Data::empty())
+                    Ok(Data::empty(0))
                 } else if idx != 0 {
                     Err(AppError::IndexingError)
                 } else {
@@ -774,7 +810,7 @@ impl ContentTree {
         }
     }
     pub fn append(&mut self, data: Data) -> Result<u64, AppError> {
-        let hash = data.hash();
+        let hash = data.get_hash();
         // we only balance a tree every time we are inserting data
         // appending has it's own logic regarding tree structure
         match self {
@@ -840,7 +876,7 @@ impl ContentTree {
         let result = match self {
             Self::Empty(_hash) => {
                 if idx == 0 {
-                    let hash = data.hash();
+                    let hash = data.get_hash();
                     *self = Self::Filled(data);
                     Ok(hash)
                 } else {
@@ -854,7 +890,7 @@ impl ContentTree {
                     //     *self = Self::Filled(data);
                     //     Ok(hash)
                     // } else {
-                    let left_hash = data.hash();
+                    let left_hash = data.get_hash();
                     let right_hash = old_data.hash();
                     let hash = double_hash(left_hash, right_hash);
                     *self = Self::Hashed(Box::new(Subtree {
@@ -923,13 +959,13 @@ impl ContentTree {
     fn pop(&mut self) -> Data {
         let myself = std::mem::replace(self, Self::Empty(0));
         match myself {
-            Self::Empty(_hash) => Data::empty(),
+            Self::Empty(_hash) => Data::empty(0),
             Self::Filled(data) => data,
             Self::Hashed(mut subtree) => {
                 let taken = subtree.pop();
                 if subtree.len() == 0 {
                 } else if subtree.len() == 1 {
-                    if let Ok(data) = subtree.replace(0, Data::empty()) {
+                    if let Ok(data) = subtree.replace(0, Data::empty(0)) {
                         *self = Self::Filled(data);
                     } else {
                         panic!("Something went wrong in pop")
@@ -1032,7 +1068,7 @@ impl Subtree {
 
     pub fn pop(&mut self) -> Data {
         if self.data_count == 0 {
-            Data::empty()
+            Data::empty(0)
         } else if !self.right.is_empty() {
             self.data_count -= 1;
             self.right.pop()

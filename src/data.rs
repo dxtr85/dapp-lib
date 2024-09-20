@@ -6,7 +6,7 @@ use gnome::prelude::CastData;
 use gnome::prelude::SyncData;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Data(Vec<u8>);
+pub struct Data(u64, Vec<u8>);
 impl Data {
     pub fn new(contents: Vec<u8>) -> Result<Self, Vec<u8>> {
         // println!("new data: {:?}", contents);
@@ -17,15 +17,17 @@ impl Data {
         // let mut with_prefix = vec![0, 0, 0, 0];
         // with_prefix.append(&mut contents);
         // Ok(Self(with_prefix))
-        Ok(Self(contents))
+        let mut hasher = DefaultHasher::new();
+        contents.hash(&mut hasher);
+        Ok(Self(hasher.finish(), contents))
     }
 
-    pub fn empty() -> Self {
-        Data(vec![])
+    pub fn empty(hash: u64) -> Self {
+        Data(hash, vec![])
     }
 
     pub fn to_sync(self) -> SyncData {
-        SyncData::new(self.0).unwrap()
+        SyncData::new(self.1).unwrap()
     }
 
     pub fn to_cast(self, mut prefix: Vec<u8>) -> CastData {
@@ -34,29 +36,34 @@ impl Data {
     }
 
     pub fn bytes(self) -> Vec<u8> {
-        self.0
+        self.1
     }
 
     pub fn ref_bytes(&self) -> &Vec<u8> {
-        &self.0
+        &self.1
     }
 
     pub fn first_byte(&self) -> u8 {
-        self.0[0]
+        self.1[0]
     }
     pub fn second_byte(&self) -> u8 {
-        self.0[1]
+        self.1[1]
     }
     pub fn third_byte(&self) -> u8 {
-        self.0[2]
+        self.1[2]
     }
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.1.len()
     }
-    pub fn hash(&self) -> u64 {
+    pub fn get_hash(&self) -> u64 {
+        self.0
+    }
+    pub fn hash(&mut self) -> u64 {
         let mut hasher = DefaultHasher::new();
-        self.0.hash(&mut hasher);
-        hasher.finish()
+        self.1.hash(&mut hasher);
+        let hash = hasher.finish();
+        self.0 = hash;
+        hash
     }
 }
 
