@@ -189,11 +189,11 @@ async fn serve_gnome_manager(
                         .await;
                 }
                 ToAppMgr::EndBroadcast => {
-                    println!("ToAppMgr::EndBroadcast");
+                    eprintln!("ToAppMgr::EndBroadcast");
                     let _ = app_mgr.active_app_data.send(ToAppData::EndBroadcast).await;
                 }
                 ToAppMgr::UnsubscribeBroadcast => {
-                    println!("ToAppMgr::UnsubscribeBroadcast");
+                    eprintln!("ToAppMgr::UnsubscribeBroadcast");
                     let _ = app_mgr
                         .active_app_data
                         .send(ToAppData::UnsubscribeBroadcast)
@@ -230,7 +230,7 @@ async fn serve_app_data(
         match resp {
             ToAppData::AppDataSynced(is_synced) => {
                 if !is_synced {
-                    println!("\n\n\nApp not synced!\n\n\n");
+                    eprintln!("App not synced!");
                     let sync_requests: Vec<SyncRequest> = vec![
                         SyncRequest::Datastore,
                         SyncRequest::AllFirstPages,
@@ -249,13 +249,13 @@ async fn serve_app_data(
                         ),
                     ));
                 } else {
-                    println!("App synced");
+                    eprintln!("App synced");
                 }
             }
             ToAppData::StartUnicast => {
                 let res =
                     to_gnome_sender.send(ToGnome::StartUnicast(GnomeId(15561580566906229863)));
-                println!("UnicastReq: {:?}", res);
+                eprintln!("UnicastReq: {:?}", res);
             }
             ToAppData::StartBroadcast => {
                 let res = to_gnome_sender.send(ToGnome::StartBroadcast);
@@ -268,14 +268,14 @@ async fn serve_app_data(
                 b_req_sent = res.is_ok();
             }
             ToAppData::EndBroadcast => {
-                println!("ToAppData::EndBroadcast");
+                eprintln!("ToAppData::EndBroadcast");
                 if let Some((c_id, sender)) = b_cast_origin {
-                    println!("Some");
+                    eprintln!("Some");
                     let res = to_gnome_sender.send(ToGnome::EndBroadcast(c_id));
                     b_req_sent = res.is_ok();
                     b_cast_origin = None;
                 } else {
-                    println!("None");
+                    eprintln!("None");
                 }
             }
             ToAppData::AddContent => {
@@ -344,29 +344,29 @@ async fn serve_app_data(
                 let _ = to_gnome_sender.send(ToGnome::ListNeighbors);
             }
             ToAppData::TransformLinkRequest(_sync_data) => {
-                println!("Sending TransformLinkRequest to gnome");
+                eprintln!("Sending TransformLinkRequest to gnome");
                 if let Some(c_id) = link_with_transform_info {
                     let sync_data = SyncData::new(c_id.to_be_bytes().into()).unwrap();
                     let _ = to_gnome_sender.send(ToGnome::Reconfigure(0, sync_data));
                     link_with_transform_info = None;
                 } else {
-                    println!("No link with TransformInfo defined for transformation to begin");
+                    eprintln!("No link with TransformInfo defined for transformation to begin");
                 }
             }
             ToAppData::TransformLink(s_data) => {
-                println!("Received TransformLink from gnome");
+                eprintln!("Received TransformLink from gnome");
                 let s_bytes = s_data.bytes();
                 let c_id = u16::from_be_bytes([s_bytes[0], s_bytes[1]]);
                 let result = app_data.transform_link(c_id);
-                println!("Link transformation result: {:?}", result);
+                eprintln!("Link transformation result: {:?}", result);
             }
             ToAppData::UploadData => {
                 //TODO: send to AppMgr UploadData message
                 // this logic should be moved to app mgr
                 if b_cast_origin.is_none() {
-                    println!("Unable to upload - no active broadcast.");
+                    eprintln!("Unable to upload - no active broadcast.");
                     if !b_req_sent {
-                        println!("Requesting broadcast channel.");
+                        eprintln!("Requesting broadcast channel.");
                         let res = to_gnome_sender.send(ToGnome::StartBroadcast);
                         b_req_sent = res.is_ok();
                     }
@@ -387,16 +387,16 @@ async fn serve_app_data(
                     let data_hashes = vec![];
                     let mut data_vec = Vec::with_capacity(big_chunk.1 as usize);
                     let mut hashes = Vec::with_capacity(big_chunk.1 as usize);
-                    println!("// 3. Split big-chunk into 1024byte small-chunks");
+                    eprintln!("// 3. Split big-chunk into 1024byte small-chunks");
                     while let Some(small_chunk) = big_chunk.next() {
                         // 4. Compute hash for each small-chunk
                         hashes.push(small_chunk.get_hash());
                         // TODO: build proper CastData from Data
                         data_vec.push(small_chunk);
                     }
-                    println!("// 5. Compute root hash from previous hashes.");
+                    eprintln!("// 5. Compute root hash from previous hashes.");
                     let root_hash = get_root_hash(&hashes);
-                    println!("// 6. Instantiate TransformInfo");
+                    eprintln!("// 6. Instantiate TransformInfo");
                     let ti = TransformInfo {
                         d_type,
                         tags: vec![],
@@ -409,19 +409,19 @@ async fn serve_app_data(
                         data: HashMap::new(),
                     };
 
-                    println!(
+                    eprintln!(
                         "// 7. SyncMessage::Append as many Data::Link to Datastore as necessary"
                     );
                     if let Some(content_id) = app_data.next_c_id() {
-                        println!("ContentID: {}", content_id);
+                        eprintln!("ContentID: {}", content_id);
                         let pre: Vec<(ContentID, u64)> = vec![(content_id, 0)];
                         let link =
                             Content::Link(GnomeId(u64::MAX), String::new(), u16::MAX, Some(ti));
                         let link_hash = link.hash();
-                        println!("Link hash: {}", link_hash);
+                        eprintln!("Link hash: {}", link_hash);
                         let data = link.to_data().unwrap();
-                        println!("Link data: {:?}", data);
-                        println!("Data hash: {}", data.get_hash());
+                        eprintln!("Link data: {:?}", data);
+                        eprintln!("Data hash: {}", data.get_hash());
                         let post: Vec<(ContentID, u64)> = vec![(content_id, link_hash)];
                         let reqs = SyncRequirements { pre, post };
                         let msg = SyncMessage::new(SyncMessageType::AddContent, reqs, data);
@@ -432,7 +432,7 @@ async fn serve_app_data(
                         //TODO: we need to set this upon receiving Gnome's confirmation
                         link_with_transform_info = Some(content_id);
                         next_val += 1;
-                        println!("// 8. For each Link Send computed Hashes via broadcast");
+                        eprintln!("// 8. For each Link Send computed Hashes via broadcast");
                         let (done_send, done_recv) = channel();
                         let mut hash_bytes = vec![];
                         let chunks = hashes.chunks(128);
@@ -455,9 +455,9 @@ async fn serve_app_data(
                                 .to_cast(),
                             )
                         }
-                        println!("duplicating hashes");
+                        eprintln!("duplicating hashes");
                         hash_bytes.append(&mut hash_bytes.clone());
-                        println!("spawning serve_broadcast_origin");
+                        eprintln!("spawning serve_broadcast_origin");
                         spawn(serve_broadcast_origin(
                             broadcast_id,
                             Duration::from_millis(512),
@@ -467,7 +467,7 @@ async fn serve_app_data(
                         ));
                         sleep(sleep_time).await;
                         let _done_res = done_recv.recv();
-                        println!("Hashes sent: {}", _done_res.is_ok());
+                        eprintln!("Hashes sent: {}", _done_res.is_ok());
                         // TODO
                         // 9. SyncMessage::Transform a Link into Data
 
@@ -508,7 +508,7 @@ async fn serve_app_data(
                     SyncMessageType::SetManifest => {
                         let old_manifest = app_data.get_all_data(0);
                         if !requirements.pre_validate(0, &app_data) {
-                            println!("PRE validation failed");
+                            eprintln!("PRE validation failed");
                         } else {
                             let content = Content::Data(0, ContentTree::Filled(data));
                             let next_id = app_data.next_c_id().unwrap();
@@ -519,22 +519,22 @@ async fn serve_app_data(
                             };
                             // println!("Manifest result: {:?}", res);
                             if !requirements.post_validate(0, &app_data) {
-                                println!("POST validation failed");
+                                eprintln!("POST validation failed");
                                 if let Ok(data_vec) = old_manifest {
                                     let c_tree = ContentTree::from(data_vec);
                                     let old_content = Content::Data(0, c_tree);
                                     let res = app_data.update(0, old_content);
-                                    println!("Restored old manifest {:?}", res.is_ok());
+                                    eprintln!("Restored old manifest {:?}", res.is_ok());
                                 } else {
                                     let content = Content::Data(0, ContentTree::Empty(0));
                                     let _ = app_data.update(0, content);
-                                    println!("Zeroed manifest");
+                                    eprintln!("Zeroed manifest");
                                 }
                             }
                             let hash = app_data.root_hash();
-                            println!("Sending updated hash: {}", hash);
+                            eprintln!("Sending updated hash: {}", hash);
                             let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
-                            println!("Send res: {:?}", res);
+                            eprintln!("Send res: {:?}", res);
                             // println!("Root hash: {}", app_data.root_hash());
                         }
                     }
@@ -545,10 +545,10 @@ async fn serve_app_data(
                         // ContentID
                         let next_id = app_data.next_c_id().unwrap();
                         if !requirements.pre_validate(next_id, &app_data) {
-                            println!("PRE validation failed for AddContent");
+                            eprintln!("PRE validation failed for AddContent");
                         } else {
                             if requirements.post.len() != 1 {
-                                println!(
+                                eprintln!(
                                     "POST validation failed for AddContent 1 ({:?})",
                                     requirements.post
                                 );
@@ -557,17 +557,17 @@ async fn serve_app_data(
                             let content = Content::from(data).unwrap();
                             // println!("Content: {:?}", content);
                             let (recv_id, recv_hash) = requirements.post[0];
-                            println!("Recv id: {}, next id: {}", recv_id, next_id);
-                            println!("Recv hash: {}, next hash: {}", recv_hash, content.hash());
+                            eprintln!("Recv id: {}, next id: {}", recv_id, next_id);
+                            eprintln!("Recv hash: {}, next hash: {}", recv_hash, content.hash());
                             if recv_id == next_id && recv_hash == content.hash() {
                                 let res = app_data.append(content);
-                                println!("Content added: {:?}", res);
+                                eprintln!("Content added: {:?}", res);
                                 let hash = app_data.root_hash();
-                                println!("Sending updated hash: {}", hash);
+                                eprintln!("Sending updated hash: {}", hash);
                                 let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
-                                println!("Send res: {:?}", res);
+                                eprintln!("Send res: {:?}", res);
                             } else {
-                                println!("POST validation failed for AddContent two");
+                                eprintln!("POST validation failed for AddContent two");
                             }
                             // println!("Root hash: {}", app_data.root_hash());
                         }
@@ -575,7 +575,7 @@ async fn serve_app_data(
                     SyncMessageType::ChangeContent(c_id) => {
                         // println!("ChangeContent");
                         if !requirements.pre_validate(c_id, &app_data) {
-                            println!("PRE validation failed for ChangeContent");
+                            eprintln!("PRE validation failed for ChangeContent");
                             continue;
                         }
                         let content = Content::from(data).unwrap();
@@ -583,98 +583,98 @@ async fn serve_app_data(
                         if let Ok(old_content) = res {
                             if !requirements.post_validate(c_id, &app_data) {
                                 let restore_res = app_data.update(c_id, old_content);
-                                println!("POST validation failed on ChangeContent");
-                                println!("Restore result: {:?}", restore_res);
+                                eprintln!("POST validation failed on ChangeContent");
+                                eprintln!("Restore result: {:?}", restore_res);
                             } else {
                                 let hash = app_data.root_hash();
-                                println!("Sending updated hash: {}", hash);
+                                eprintln!("Sending updated hash: {}", hash);
                                 let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
-                                println!("Send res: {:?}", res);
-                                println!("ChangeContent completed successfully ({})", hash);
+                                eprintln!("Send res: {:?}", res);
+                                eprintln!("ChangeContent completed successfully ({})", hash);
                             }
                         } else {
-                            println!("Update procedure failed: {:?}", res);
+                            eprintln!("Update procedure failed: {:?}", res);
                         }
                     }
                     SyncMessageType::AppendData(c_id) => {
                         //TODO
-                        println!("SyncMessageType::AppendData ");
+                        eprintln!("SyncMessageType::AppendData ");
                         if !requirements.pre_validate(c_id, &app_data) {
-                            println!("PRE validation failed for AppendData");
+                            eprintln!("PRE validation failed for AppendData");
                             continue;
                         }
                         // TODO
                         let res = app_data.append_data(c_id, data);
                         if res.is_ok() {
                             if !requirements.post_validate(c_id, &app_data) {
-                                println!("POST validation failed for AppendData");
+                                eprintln!("POST validation failed for AppendData");
                                 // TODO: restore previous order
                                 let res = app_data.pop_data(c_id);
-                                println!("Restore result: {:?}", res);
+                                eprintln!("Restore result: {:?}", res);
                             } else {
                                 let hash = app_data.root_hash();
-                                println!("Sending updated hash: {}", hash);
+                                eprintln!("Sending updated hash: {}", hash);
                                 let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
-                                println!("Send res: {:?}", res);
-                                println!("Data appended successfully ({})", hash);
+                                eprintln!("Send res: {:?}", res);
+                                eprintln!("Data appended successfully ({})", hash);
                             }
                         }
                     }
                     SyncMessageType::RemoveData(c_id, d_id) => {
                         //TODO
-                        println!("SyncMessageType::RemoveData ");
+                        eprintln!("SyncMessageType::RemoveData ");
                         if !requirements.pre_validate(c_id, &app_data) {
-                            println!("PRE validation failed for RemoveData");
+                            eprintln!("PRE validation failed for RemoveData");
                             continue;
                         }
                         // TODO
                         let res = app_data.remove_data(c_id, d_id);
                         if let Ok(removed_data) = res {
                             if !requirements.post_validate(c_id, &app_data) {
-                                println!("POST validation failed for RemoveData");
+                                eprintln!("POST validation failed for RemoveData");
                                 // TODO: restore previous order
                                 let res = app_data.insert_data(c_id, d_id, removed_data);
-                                println!("Restore result: {:?}", res);
+                                eprintln!("Restore result: {:?}", res);
                             } else {
-                                println!("Data appended successfully ({})", app_data.root_hash());
+                                eprintln!("Data appended successfully ({})", app_data.root_hash());
                             }
                         }
                     }
                     SyncMessageType::UpdateData(c_id, d_id) => {
                         //TODO
-                        println!("SyncMessageType::UpdateData ");
+                        eprintln!("SyncMessageType::UpdateData ");
                         if !requirements.pre_validate(c_id, &app_data) {
-                            println!("PRE validation failed for UpdateData");
+                            eprintln!("PRE validation failed for UpdateData");
                             continue;
                         }
                         // TODO
                         let res = app_data.remove_data(c_id, d_id);
                         if let Ok(removed_data) = res {
                             if !requirements.post_validate(c_id, &app_data) {
-                                println!("POST validation failed for RemoveData");
+                                eprintln!("POST validation failed for RemoveData");
                                 // TODO: restore previous order
                                 let res = app_data.insert_data(c_id, d_id, removed_data);
-                                println!("Restore result: {:?}", res);
+                                eprintln!("Restore result: {:?}", res);
                             } else {
                                 let hash = app_data.root_hash();
-                                println!("Sending updated hash: {}", hash);
+                                eprintln!("Sending updated hash: {}", hash);
                                 let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
-                                println!("Send res: {:?}", res);
-                                println!("Data appended successfully ({})", hash);
+                                eprintln!("Send res: {:?}", res);
+                                eprintln!("Data appended successfully ({})", hash);
                             }
                         }
                     }
                     SyncMessageType::InsertData(c_id, d_id) => {
                         //TODO
-                        println!("SyncMessageType::InsertData ");
+                        eprintln!("SyncMessageType::InsertData ");
                     }
                     SyncMessageType::ExtendData(c_id, d_id) => {
                         //TODO
-                        println!("SyncMessageType::ExtendData ");
+                        eprintln!("SyncMessageType::ExtendData ");
                     }
                     SyncMessageType::UserDefined(_value) => {
                         //TODO
-                        println!("SyncMessageType::UserDefined({})", _value);
+                        eprintln!("SyncMessageType::UserDefined({})", _value);
                     }
                 }
             }
@@ -725,17 +725,20 @@ async fn serve_app_data(
                                             ),
                                         ));
                                     }
-                                    println!("Sent Datastore response");
+                                    eprintln!("Sent Datastore response");
                                 }
                                 SyncRequest::AllFirstPages => {
                                     // TODO: here we should trigger a separate task for sending
                                     // all Content's main pages to specified Neighbor
-                                    println!(
+                                    eprintln!(
                                         "We are requested to send all main pages to neighbor."
                                     );
                                     let sync_type = 0;
                                     for c_id in 1..app_data.next_c_id().unwrap() {
-                                        println!("We need to send main page of ContentID-{}", c_id);
+                                        eprintln!(
+                                            "We need to send main page of ContentID-{}",
+                                            c_id
+                                        );
                                         if let Ok(data) = app_data.read_data(c_id, 0) {
                                             let (data_type, len) =
                                                 app_data.get_type_and_len(c_id).unwrap();
@@ -751,7 +754,7 @@ async fn serve_app_data(
                                                 ),
                                             ));
                                             if res.is_ok() {
-                                                println!(
+                                                eprintln!(
                                                     "Main page of {} sent successfully.",
                                                     c_id,
                                                 );
@@ -761,7 +764,7 @@ async fn serve_app_data(
                                 }
                                 SyncRequest::Hashes(c_id, d_type, h_ids) => {
                                     //TODO
-                                    println!(
+                                    eprintln!(
                                         "We should send some page hashes of Contents: {:?}",
                                         c_id
                                     );
@@ -803,7 +806,7 @@ async fn serve_app_data(
                                                             ),
                                                         ));
                                                     if res.is_ok() {
-                                                        println!(
+                                                        eprintln!(
                                                             "Hashes [{}/{}] of {} sent",
                                                             h_id, hashes_len, c_id
                                                         );
@@ -815,7 +818,7 @@ async fn serve_app_data(
                                 }
                                 SyncRequest::Pages(c_id, d_type, _p_ids) => {
                                     //TODO
-                                    println!(
+                                    eprintln!(
                                         "We are requested to send some pages to neighbor ({:?}: {:?}).",c_id,
                                         _p_ids
                                     );
@@ -843,18 +846,18 @@ async fn serve_app_data(
                                                             ),
                                                         );
                                                         if r.is_ok() {
-                                                            println!(
+                                                            eprintln!(
                                                                 "Sent {}[{}/{}]",
                                                                 c_id, p_id, total
                                                             );
                                                         }
                                                     } else {
-                                                        println!("No Data read.");
+                                                        eprintln!("No Data read.");
                                                     }
                                                 }
                                             }
                                         } else if data_type == 255 {
-                                            println!("Link len: {}", len);
+                                            eprintln!("Link len: {}", len);
                                             if len > 0 {
                                                 let total = len as u16 - 1;
                                                 let sync_type = 0;
@@ -878,13 +881,13 @@ async fn serve_app_data(
                                                             ),
                                                         );
                                                         if r.is_ok() {
-                                                            println!(
+                                                            eprintln!(
                                                                 "Sent {}[{}/{}]",
                                                                 c_id, p_id, total
                                                             );
                                                         }
                                                     } else {
-                                                        println!("No Data read.");
+                                                        eprintln!("No Data read.");
                                                     }
                                                 }
                                             }
@@ -897,7 +900,7 @@ async fn serve_app_data(
                                     // TODO: here we should trigger a separate task for
                                     // each ContentID received in order to send
                                     // all Content's pages to specified Neighbor
-                                    println!(
+                                    eprintln!(
                                         "We are requested to send all pages to neighbor ({:?}).",
                                         c_ids
                                     );
@@ -929,7 +932,7 @@ async fn serve_app_data(
                                                     ),
                                                 ));
                                             }
-                                            println!("Sent CID response");
+                                            eprintln!("Sent CID response");
                                         }
                                     }
                                 }
@@ -937,7 +940,7 @@ async fn serve_app_data(
                         }
                     }
                     other => {
-                        println!("Request {}", other);
+                        eprintln!("Request {}", other);
                     }
                 }
             }
@@ -954,12 +957,12 @@ async fn serve_app_data(
                                         let tree = ContentTree::empty(hash);
                                         let content = Content::Data(data_type, tree);
                                         let res = app_data.append(content);
-                                        println!("Datastore add: {:?}", res);
+                                        eprintln!("Datastore add: {:?}", res);
                                     }
                                 }
                                 SyncResponse::Hashes(c_id, part_no, total, hashes) => {
                                     //TODO: not yet implemented
-                                    println!(
+                                    eprintln!(
                                         "Received hashes [{}/{}] of {} (len: {})!",
                                         part_no,
                                         total,
@@ -969,45 +972,45 @@ async fn serve_app_data(
                                     let upd_res = app_data.update_transformative_link(
                                         true, c_id, part_no, total, hashes,
                                     );
-                                    println!("Update res: {:?}", upd_res);
+                                    eprintln!("Update res: {:?}", upd_res);
                                 }
                                 SyncResponse::Page(c_id, data_type, page_no, total, data) => {
                                     //TODO: make it proper
                                     if page_no == 0 {
-                                        println!(
+                                        eprintln!(
                                             "We've got main page of {}, data type: {}",
                                             c_id, data_type
                                         );
                                         if let Ok((d_type, len)) = app_data.get_type_and_len(c_id) {
-                                            println!("CID already exists");
+                                            eprintln!("CID already exists");
                                             if d_type == 255 {
                                                 if len > 0 {
-                                                    println!("Update existing Link");
+                                                    eprintln!("Update existing Link");
                                                     let _ = app_data.update_transformative_link(
                                                         false, c_id, page_no, total, data,
                                                     );
                                                 } else {
-                                                    println!("Create new Link");
+                                                    eprintln!("Create new Link");
                                                     let res = app_data
                                                         .update(c_id, data_to_link(data).unwrap());
-                                                    println!("Update result: {:?}", res);
+                                                    eprintln!("Update result: {:?}", res);
                                                 }
                                             } else {
-                                                println!("Update existing Data");
+                                                eprintln!("Update existing Data");
                                                 let _res =
                                                     app_data.insert_data(c_id, page_no, data);
                                             }
                                         } else if data_type < 255 {
-                                            println!("Create new Data");
+                                            eprintln!("Create new Data");
                                             let _res = app_data.update(
                                                 c_id,
                                                 Content::Data(data_type, ContentTree::Filled(data)),
                                             );
                                         } else {
-                                            println!("Create new Link 2");
+                                            eprintln!("Create new Link 2");
                                             let res =
                                                 app_data.update(c_id, data_to_link(data).unwrap());
-                                            println!("Update result: {:?}", res);
+                                            eprintln!("Update result: {:?}", res);
                                         }
 
                                         // if data_type < 255 {
@@ -1019,20 +1022,20 @@ async fn serve_app_data(
                                     {
                                         if d_type == data_type {
                                             let res = app_data.append_data(c_id, data);
-                                            println!("Page #{} add result: {:?}", page_no, res);
+                                            eprintln!("Page #{} add result: {:?}", page_no, res);
                                         } else if d_type == 255 {
                                             let res = app_data.update_transformative_link(
                                                 false, c_id, page_no, total, data,
                                             );
                                             // println!("Update TI result: {:?}", res);
                                         } else {
-                                            println!(
+                                            eprintln!(
                                                 "Error: Stored:{} len:{}\nreceived:{} len:{}",
                                                 d_type, len, data_type, total
                                             );
                                         }
                                     } else {
-                                        println!("Datastore couldn't find ContentID {}", c_id);
+                                        eprintln!("Datastore couldn't find ContentID {}", c_id);
                                     }
                                 }
                             }
@@ -1108,14 +1111,11 @@ async fn serve_app_data(
                     //     println!("Response 2");
                     // }
                     other => {
-                        println!("Response {}", other);
+                        eprintln!("Response {}", other);
                     }
                 }
             }
-            ToAppData::BCastOrigin(c_id, send) => {
-                //TODO: we need an option to also receive what we have broadcasted!
-                b_cast_origin = Some((c_id, send))
-            }
+            ToAppData::BCastOrigin(c_id, send) => b_cast_origin = Some((c_id, send)),
             ToAppData::BCastData(_c_id, c_data) => {
                 // TODO: serve this
                 let a_msg_res = parse_cast(c_data);
@@ -1132,7 +1132,7 @@ async fn serve_app_data(
                         //TODO: request hashes if missing not empty
                         if !missing_hashes.is_empty() {
                             //TODO: there can be multiple SyncRequests
-                            println!("Missing hashes: {:?}", missing_hashes);
+                            eprintln!("Missing hashes: {:?}", missing_hashes);
                             let sync_request =
                                 SyncRequest::Hashes(a_msg.content_id, d_type, missing_hashes);
                             to_gnome_sender
@@ -1148,7 +1148,7 @@ async fn serve_app_data(
                         }
                         if !missing_data.is_empty() {
                             //TODO: there can be multiple SyncRequests
-                            println!("Missing data: {:?}", missing_data);
+                            eprintln!("Missing data: {:?}", missing_data);
                             let sync_request =
                                 SyncRequest::Pages(a_msg.content_id, d_type, missing_data);
                             to_gnome_sender
@@ -1163,15 +1163,15 @@ async fn serve_app_data(
                                 .unwrap();
                         }
                     } else {
-                        println!("Unable to update: {:?}", upd_res);
+                        eprintln!("Unable to update: {:?}", upd_res);
                     }
                 } else {
                     let data = a_msg_res.err().unwrap();
-                    println!("App Data: {} ", data);
+                    eprintln!("App Data: {} ", data);
                 }
             }
             _ => {
-                println!("Unserved by app: {:?}", resp);
+                eprintln!("Unserved by app: {:?}", resp);
             }
         }
     }
@@ -1188,7 +1188,7 @@ async fn serve_swarm(
             // println!("SUR: {:?}", resp);
             match resp {
                 GnomeToApp::AppDataSynced(synced) => {
-                    println!("Gnome says if synced: {}", synced);
+                    eprintln!("Gnome says if synced: {}", synced);
                     let _ = to_app_data_send
                         .send(ToAppData::AppDataSynced(synced))
                         .await;
@@ -1246,7 +1246,7 @@ async fn serve_swarm(
                             .await;
                     }
                     other => {
-                        println!("Unserved Reconfig from Gnome: {}", id);
+                        eprintln!("Unserved Reconfig from Gnome: {}", id);
                     }
                 },
                 _ => {
@@ -1259,11 +1259,11 @@ async fn serve_swarm(
 }
 
 async fn serve_unicast(c_id: CastID, sleep_time: Duration, user_res: Receiver<CastData>) {
-    println!("Serving unicast {:?}", c_id);
+    eprintln!("Serving unicast {:?}", c_id);
     loop {
         let recv_res = user_res.try_recv();
         if let Ok(data) = recv_res {
-            println!("U{:?}: {}", c_id, data);
+            eprintln!("U{:?}: {}", c_id, data);
         }
         sleep(sleep_time).await;
     }
@@ -1275,16 +1275,16 @@ async fn serve_broadcast_origin(
     data_vec: Vec<CastData>,
     done: Sender<()>,
 ) {
-    println!("Originating broadcast {:?}", c_id);
+    eprintln!("Originating broadcast {:?}", c_id);
     sleep(Duration::from_secs(2)).await;
-    println!("Initial sleep is over");
+    eprintln!("Initial sleep is over");
     // TODO: indexing
     for (i, data) in data_vec.into_iter().enumerate() {
         let send_res = user_res.send(data);
         if send_res.is_ok() {
             print!("BCed: {}\t", i + 1);
         } else {
-            println!(
+            eprintln!(
                 "Error while trying to broadcast: {:?}",
                 send_res.err().unwrap()
             );
@@ -1302,7 +1302,7 @@ async fn serve_broadcast(
     cast_data_recv: Receiver<CastData>,
     to_app_data_send: ASender<ToAppData>,
 ) {
-    println!("Serving broadcast {:?}", c_id);
+    eprintln!("Serving broadcast {:?}", c_id);
     loop {
         let recv_res = cast_data_recv.try_recv();
         if let Ok(data) = recv_res {
@@ -1316,14 +1316,14 @@ async fn serve_broadcast(
 }
 
 async fn serve_unicast_origin(c_id: CastID, sleep_time: Duration, user_res: Sender<CastData>) {
-    println!("Originating unicast {:?}", c_id);
+    eprintln!("Originating unicast {:?}", c_id);
     let mut i: u8 = 0;
     loop {
         let send_res = user_res.send(CastData::new(vec![i]).unwrap());
         if send_res.is_ok() {
-            println!("Unicasted {}", i);
+            eprintln!("Unicasted {}", i);
         } else {
-            println!(
+            eprintln!(
                 "Error while trying to unicast: {:?}",
                 send_res.err().unwrap()
             );
@@ -1617,7 +1617,7 @@ impl ApplicationData {
     }
     pub fn get_all_page_hashes(&self, c_id: ContentID) -> Result<Vec<Data>, AppError> {
         let hashes_vec = self.contents.content_bottom_hashes(c_id)?;
-        println!("Got hashes vec");
+        eprintln!("Got hashes vec");
         let mut results = vec![];
         let mut hash_iter = hashes_vec.into_iter();
         let mut i = 0;

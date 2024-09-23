@@ -80,14 +80,14 @@ pub struct TransformInfo {
 
 impl TransformInfo {
     pub fn from(bytes: Vec<u8>) -> Option<Self> {
-        println!("TI from: {:?} bytes", bytes.len());
+        eprintln!("TI from: {:?} bytes", bytes.len());
         let mut bytes_iter = bytes.into_iter();
         if let Some(d_type) = bytes_iter.next() {
             let b1 = bytes_iter.next().unwrap();
             let b2 = bytes_iter.next().unwrap();
             let size = u16::from_be_bytes([b1, b2]);
             let tags_len = bytes_iter.next().unwrap();
-            println!("tag len: {}", tags_len);
+            eprintln!("tag len: {}", tags_len);
             let mut tags = Vec::with_capacity(tags_len as usize);
             for _i in 0..tags_len {
                 tags.push(bytes_iter.next().unwrap());
@@ -169,7 +169,7 @@ impl TransformInfo {
                 if data.hash() == hash {
                     let _ = c_tree.append(data);
                 } else {
-                    println!("Hash mismatch data's: {}, announced: {}", data.hash(), hash);
+                    eprintln!("Hash mismatch data's: {}, announced: {}", data.hash(), hash);
                     let _ = c_tree.append(Data::empty(hash));
                 }
             } else {
@@ -224,7 +224,7 @@ impl TransformInfo {
     }
     pub fn add_hash(&mut self, part_no: u16, _total_parts: u16, data: Data) {
         //TODO
-        println!(
+        eprintln!(
             "Adding hash: [{}/{}], len: {}",
             part_no,
             _total_parts,
@@ -238,13 +238,13 @@ impl TransformInfo {
             } else if dh_len == part_no {
                 self.data_hashes.push(data)
             } else {
-                println!(
+                eprintln!(
                     "Received hashes [{}/{}], we have only {} parts",
                     part_no, _total_parts, dh_len
                 );
             }
         } else {
-            println!("not missing");
+            eprintln!("not missing");
             let current_len = self.data_hashes.len() as u16;
             if current_len < part_no {
                 for i in current_len..part_no {
@@ -274,7 +274,7 @@ impl TransformInfo {
         let hash_data_id = part_no >> 7;
         // println!("hID: {}, DHlen: {}", hash_data_id, self.data_hashes.len());
         if self.missing_hashes.contains(&hash_data_id) {
-            println!("Missing hash, adding unconditionally");
+            eprintln!("Missing hash, adding unconditionally");
             let _res = self.data.insert(part_no, data);
         } else if hash_data_id as usize >= self.data_hashes.len() {
             for i in self.data_hashes.len() as u16..=hash_data_id {
@@ -298,13 +298,13 @@ impl TransformInfo {
             if hash == data.get_hash() {
                 let _res = self.data.insert(part_no, data);
             } else {
-                println!("Hashes do not match, not adding");
+                eprintln!("Hashes do not match, not adding");
             }
         }
         // println!("Data len before: {}", self.data.len());
         // let res = self.data.insert(part_no, Data::empty());
         // self.data.len()
-        print!("L:{}\t", self.data.len());
+        eprint!("L:{}\t", self.data.len());
     }
     pub fn what_hashes_are_missing(&self) -> Vec<u16> {
         let mut res = Vec::with_capacity(self.missing_hashes.len());
@@ -432,7 +432,7 @@ impl Content {
                 //     }
                 // } else {
                 if data_id == 0 {
-                    println!("Converting link to data, TI: {:?}", ti.is_some());
+                    eprintln!("Converting link to data, TI: {:?}", ti.is_some());
                     Ok(link_to_data(*g_id, s_name.clone(), *c_id, ti.clone()))
                 } else {
                     Err(AppError::IndexingError)
@@ -625,7 +625,7 @@ impl Content {
 pub fn data_to_link(data: Data) -> Result<Content, AppError> {
     let mut bytes_iter = data.bytes().into_iter();
     let len = bytes_iter.len();
-    println!("creating link from {} bytes", len);
+    eprintln!("creating link from {} bytes", len);
     bytes_iter.next().unwrap();
     if len < 11 {
         return Err(AppError::Smthg);
@@ -643,7 +643,7 @@ pub fn data_to_link(data: Data) -> Result<Content, AppError> {
     let next_two = [bytes_iter.next().unwrap(), bytes_iter.next().unwrap()];
 
     let name_len = bytes_iter.next().unwrap();
-    println!("S name len: {}", name_len);
+    eprintln!("S name len: {}", name_len);
     let mut name_vec = Vec::with_capacity(name_len as usize);
     for _i in 0..name_len {
         name_vec.push(bytes_iter.next().unwrap());
@@ -664,9 +664,9 @@ fn link_to_data(g_id: GnomeId, s_name: String, c_id: ContentID, ti: Option<Trans
     for b in c_id.to_be_bytes() {
         v.push(b);
     }
-    println!("S name: {},", s_name,);
+    eprintln!("S name: {},", s_name,);
     let s_bytes = s_name.into_bytes();
-    println!(" len: {}", s_bytes.len());
+    eprintln!(" len: {}", s_bytes.len());
     v.push(s_bytes.len() as u8);
     for b in s_bytes {
         v.push(b);
@@ -674,7 +674,7 @@ fn link_to_data(g_id: GnomeId, s_name: String, c_id: ContentID, ti: Option<Trans
     if let Some(ti) = ti {
         v.append(&mut ti.bytes());
     }
-    println!("link_to_data len: {}\n{:?}", v.len(), v);
+    eprintln!("link_to_data len: {}\n{:?}", v.len(), v);
     Data::new(v).unwrap()
 }
 
@@ -971,7 +971,7 @@ impl ContentTree {
                         panic!("Something went wrong in pop")
                     }
                 } else if subtree.len().count_ones() == 1 {
-                    println!("Shrinking, right size: {}", subtree.right.len());
+                    eprintln!("Shrinking, right size: {}", subtree.right.len());
                     *self = subtree.left;
                 } else {
                     *self = Self::Hashed(subtree);
