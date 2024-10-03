@@ -44,7 +44,9 @@ use async_std::channel::Receiver as AReceiver;
 use async_std::channel::Sender as ASender;
 
 pub mod prelude {
-    pub use crate::content::{double_hash, Content, ContentID, ContentTree, TransformInfo};
+    pub use crate::content::{
+        double_hash, Content, ContentID, ContentTree, DataType, TransformInfo,
+    };
     pub use crate::data::Data;
     pub use crate::error::AppError;
     pub use crate::initialize;
@@ -55,6 +57,7 @@ pub mod prelude {
     pub use crate::ApplicationData;
     pub use crate::ApplicationManager;
     pub use crate::Configuration;
+    pub use crate::ToUser;
     pub use gnome::prelude::CastData;
     pub use gnome::prelude::GnomeId;
     pub use gnome::prelude::SyncData;
@@ -70,7 +73,8 @@ fn manifest() -> ApplicationManifest {
 }
 
 pub enum ToUser {
-    //TODO
+    Neighbors(String, Vec<GnomeId>),
+    NewContent(ContentID, DataType),
 }
 
 pub enum ToAppMgr {
@@ -81,8 +85,10 @@ pub enum ToAppMgr {
     UnsubscribeBroadcast,
     SendManifest,
     ListNeighbors,
+    NeighborsListing(String, Vec<GnomeId>),
     ChangeContent,
     AddContent,
+    ContentAdded(ContentID, DataType),
     TransformLinkRequest(Box<SyncData>),
 }
 // enum ToApp {}
@@ -132,6 +138,7 @@ pub fn initialize(config: Configuration) -> (Sender<ToAppMgr>, Receiver<ToUser>)
         gmgr_send,
         gmgr_recv,
         to_user_send,
+        to_app_mgr_send.clone(),
         to_app_mgr_recv,
     ));
     (to_app_mgr_send, to_user_recv)
@@ -141,6 +148,7 @@ async fn serve_gnome_manager(
     send: Sender<ToGnomeManager>,
     recv: Receiver<FromGnomeManager>,
     to_user_send: Sender<ToUser>,
+    to_app_mgr_send: Sender<ToAppMgr>,
     to_app_mgr_recv: Receiver<ToAppMgr>,
 ) {
     // TODO: AppMgr should hold state
@@ -161,7 +169,12 @@ async fn serve_gnome_manager(
             let (to_app_data_send, to_app_data_recv) = achannel::bounded(32);
             app_mgr.add_app_data(s_id, to_app_data_send.clone());
             let app_data = ApplicationData::empty();
-            spawn(serve_app_data(app_data, to_app_data_recv, to_swarm));
+            spawn(serve_app_data(
+                app_data,
+                to_app_data_recv,
+                to_swarm,
+                to_app_mgr_send.clone(),
+            ));
             spawn(serve_swarm(
                 Duration::from_millis(64),
                 from_swarm,
@@ -205,11 +218,17 @@ async fn serve_gnome_manager(
                 ToAppMgr::ListNeighbors => {
                     let _ = app_mgr.active_app_data.send(ToAppData::ListNeighbors).await;
                 }
+                ToAppMgr::NeighborsListing(s_id, neighbors) => {
+                    let _ = to_user_send.send(ToUser::Neighbors(s_id, neighbors));
+                }
                 ToAppMgr::ChangeContent => {
                     let _ = app_mgr.active_app_data.send(ToAppData::ChangeContent).await;
                 }
                 ToAppMgr::AddContent => {
                     let _ = app_mgr.active_app_data.send(ToAppData::AddContent).await;
+                }
+                ToAppMgr::ContentAdded(c_id, d_type) => {
+                    let _ = to_user_send.send(ToUser::NewContent(c_id, d_type));
                 }
             }
         }
@@ -220,6 +239,7 @@ async fn serve_app_data(
     mut app_data: ApplicationData,
     app_data_recv: AReceiver<ToAppData>,
     to_gnome_sender: Sender<ToGnome>,
+    to_app_mgr_send: Sender<ToAppMgr>,
 ) {
     let mut b_cast_origin: Option<(CastID, Sender<CastData>)> = None;
     let mut link_with_transform_info: Option<ContentID> = None;
@@ -490,6 +510,9 @@ async fn serve_app_data(
                     }
                 }
             }
+            ToAppData::Response(GnomeToApp::Neighbors(s_id, neighbors)) => {
+                let _ = to_app_mgr_send.send(ToAppMgr::NeighborsListing(s_id, neighbors));
+            }
             ToAppData::Response(GnomeToApp::Block(_id, data)) => {
                 // println!("Processing data...");
                 let process_result = app_data.process(data);
@@ -557,16 +580,23 @@ async fn serve_app_data(
                             let content = Content::from(data).unwrap();
                             // println!("Content: {:?}", content);
                             let (recv_id, recv_hash) = requirements.post[0];
-                            eprintln!("Recv id: {}, next id: {}", recv_id, next_id);
-                            eprintln!("Recv hash: {}, next hash: {}", recv_hash, content.hash());
                             if recv_id == next_id && recv_hash == content.hash() {
+                                let d_type = content.data_type();
                                 let res = app_data.append(content);
                                 eprintln!("Content added: {:?}", res);
                                 let hash = app_data.root_hash();
                                 eprintln!("Sending updated hash: {}", hash);
                                 let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
                                 eprintln!("Send res: {:?}", res);
+                                let _to_mgr_res =
+                                    to_app_mgr_send.send(ToAppMgr::ContentAdded(recv_id, d_type));
                             } else {
+                                eprintln!("Recv id: {}, next id: {}", recv_id, next_id);
+                                eprintln!(
+                                    "Recv hash: {}, next hash: {}",
+                                    recv_hash,
+                                    content.hash()
+                                );
                                 eprintln!("POST validation failed for AddContent two");
                             }
                             // println!("Root hash: {}", app_data.root_hash());
