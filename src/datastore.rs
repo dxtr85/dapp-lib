@@ -44,11 +44,13 @@ impl Datastore {
     // failing when all possible slots are already taken
     pub fn insert_data(&mut self, c_id: ContentID, d_id: u16, data: Data) -> Result<u64, AppError> {
         let take_result = self.take(c_id);
+        // eprintln!("Take result: {:?}", take_result);
         if let Err(e) = take_result {
             return Err(e);
         }
         let mut content = take_result.unwrap();
         let insert_result = content.insert(d_id, data);
+        // eprintln!("Insert result: {:?}", insert_result);
         let _ = self.update(c_id, content);
         insert_result
     }
@@ -56,7 +58,7 @@ impl Datastore {
     // this fn should be used for adding new Data to existing Content,
     // failing when all possible slots are already taken
     pub fn append_data(&mut self, c_id: ContentID, data: Data) -> Result<u64, AppError> {
-        println!("Append {}", c_id);
+        // eprintln!("Append {}", c_id);
         let take_result = self.take(c_id);
         if let Err(e) = take_result {
             return Err(e);
@@ -308,7 +310,7 @@ impl Datastore {
             // println!("Update res: {:?}", _res);
             Ok((d_type, missing_hashes, missing_parts))
         } else {
-            println!("Link has no TI");
+            eprintln!("Link has no TI");
             // let _ = self.update(content_id, Content::Link(g_id, s_name, lc_id, ti));
             Err(AppError::LinkNonTransformative)
         }
@@ -377,7 +379,7 @@ impl Datastore {
         if !v.is_empty() {
             total.push(v);
         }
-        println!("All root hashes count: ~{}", total.len() * 128);
+        // eprintln!("All root hashes count: ~{}", total.len() * 128);
         total
     }
 
@@ -400,7 +402,7 @@ impl Datastore {
         match self {
             Self::Empty => Err(AppError::ContentEmpty),
             Self::Filled(content) => {
-                println!("Sending bottom hashes up");
+                eprintln!("Sending bottom hashes up");
                 if c_id == 0 {
                     content.link_ti_hashes()
                 } else {

@@ -1,3 +1,4 @@
+use crate::prelude::DataType;
 use crate::SyncData;
 use std::collections::HashMap;
 
@@ -103,8 +104,8 @@ impl SyncRequirements {
 #[derive(Clone, Copy, Debug)]
 pub enum SyncMessageType {
     SetManifest, // Should this be a separate type?
-    AddContent,
-    ChangeContent(ContentID),
+    AddContent(DataType),
+    ChangeContent(DataType, ContentID),
     AppendData(ContentID),
     RemoveData(ContentID, u16),
     UpdateData(ContentID, u16),
@@ -117,12 +118,16 @@ impl SyncMessageType {
         let value = bytes.drain(0..1).next().unwrap();
         match value {
             255 => SyncMessageType::SetManifest,
-            254 => SyncMessageType::AddContent,
+            254 => {
+                let b1 = bytes.drain(0..1).next().unwrap();
+                SyncMessageType::AddContent(b1)
+            }
             253 => {
+                let d_type = bytes.drain(0..1).next().unwrap();
                 let b1 = bytes.drain(0..1).next().unwrap();
                 let b2 = bytes.drain(0..1).next().unwrap();
                 let c_id = u16::from_be_bytes([b1, b2]);
-                SyncMessageType::ChangeContent(c_id)
+                SyncMessageType::ChangeContent(d_type, c_id)
             }
             252 => {
                 let b1 = bytes.drain(0..1).next().unwrap();
@@ -179,10 +184,10 @@ impl SyncMessageType {
     pub fn as_bytes(&self) -> Vec<u8> {
         match self {
             SyncMessageType::SetManifest => vec![255],
-            SyncMessageType::AddContent => vec![254],
-            SyncMessageType::ChangeContent(c_id) => {
+            SyncMessageType::AddContent(d_type) => vec![254, *d_type],
+            SyncMessageType::ChangeContent(d_type, c_id) => {
                 let [b1, b2] = c_id.to_be_bytes();
-                vec![253, b1, b2]
+                vec![253, *d_type, b1, b2]
             }
             SyncMessageType::AppendData(c_id) => {
                 let [b1, b2] = c_id.to_be_bytes();

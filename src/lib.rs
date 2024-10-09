@@ -75,9 +75,13 @@ fn manifest() -> ApplicationManifest {
 pub enum ToUser {
     Neighbors(String, Vec<GnomeId>),
     NewContent(ContentID, DataType),
+    ReadResult(ContentID, Vec<Data>),
+    Disconnected,
 }
 
 pub enum ToAppMgr {
+    ReadData(ContentID),
+    ReadResult(ContentID, Vec<Data>),
     UploadData,
     StartUnicast,
     StartBroadcast,
@@ -86,16 +90,18 @@ pub enum ToAppMgr {
     SendManifest,
     ListNeighbors,
     NeighborsListing(String, Vec<GnomeId>),
-    ChangeContent,
-    AddContent,
+    ChangeContent(DataType, Data),
+    AddContent(Data),
     ContentAdded(ContentID, DataType),
     TransformLinkRequest(Box<SyncData>),
+    Quit,
 }
 // enum ToApp {}
 
 #[derive(Debug)]
 pub enum ToAppData {
     Response(GnomeToApp),
+    ReadData(ContentID),
     UploadData,
     StartUnicast,
     StartBroadcast,
@@ -106,12 +112,13 @@ pub enum ToAppData {
     AppDataSynced(bool),
     BCastData(CastID, CastData),
     BCastOrigin(CastID, Sender<CastData>),
-    ChangeContent,
-    AddContent,
+    ChangeContent(DataType, Data),
+    AddContent(Data),
     CustomRequest(u8, GnomeId, CastData),
     CustomResponse(u8, GnomeId, CastData),
     TransformLinkRequest(SyncData),
     TransformLink(SyncData),
+    Terminate,
 }
 // enum ToSwarm {}
 
@@ -155,36 +162,52 @@ async fn serve_gnome_manager(
     let mut app_mgr = ApplicationManager::new();
 
     let sleep_time = Duration::from_millis(128);
-    loop {
+    'outer: loop {
         sleep(sleep_time).await;
-        while let Ok(FromGnomeManager::SwarmJoined(s_id, _s_name, to_swarm, from_swarm)) =
-            recv.try_recv()
-        {
-            // println!("recv swarm joined");
-            // TODO: we need to identify to which application should we assign
-            //       given swarm
-            // TODO: we need a bi-directional communication between
-            // AppMgr and each AppData
-            // TODO: we need a bi-directional comm between AppMgr and user App
-            let (to_app_data_send, to_app_data_recv) = achannel::bounded(32);
-            app_mgr.add_app_data(s_id, to_app_data_send.clone());
-            let app_data = ApplicationData::empty();
-            spawn(serve_app_data(
-                app_data,
-                to_app_data_recv,
-                to_swarm,
-                to_app_mgr_send.clone(),
-            ));
-            spawn(serve_swarm(
-                Duration::from_millis(64),
-                from_swarm,
-                to_app_data_send.clone(),
-            ));
+        while let Ok(message) = recv.try_recv() {
+            match message {
+                FromGnomeManager::SwarmJoined(s_id, _s_name, to_swarm, from_swarm) => {
+                    // println!("recv swarm joined");
+                    // TODO: we need to identify to which application should we assign
+                    //       given swarm
+                    // TODO: we need a bi-directional communication between
+                    // AppMgr and each AppData
+                    // TODO: we need a bi-directional comm between AppMgr and user App
+                    let (to_app_data_send, to_app_data_recv) = achannel::bounded(32);
+                    app_mgr.add_app_data(s_id, to_app_data_send.clone());
+                    let app_data = ApplicationData::empty();
+                    spawn(serve_app_data(
+                        app_data,
+                        to_app_data_recv,
+                        to_swarm,
+                        to_app_mgr_send.clone(),
+                    ));
+                    spawn(serve_swarm(
+                        Duration::from_millis(64),
+                        from_swarm,
+                        to_app_data_send.clone(),
+                    ));
+                }
+                FromGnomeManager::Disconnected => {
+                    eprintln!("AppMgr received Disconnected");
+                    let _ = to_user_send.send(ToUser::Disconnected);
+                    break 'outer;
+                }
+            }
         }
         while let Ok(message) = to_app_mgr_recv.try_recv() {
             match message {
                 ToAppMgr::UploadData => {
                     let _ = app_mgr.active_app_data.send(ToAppData::UploadData).await;
+                }
+                ToAppMgr::ReadData(c_id) => {
+                    let _ = app_mgr
+                        .active_app_data
+                        .send(ToAppData::ReadData(c_id))
+                        .await;
+                }
+                ToAppMgr::ReadResult(c_id, data_vec) => {
+                    to_user_send.send(ToUser::ReadResult(c_id, data_vec));
                 }
                 ToAppMgr::TransformLinkRequest(boxed_s_data) => {
                     let _ = app_mgr
@@ -221,18 +244,31 @@ async fn serve_gnome_manager(
                 ToAppMgr::NeighborsListing(s_id, neighbors) => {
                     let _ = to_user_send.send(ToUser::Neighbors(s_id, neighbors));
                 }
-                ToAppMgr::ChangeContent => {
-                    let _ = app_mgr.active_app_data.send(ToAppData::ChangeContent).await;
+                ToAppMgr::ChangeContent(d_type, data) => {
+                    let _ = app_mgr
+                        .active_app_data
+                        .send(ToAppData::ChangeContent(d_type, data))
+                        .await;
                 }
-                ToAppMgr::AddContent => {
-                    let _ = app_mgr.active_app_data.send(ToAppData::AddContent).await;
+                ToAppMgr::AddContent(data) => {
+                    let _ = app_mgr
+                        .active_app_data
+                        .send(ToAppData::AddContent(data))
+                        .await;
                 }
                 ToAppMgr::ContentAdded(c_id, d_type) => {
                     let _ = to_user_send.send(ToUser::NewContent(c_id, d_type));
                 }
+                ToAppMgr::Quit => {
+                    eprintln!("AppMgr received Quit");
+                    let _ = send.send(ToGnomeManager::Disconnect);
+                    let _ = app_mgr.active_app_data.send(ToAppData::Terminate).await;
+                    break;
+                }
             }
         }
     }
+    eprintln!("Done serving AppMgr");
 }
 
 async fn serve_app_data(
@@ -289,23 +325,28 @@ async fn serve_app_data(
             }
             ToAppData::EndBroadcast => {
                 eprintln!("ToAppData::EndBroadcast");
-                if let Some((c_id, sender)) = b_cast_origin {
-                    eprintln!("Some");
+                if let Some((c_id, _sender)) = b_cast_origin {
+                    // eprintln!("Some");
                     let res = to_gnome_sender.send(ToGnome::EndBroadcast(c_id));
                     b_req_sent = res.is_ok();
                     b_cast_origin = None;
                 } else {
-                    eprintln!("None");
+                    // eprintln!("None");
                 }
             }
-            ToAppData::AddContent => {
+            ToAppData::AddContent(data) => {
                 if let Some(next_id) = app_data.next_c_id() {
                     let pre: Vec<(ContentID, u64)> = vec![(next_id, 0)];
-                    let data = Data::new(vec![next_val]).unwrap();
                     let post: Vec<(ContentID, u64)> = vec![(next_id, data.get_hash())];
-                    let data = Data::new(vec![0, next_val]).unwrap();
+                    //TODO: we push this 0 to inform Content::from that we are dealing
+                    // Not with a Content::Link, which is 255 but with Content::Data,
+                    // whose DataType = 0
+                    // We should probably send this in SyncMessage header instead
+                    // let mut bytes = vec![0];
+                    // bytes.append(&mut data.bytes());
+                    // let data = Data::new(bytes).unwrap();
                     let reqs = SyncRequirements { pre, post };
-                    let msg = SyncMessage::new(SyncMessageType::AddContent, reqs, data);
+                    let msg = SyncMessage::new(SyncMessageType::AddContent(0), reqs, data);
                     let parts = msg.into_parts();
                     for part in parts {
                         let _ = to_gnome_sender.send(ToGnome::AddData(part));
@@ -313,7 +354,7 @@ async fn serve_app_data(
                     next_val += 1;
                 }
             }
-            ToAppData::ChangeContent => {
+            ToAppData::ChangeContent(d_type, data) => {
                 let c_id: u16 = 1;
                 let pre_hash_result = app_data.content_root_hash(c_id);
                 // println!("About to change content {:?}", pre_hash_result);
@@ -322,9 +363,10 @@ async fn serve_app_data(
                     let data = Data::new(vec![next_val]).unwrap();
                     let post: Vec<(ContentID, u64)> = vec![(c_id, data.get_hash())];
                     // We prepend 0 to indicate it is not a Link
-                    let data = Data::new(vec![0, next_val]).unwrap();
+                    // let data = Data::new(vec![0, next_val]).unwrap();
                     let reqs = SyncRequirements { pre, post };
-                    let msg = SyncMessage::new(SyncMessageType::ChangeContent(c_id), reqs, data);
+                    let msg =
+                        SyncMessage::new(SyncMessageType::ChangeContent(d_type, c_id), reqs, data);
                     let parts = msg.into_parts();
                     for part in parts {
                         let _ = to_gnome_sender.send(ToGnome::AddData(part));
@@ -444,7 +486,7 @@ async fn serve_app_data(
                         eprintln!("Data hash: {}", data.get_hash());
                         let post: Vec<(ContentID, u64)> = vec![(content_id, link_hash)];
                         let reqs = SyncRequirements { pre, post };
-                        let msg = SyncMessage::new(SyncMessageType::AddContent, reqs, data);
+                        let msg = SyncMessage::new(SyncMessageType::AddContent(255), reqs, data);
                         let parts = msg.into_parts();
                         for part in parts {
                             let _ = to_gnome_sender.send(ToGnome::AddData(part));
@@ -561,7 +603,7 @@ async fn serve_app_data(
                             // println!("Root hash: {}", app_data.root_hash());
                         }
                     }
-                    SyncMessageType::AddContent => {
+                    SyncMessageType::AddContent(d_type) => {
                         // TODO: potentially for AddContent & ChangeContent
                         // post requirements could be empty
                         // pre requirements can not be empty since we need
@@ -577,7 +619,7 @@ async fn serve_app_data(
                                 );
                                 continue;
                             }
-                            let content = Content::from(data).unwrap();
+                            let content = Content::from(d_type, data).unwrap();
                             // println!("Content: {:?}", content);
                             let (recv_id, recv_hash) = requirements.post[0];
                             if recv_id == next_id && recv_hash == content.hash() {
@@ -602,13 +644,13 @@ async fn serve_app_data(
                             // println!("Root hash: {}", app_data.root_hash());
                         }
                     }
-                    SyncMessageType::ChangeContent(c_id) => {
+                    SyncMessageType::ChangeContent(d_type, c_id) => {
                         // println!("ChangeContent");
                         if !requirements.pre_validate(c_id, &app_data) {
                             eprintln!("PRE validation failed for ChangeContent");
                             continue;
                         }
-                        let content = Content::from(data).unwrap();
+                        let content = Content::from(d_type, data).unwrap();
                         let res = app_data.update(c_id, content);
                         if let Ok(old_content) = res {
                             if !requirements.post_validate(c_id, &app_data) {
@@ -986,7 +1028,10 @@ async fn serve_app_data(
                                     for (data_type, hash) in hashes {
                                         let tree = ContentTree::empty(hash);
                                         let content = Content::Data(data_type, tree);
+                                        let c_id = app_data.next_c_id().unwrap();
                                         let res = app_data.append(content);
+                                        let _ = to_app_mgr_send
+                                            .send(ToAppMgr::ContentAdded(c_id, data_type));
                                         eprintln!("Datastore add: {:?}", res);
                                     }
                                 }
@@ -1012,7 +1057,7 @@ async fn serve_app_data(
                                             c_id, data_type
                                         );
                                         if let Ok((d_type, len)) = app_data.get_type_and_len(c_id) {
-                                            eprintln!("CID already exists");
+                                            eprintln!("CID {} already exists", c_id);
                                             if d_type == 255 {
                                                 if len > 0 {
                                                     eprintln!("Update existing Link");
@@ -1026,18 +1071,22 @@ async fn serve_app_data(
                                                     eprintln!("Update result: {:?}", res);
                                                 }
                                             } else {
-                                                eprintln!("Update existing Data");
                                                 let _res =
                                                     app_data.insert_data(c_id, page_no, data);
+                                                eprintln!("Update existing Data: {:?}", _res);
                                             }
                                         } else if data_type < 255 {
                                             eprintln!("Create new Data");
+                                            let _ = to_app_mgr_send
+                                                .send(ToAppMgr::ContentAdded(c_id, data_type));
                                             let _res = app_data.update(
                                                 c_id,
                                                 Content::Data(data_type, ContentTree::Filled(data)),
                                             );
                                         } else {
                                             eprintln!("Create new Link 2");
+                                            let _ = to_app_mgr_send
+                                                .send(ToAppMgr::ContentAdded(c_id, data_type));
                                             let res =
                                                 app_data.update(c_id, data_to_link(data).unwrap());
                                             eprintln!("Update result: {:?}", res);
@@ -1145,6 +1194,12 @@ async fn serve_app_data(
                     }
                 }
             }
+            ToAppData::ReadData(c_id) => {
+                //TODO:
+                if let Ok(data_vec) = app_data.get_all_data(c_id) {
+                    to_app_mgr_send.send(ToAppMgr::ReadResult(c_id, data_vec));
+                }
+            }
             ToAppData::BCastOrigin(c_id, send) => b_cast_origin = Some((c_id, send)),
             ToAppData::BCastData(_c_id, c_data) => {
                 // TODO: serve this
@@ -1200,11 +1255,16 @@ async fn serve_app_data(
                     eprintln!("App Data: {} ", data);
                 }
             }
+            ToAppData::Terminate => {
+                eprintln!("Done serving AppData");
+                break;
+            }
             _ => {
                 eprintln!("Unserved by app: {:?}", resp);
             }
         }
     }
+    eprintln!("AppData out of loop");
 }
 
 async fn serve_swarm(

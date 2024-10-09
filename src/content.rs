@@ -349,15 +349,15 @@ impl TransformInfo {
 // We can have up to 256 such synchronizations occur simultaneously per swarm
 // and still stay in Sync and update Datastore.
 impl Content {
-    pub fn from(data: Data) -> Result<Self, AppError> {
+    pub fn from(d_type: u8, data: Data) -> Result<Self, AppError> {
         let bytes = data.bytes();
         // println!("Bytes: {:?}", bytes);
         let mut bytes_iter = bytes.into_iter();
-        let first_byte = bytes_iter.next();
+        // let d_type = bytes_iter.next();
         // println!("First byte: {:?}", first_byte);
-        match first_byte {
-            None => Err(AppError::Smthg),
-            Some(255) => {
+        match d_type {
+            // None => Err(AppError::Smthg),
+            255 => {
                 // first 8 bytes is GnomeId
                 let b1 = bytes_iter.next().unwrap();
                 let b2 = bytes_iter.next().unwrap();
@@ -389,7 +389,7 @@ impl Content {
             // at it's bottom root data hashes
             // TODO: once we have all root data hashes we can start
             // replacing them one-by-one
-            Some(other) => {
+            other => {
                 let tree = ContentTree::new(Data::new(bytes_iter.collect()).unwrap());
                 Ok(Content::Data(other, tree))
             }
@@ -869,7 +869,8 @@ impl ContentTree {
 
     pub fn insert(&mut self, idx: u16, data: Data) -> Result<u64, AppError> {
         // Use append in this case
-        if idx >= self.len() {
+        if idx > 0 && idx >= self.len() {
+            // eprintln!("idx {} >= {} self.len()", idx, self.len());
             return Err(AppError::IndexingError);
         }
         let remove_last = self.len() == u16::MAX;
@@ -880,6 +881,7 @@ impl ContentTree {
                     *self = Self::Filled(data);
                     Ok(hash)
                 } else {
+                    // eprintln!("idx is not 0");
                     Err(AppError::IndexingError)
                 }
             }
@@ -903,6 +905,7 @@ impl ContentTree {
                     // }
                 } else {
                     // This should not happen, but anyway...
+                    // eprintln!("filled idx is not 0");
                     Err(AppError::IndexingError)
                 }
             }
