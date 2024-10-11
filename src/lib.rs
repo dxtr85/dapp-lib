@@ -60,6 +60,7 @@ pub mod prelude {
     pub use crate::ToUser;
     pub use gnome::prelude::CastData;
     pub use gnome::prelude::GnomeId;
+    pub use gnome::prelude::SwarmName;
     pub use gnome::prelude::SyncData;
     pub use gnome::prelude::ToGnome;
 }
@@ -73,7 +74,7 @@ fn manifest() -> ApplicationManifest {
 }
 
 pub enum ToUser {
-    Neighbors(String, Vec<GnomeId>),
+    Neighbors(SwarmName, Vec<GnomeId>),
     NewContent(ContentID, DataType),
     ReadResult(ContentID, Vec<Data>),
     Disconnected,
@@ -89,7 +90,7 @@ pub enum ToAppMgr {
     UnsubscribeBroadcast,
     SendManifest,
     ListNeighbors,
-    NeighborsListing(String, Vec<GnomeId>),
+    NeighborsListing(SwarmName, Vec<GnomeId>),
     ChangeContent(DataType, Data),
     AddContent(Data),
     ContentAdded(ContentID, DataType),
@@ -152,20 +153,50 @@ pub fn initialize(config: Configuration) -> (Sender<ToAppMgr>, Receiver<ToUser>)
 }
 
 async fn serve_gnome_manager(
-    send: Sender<ToGnomeManager>,
-    recv: Receiver<FromGnomeManager>,
-    to_user_send: Sender<ToUser>,
-    to_app_mgr_send: Sender<ToAppMgr>,
+    to_gnome_mgr: Sender<ToGnomeManager>,
+    from_gnome_mgr: Receiver<FromGnomeManager>,
+    to_user: Sender<ToUser>,
+    to_app_mgr: Sender<ToAppMgr>,
     to_app_mgr_recv: Receiver<ToAppMgr>,
 ) {
     // TODO: AppMgr should hold state
-    let mut app_mgr = ApplicationManager::new();
+    let message = from_gnome_mgr
+        .recv()
+        .expect("First message sent from gnome mgr has to be MyID");
+    let mut my_id = if let FromGnomeManager::MyID(gnome_id) = message {
+        gnome_id
+    } else {
+        GnomeId(u64::MAX)
+    };
+    eprintln!("My-ID: {}", my_id);
+    let mut app_mgr = ApplicationManager::new(my_id);
 
     let sleep_time = Duration::from_millis(128);
+    let mut own_swarm_started = false;
     'outer: loop {
         sleep(sleep_time).await;
-        while let Ok(message) = recv.try_recv() {
+        while let Ok(message) = from_gnome_mgr.try_recv() {
             match message {
+                FromGnomeManager::MyID(m_id) => my_id = m_id,
+                FromGnomeManager::SwarmFounderDetermined(swarm_id, f_id) => {
+                    //TODO: distinguish between founder and my_id, if not equal
+                    // request gnome manager to join another swarm where f_id == my_id
+                    if f_id != my_id {
+                        if !own_swarm_started {
+                            own_swarm_started = true;
+                            eprintln!("Starting a new swarm, where I am Founder…");
+                            let _ = to_gnome_mgr.send(ToGnomeManager::JoinSwarm(
+                                SwarmName::new(my_id, "/".to_string()).unwrap(),
+                            ));
+                        }
+                    } else {
+                        own_swarm_started = true;
+                    }
+                }
+                FromGnomeManager::NewSwarmAvailable(swarm_name) => {
+                    eprintln!("NewSwarm available, joining: {}", swarm_name);
+                    let _ = to_gnome_mgr.send(ToGnomeManager::JoinSwarm(swarm_name));
+                }
                 FromGnomeManager::SwarmJoined(s_id, _s_name, to_swarm, from_swarm) => {
                     // println!("recv swarm joined");
                     // TODO: we need to identify to which application should we assign
@@ -180,7 +211,7 @@ async fn serve_gnome_manager(
                         app_data,
                         to_app_data_recv,
                         to_swarm,
-                        to_app_mgr_send.clone(),
+                        to_app_mgr.clone(),
                     ));
                     spawn(serve_swarm(
                         Duration::from_millis(64),
@@ -190,7 +221,7 @@ async fn serve_gnome_manager(
                 }
                 FromGnomeManager::Disconnected => {
                     eprintln!("AppMgr received Disconnected");
-                    let _ = to_user_send.send(ToUser::Disconnected);
+                    let _ = to_user.send(ToUser::Disconnected);
                     break 'outer;
                 }
             }
@@ -207,7 +238,7 @@ async fn serve_gnome_manager(
                         .await;
                 }
                 ToAppMgr::ReadResult(c_id, data_vec) => {
-                    to_user_send.send(ToUser::ReadResult(c_id, data_vec));
+                    to_user.send(ToUser::ReadResult(c_id, data_vec));
                 }
                 ToAppMgr::TransformLinkRequest(boxed_s_data) => {
                     let _ = app_mgr
@@ -242,7 +273,7 @@ async fn serve_gnome_manager(
                     let _ = app_mgr.active_app_data.send(ToAppData::ListNeighbors).await;
                 }
                 ToAppMgr::NeighborsListing(s_id, neighbors) => {
-                    let _ = to_user_send.send(ToUser::Neighbors(s_id, neighbors));
+                    let _ = to_user.send(ToUser::Neighbors(s_id, neighbors));
                 }
                 ToAppMgr::ChangeContent(d_type, data) => {
                     let _ = app_mgr
@@ -257,11 +288,11 @@ async fn serve_gnome_manager(
                         .await;
                 }
                 ToAppMgr::ContentAdded(c_id, d_type) => {
-                    let _ = to_user_send.send(ToUser::NewContent(c_id, d_type));
+                    let _ = to_user.send(ToUser::NewContent(c_id, d_type));
                 }
                 ToAppMgr::Quit => {
                     eprintln!("AppMgr received Quit");
-                    let _ = send.send(ToGnomeManager::Disconnect);
+                    let _ = to_gnome_mgr.send(ToGnomeManager::Disconnect);
                     let _ = app_mgr.active_app_data.send(ToAppData::Terminate).await;
                     break;
                 }
