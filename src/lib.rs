@@ -57,10 +57,10 @@ pub mod prelude {
     pub use crate::ApplicationData;
     pub use crate::ApplicationManager;
     pub use crate::Configuration;
-    pub use crate::ToUser;
+    pub use crate::ToApp;
     pub use gnome::prelude::CastData;
     pub use gnome::prelude::GnomeId;
-    pub use gnome::prelude::SwarmName;
+    pub use gnome::prelude::SwarmID;
     pub use gnome::prelude::SyncData;
     pub use gnome::prelude::ToGnome;
 }
@@ -73,27 +73,29 @@ fn manifest() -> ApplicationManifest {
     ApplicationManifest::new(header, HashMap::new())
 }
 
-pub enum ToUser {
-    Neighbors(SwarmName, Vec<GnomeId>),
-    NewContent(ContentID, DataType),
-    ReadResult(ContentID, Vec<Data>),
+pub enum ToApp {
+    ActiveSwarm(GnomeId, SwarmID),
+    Neighbors(SwarmID, Vec<GnomeId>),
+    NewContent(SwarmID, ContentID, DataType),
+    ReadResult(SwarmID, ContentID, Vec<Data>),
     Disconnected,
 }
 
 pub enum ToAppMgr {
-    ReadData(ContentID),
-    ReadResult(ContentID, Vec<Data>),
+    ReadData(SwarmID, ContentID),
+    ReadResult(SwarmID, ContentID, Vec<Data>),
     UploadData,
+    SetActiveApp(GnomeId),
     StartUnicast,
     StartBroadcast,
     EndBroadcast,
     UnsubscribeBroadcast,
     SendManifest,
     ListNeighbors,
-    NeighborsListing(SwarmName, Vec<GnomeId>),
+    NeighborsListing(SwarmID, Vec<GnomeId>),
     ChangeContent(DataType, Data),
-    AddContent(Data),
-    ContentAdded(ContentID, DataType),
+    AddContent(SwarmID, Data),
+    ContentAdded(SwarmID, ContentID, DataType),
     TransformLinkRequest(Box<SyncData>),
     Quit,
 }
@@ -138,24 +140,27 @@ impl BigChunk {
 
 // fn parse_sync(sync_data: SyncData) -> AppMessage {}
 
-pub fn initialize(config: Configuration) -> (Sender<ToAppMgr>, Receiver<ToUser>) {
-    let (gmgr_send, gmgr_recv) = init(config.work_dir.clone(), config.app_data_root_hash);
-    let (to_user_send, to_user_recv) = channel();
-    let (to_app_mgr_send, to_app_mgr_recv) = channel();
+pub fn initialize(
+    to_user_send: Sender<ToApp>,
+    to_app_mgr_send: Sender<ToAppMgr>,
+    to_app_mgr_recv: Receiver<ToAppMgr>,
+    config: Configuration,
+) -> GnomeId {
+    let (gmgr_send, gmgr_recv, my_id) = init(config.work_dir.clone(), config.app_data_root_hash);
     spawn(serve_gnome_manager(
         gmgr_send,
         gmgr_recv,
         to_user_send,
-        to_app_mgr_send.clone(),
+        to_app_mgr_send,
         to_app_mgr_recv,
     ));
-    (to_app_mgr_send, to_user_recv)
+    my_id
 }
 
 async fn serve_gnome_manager(
     to_gnome_mgr: Sender<ToGnomeManager>,
     from_gnome_mgr: Receiver<FromGnomeManager>,
-    to_user: Sender<ToUser>,
+    to_user: Sender<ToApp>,
     to_app_mgr: Sender<ToAppMgr>,
     to_app_mgr_recv: Receiver<ToAppMgr>,
 ) {
@@ -179,6 +184,7 @@ async fn serve_gnome_manager(
             match message {
                 FromGnomeManager::MyID(m_id) => my_id = m_id,
                 FromGnomeManager::SwarmFounderDetermined(swarm_id, f_id) => {
+                    app_mgr.update_app_data_founder(swarm_id, f_id);
                     //TODO: distinguish between founder and my_id, if not equal
                     // request gnome manager to join another swarm where f_id == my_id
                     if f_id != my_id {
@@ -197,17 +203,19 @@ async fn serve_gnome_manager(
                     eprintln!("NewSwarm available, joining: {}", swarm_name);
                     let _ = to_gnome_mgr.send(ToGnomeManager::JoinSwarm(swarm_name));
                 }
-                FromGnomeManager::SwarmJoined(s_id, _s_name, to_swarm, from_swarm) => {
-                    // println!("recv swarm joined");
+                FromGnomeManager::SwarmJoined(s_id, s_name, to_swarm, from_swarm) => {
+                    eprintln!("{:?} joined {}", s_id, s_name);
                     // TODO: we need to identify to which application should we assign
                     //       given swarm
                     // TODO: we need a bi-directional communication between
                     // AppMgr and each AppData
                     // TODO: we need a bi-directional comm between AppMgr and user App
                     let (to_app_data_send, to_app_data_recv) = achannel::bounded(32);
-                    app_mgr.add_app_data(s_id, to_app_data_send.clone());
+                    app_mgr.add_app_data(s_name, s_id, to_app_data_send.clone());
                     let app_data = ApplicationData::empty();
+                    eprintln!("spawning new serve_app_data");
                     spawn(serve_app_data(
+                        s_id,
                         app_data,
                         to_app_data_recv,
                         to_swarm,
@@ -221,7 +229,7 @@ async fn serve_gnome_manager(
                 }
                 FromGnomeManager::Disconnected => {
                     eprintln!("AppMgr received Disconnected");
-                    let _ = to_user.send(ToUser::Disconnected);
+                    let _ = to_user.send(ToApp::Disconnected);
                     break 'outer;
                 }
             }
@@ -231,20 +239,27 @@ async fn serve_gnome_manager(
                 ToAppMgr::UploadData => {
                     let _ = app_mgr.active_app_data.send(ToAppData::UploadData).await;
                 }
-                ToAppMgr::ReadData(c_id) => {
+                ToAppMgr::ReadData(s_id, c_id) => {
                     let _ = app_mgr
                         .active_app_data
                         .send(ToAppData::ReadData(c_id))
                         .await;
                 }
-                ToAppMgr::ReadResult(c_id, data_vec) => {
-                    to_user.send(ToUser::ReadResult(c_id, data_vec));
+                ToAppMgr::ReadResult(s_id, c_id, data_vec) => {
+                    let _ = to_user.send(ToApp::ReadResult(s_id, c_id, data_vec));
                 }
                 ToAppMgr::TransformLinkRequest(boxed_s_data) => {
                     let _ = app_mgr
                         .active_app_data
                         .send(ToAppData::TransformLinkRequest(*boxed_s_data))
                         .await;
+                }
+                ToAppMgr::SetActiveApp(gnome_id) => {
+                    if let Ok(s_id) = app_mgr.set_active(&gnome_id) {
+                        to_user.send(ToApp::ActiveSwarm(gnome_id, s_id));
+                    } else {
+                        eprintln!("Unable to find swarm for {}…", gnome_id);
+                    }
                 }
                 ToAppMgr::StartUnicast => {
                     let _ = app_mgr.active_app_data.send(ToAppData::StartUnicast).await;
@@ -273,7 +288,7 @@ async fn serve_gnome_manager(
                     let _ = app_mgr.active_app_data.send(ToAppData::ListNeighbors).await;
                 }
                 ToAppMgr::NeighborsListing(s_id, neighbors) => {
-                    let _ = to_user.send(ToUser::Neighbors(s_id, neighbors));
+                    let _ = to_user.send(ToApp::Neighbors(s_id, neighbors));
                 }
                 ToAppMgr::ChangeContent(d_type, data) => {
                     let _ = app_mgr
@@ -281,14 +296,14 @@ async fn serve_gnome_manager(
                         .send(ToAppData::ChangeContent(d_type, data))
                         .await;
                 }
-                ToAppMgr::AddContent(data) => {
+                ToAppMgr::AddContent(s_id, data) => {
                     let _ = app_mgr
                         .active_app_data
                         .send(ToAppData::AddContent(data))
                         .await;
                 }
-                ToAppMgr::ContentAdded(c_id, d_type) => {
-                    let _ = to_user.send(ToUser::NewContent(c_id, d_type));
+                ToAppMgr::ContentAdded(s_id, c_id, d_type) => {
+                    let _ = to_user.send(ToApp::NewContent(s_id, c_id, d_type));
                 }
                 ToAppMgr::Quit => {
                     eprintln!("AppMgr received Quit");
@@ -303,6 +318,7 @@ async fn serve_gnome_manager(
 }
 
 async fn serve_app_data(
+    swarm_id: SwarmID,
     mut app_data: ApplicationData,
     app_data_recv: AReceiver<ToAppData>,
     to_gnome_sender: Sender<ToGnome>,
@@ -661,8 +677,8 @@ async fn serve_app_data(
                                 eprintln!("Sending updated hash: {}", hash);
                                 let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
                                 eprintln!("Send res: {:?}", res);
-                                let _to_mgr_res =
-                                    to_app_mgr_send.send(ToAppMgr::ContentAdded(recv_id, d_type));
+                                let _to_mgr_res = to_app_mgr_send
+                                    .send(ToAppMgr::ContentAdded(swarm_id, recv_id, d_type));
                             } else {
                                 eprintln!("Recv id: {}, next id: {}", recv_id, next_id);
                                 eprintln!(
@@ -1061,8 +1077,9 @@ async fn serve_app_data(
                                         let content = Content::Data(data_type, tree);
                                         let c_id = app_data.next_c_id().unwrap();
                                         let res = app_data.append(content);
-                                        let _ = to_app_mgr_send
-                                            .send(ToAppMgr::ContentAdded(c_id, data_type));
+                                        let _ = to_app_mgr_send.send(ToAppMgr::ContentAdded(
+                                            swarm_id, c_id, data_type,
+                                        ));
                                         eprintln!("Datastore add: {:?}", res);
                                     }
                                 }
@@ -1108,16 +1125,18 @@ async fn serve_app_data(
                                             }
                                         } else if data_type < 255 {
                                             eprintln!("Create new Data");
-                                            let _ = to_app_mgr_send
-                                                .send(ToAppMgr::ContentAdded(c_id, data_type));
+                                            let _ = to_app_mgr_send.send(ToAppMgr::ContentAdded(
+                                                swarm_id, c_id, data_type,
+                                            ));
                                             let _res = app_data.update(
                                                 c_id,
                                                 Content::Data(data_type, ContentTree::Filled(data)),
                                             );
                                         } else {
                                             eprintln!("Create new Link 2");
-                                            let _ = to_app_mgr_send
-                                                .send(ToAppMgr::ContentAdded(c_id, data_type));
+                                            let _ = to_app_mgr_send.send(ToAppMgr::ContentAdded(
+                                                swarm_id, c_id, data_type,
+                                            ));
                                             let res =
                                                 app_data.update(c_id, data_to_link(data).unwrap());
                                             eprintln!("Update result: {:?}", res);
@@ -1228,7 +1247,7 @@ async fn serve_app_data(
             ToAppData::ReadData(c_id) => {
                 //TODO:
                 if let Ok(data_vec) = app_data.get_all_data(c_id) {
-                    to_app_mgr_send.send(ToAppMgr::ReadResult(c_id, data_vec));
+                    let _ = to_app_mgr_send.send(ToAppMgr::ReadResult(swarm_id, c_id, data_vec));
                 }
             }
             ToAppData::BCastOrigin(c_id, send) => b_cast_origin = Some((c_id, send)),
