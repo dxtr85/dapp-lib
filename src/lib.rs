@@ -228,7 +228,7 @@ async fn serve_gnome_manager(
                     ));
                 }
                 FromGnomeManager::Disconnected => {
-                    eprintln!("AppMgr received Disconnected");
+                    // eprintln!("AppMgr received Disconnected");
                     let _ = to_user.send(ToApp::Disconnected);
                     break 'outer;
                 }
@@ -306,7 +306,7 @@ async fn serve_gnome_manager(
                     let _ = to_user.send(ToApp::NewContent(s_id, c_id, d_type));
                 }
                 ToAppMgr::Quit => {
-                    eprintln!("AppMgr received Quit");
+                    // eprintln!("AppMgr received Quit");
                     let _ = to_gnome_mgr.send(ToGnomeManager::Disconnect);
                     let _ = app_mgr.active_app_data.send(ToAppData::Terminate).await;
                     break;
@@ -1314,7 +1314,6 @@ async fn serve_app_data(
             }
         }
     }
-    eprintln!("AppData out of loop");
 }
 
 async fn serve_swarm(
