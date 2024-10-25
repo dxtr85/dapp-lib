@@ -26,6 +26,10 @@ impl Data {
         Data(hash, vec![])
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.1.is_empty()
+    }
+
     pub fn to_sync(self) -> SyncData {
         SyncData::new(self.1).unwrap()
     }

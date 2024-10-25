@@ -1,13 +1,13 @@
 use super::content::Content;
 use super::content::ContentID;
 use super::content::ContentTree;
-use super::manifest::ApplicationManifest;
 use super::prelude::AppError;
+use crate::app_type::AppType;
 use crate::content::double_hash;
 use crate::content::DataType;
 use crate::prelude::TransformInfo;
 use crate::Data;
-use std::collections::HashSet;
+// use std::collections::HashSet;
 
 // A Datastore is an append-only data structure built as a binary tree,
 // that should never be actively balanced.
@@ -19,10 +19,12 @@ pub enum Datastore {
 }
 
 impl Datastore {
-    pub fn new(manifest: ApplicationManifest) -> Datastore {
+    // pub fn new(manifest: Manifest) -> Datastore {
+    pub fn new(app_type: AppType) -> Datastore {
         let mut content_tree = ContentTree::empty(0);
-        let _ = content_tree.append(manifest.to_data(None));
-        let content = Content::Data(0, content_tree);
+        // let _ = content_tree.append(manifest.to_data(None));
+        let _ = content_tree.append(Data::new(vec![app_type.byte()]).unwrap());
+        let content = Content::Data(DataType::Data(0), content_tree);
         Datastore::Filled(content)
     }
 
@@ -44,13 +46,13 @@ impl Datastore {
     // failing when all possible slots are already taken
     pub fn insert_data(&mut self, c_id: ContentID, d_id: u16, data: Data) -> Result<u64, AppError> {
         let take_result = self.take(c_id);
-        // eprintln!("Take result: {:?}", take_result);
+        eprintln!("Take result: {:?}", take_result);
         if let Err(e) = take_result {
             return Err(e);
         }
         let mut content = take_result.unwrap();
         let insert_result = content.insert(d_id, data);
-        // eprintln!("Insert result: {:?}", insert_result);
+        eprintln!("Insert result: {:?}", insert_result);
         let _ = self.update(c_id, content);
         insert_result
     }
@@ -65,7 +67,9 @@ impl Datastore {
         }
         let mut content = take_result.unwrap();
         let append_result = content.push_data(data);
-        let _ = self.update(c_id, content);
+        let _r = self.update(c_id, content);
+        let (_t, len) = self.type_and_len(c_id).unwrap();
+        eprintln!("Update result: {}, len: {}", _r.is_ok(), len);
         append_result
     }
 
@@ -142,6 +146,7 @@ impl Datastore {
                     *self = Self::Filled(new_content);
                     Ok(old_content)
                 } else {
+                    *self = Self::Filled(old_content);
                     Err(AppError::IndexingError)
                 }
             }
@@ -150,6 +155,19 @@ impl Datastore {
                 *self = Self::Hashed(s_store);
                 result
             }
+        }
+    }
+    pub fn shell(&self, c_id: ContentID) -> Result<Content, AppError> {
+        match self {
+            Self::Empty => Err(AppError::IndexingError),
+            Self::Filled(content) => {
+                if c_id == 0 {
+                    Ok(content.shell())
+                } else {
+                    Err(AppError::IndexingError)
+                }
+            }
+            Self::Hashed(ref s_store) => s_store.shell(c_id),
         }
     }
     pub fn take_transform_info(&mut self, c_id: ContentID) -> Result<TransformInfo, AppError> {
@@ -243,6 +261,7 @@ impl Datastore {
                         }
                     }
                 } else {
+                    *self = Self::Filled(old_content);
                     Err(AppError::IndexingError)
                 }
             }
@@ -267,6 +286,7 @@ impl Datastore {
             Self::Filled(mut content) => {
                 if c_id == 0 {
                     let result = content.update_data(data_id, data);
+                    // eprintln!("1 After update, len: {}", content.len());
                     *self = Self::Filled(content);
                     result
                 } else {
@@ -322,12 +342,18 @@ impl Datastore {
 
     // This fn should be used for reading selected datachunk
     pub fn read_data(&self, (c_id, data_id): (ContentID, u16)) -> Result<Data, AppError> {
+        eprintln!("Read request: {}-{}", c_id, data_id);
         match self {
-            Self::Empty => Err(AppError::IndexingError),
+            Self::Empty => {
+                eprintln!("EMPTY");
+                Err(AppError::IndexingError)
+            }
             Self::Filled(content) => {
                 if c_id == 0 {
+                    eprintln!("Read OK");
                     content.read_data(data_id)
                 } else {
+                    eprintln!("Read Error");
                     Err(AppError::IndexingError)
                 }
             }
@@ -357,7 +383,7 @@ impl Datastore {
     // This fn should return a Vec<u64> of all of Datastore's
     // bottom layer hashes from left to right.
     // Those are also called Content root hashes.
-    pub fn all_typed_root_hashes(&self) -> Vec<Vec<(u8, u64)>> {
+    pub fn all_typed_root_hashes(&self) -> Vec<Vec<(DataType, u64)>> {
         // println!("Next")
 
         let mut count = 0;
@@ -431,7 +457,10 @@ impl Datastore {
             Self::Hashed(s_store) => s_store.hash,
         }
     }
-    pub fn get_root_content_typed_hash(&self, c_id: ContentID) -> Result<(u8, u64), AppError> {
+    pub fn get_root_content_typed_hash(
+        &self,
+        c_id: ContentID,
+    ) -> Result<(DataType, u64), AppError> {
         match self {
             Self::Empty => Err(AppError::ContentEmpty),
             Self::Filled(content) => {
@@ -497,6 +526,17 @@ impl Substore {
             self.right.take(c_id - left_len)
         } else {
             self.left.take(c_id)
+        }
+    }
+    pub fn shell(&self, c_id: ContentID) -> Result<Content, AppError> {
+        if c_id >= self.data_count {
+            return Err(AppError::IndexingError);
+        }
+        let left_len = self.left.len();
+        if c_id >= left_len {
+            self.right.shell(c_id - left_len)
+        } else {
+            self.left.shell(c_id)
         }
     }
     pub fn take_transform_info(&mut self, c_id: ContentID) -> Result<TransformInfo, AppError> {
@@ -615,7 +655,7 @@ impl Substore {
             self.left.content_bottom_hashes(c_id)
         }
     }
-    fn get_root_content_hash(&self, c_id: ContentID) -> Result<(u8, u64), AppError> {
+    fn get_root_content_hash(&self, c_id: ContentID) -> Result<(DataType, u64), AppError> {
         if c_id >= self.data_count {
             return Err(AppError::IndexingError);
         }

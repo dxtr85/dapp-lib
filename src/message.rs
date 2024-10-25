@@ -7,6 +7,7 @@ use crate::Data;
 use crate::content::ContentID;
 use crate::ApplicationData;
 
+#[derive(Clone)]
 pub struct SyncRequirements {
     pub pre: Vec<(ContentID, u64)>,
     pub post: Vec<(ContentID, u64)>,
@@ -42,7 +43,7 @@ impl SyncRequirements {
     // and that all specified contents were read
     pub fn pre_validate(&self, _c_id: ContentID, app: &ApplicationData) -> bool {
         for (c_id, hash) in self.pre.iter() {
-            if let Ok(d_hash) = app.content_root_hash(*c_id) {
+            if let Ok((_d_type, d_hash)) = app.content_root_hash(*c_id) {
                 if d_hash != *hash {
                     println!("Stored  hash: {},\nmessage hash: {}", d_hash, hash);
                     return false;
@@ -60,17 +61,18 @@ impl SyncRequirements {
     // and that all specified contents were changed
     pub fn post_validate(&self, c_id: ContentID, app: &ApplicationData) -> bool {
         for (c_id, hash) in self.post.iter() {
-            if let Ok(d_hash) = app.content_root_hash(*c_id) {
+            if let Ok((_d_type, d_hash)) = app.content_root_hash(*c_id) {
                 if d_hash != *hash {
-                    println!(
-                        "Stored  hash: {:?},\nmessage hash: {:?}",
+                    eprintln!(
+                        "{} stored  hash: {:?},\nmessage hash: {:?}",
+                        c_id,
                         d_hash.to_be_bytes(),
                         hash.to_be_bytes()
                     );
                     return false;
                 }
             } else if *hash != 0 {
-                println!("Datastore has no CID: {}, hash: {}", c_id, hash);
+                eprintln!("Datastore has no CID: {}, hash: {}", c_id, hash);
                 return false;
             }
         }
@@ -103,10 +105,11 @@ impl SyncRequirements {
 
 #[derive(Clone, Copy, Debug)]
 pub enum SyncMessageType {
-    SetManifest, // Should this be a separate type?
-    AddContent(DataType),
+    // SetManifest, // Should this be a separate type?
+    AppendContent(DataType),
     ChangeContent(DataType, ContentID),
     AppendData(ContentID),
+    AppendShelledDatas(ContentID),
     RemoveData(ContentID, u16),
     UpdateData(ContentID, u16),
     InsertData(ContentID, u16),
@@ -117,13 +120,18 @@ impl SyncMessageType {
     pub fn new(bytes: &mut Vec<u8>) -> Self {
         let value = bytes.drain(0..1).next().unwrap();
         match value {
-            255 => SyncMessageType::SetManifest,
-            254 => {
+            255 => {
                 let b1 = bytes.drain(0..1).next().unwrap();
-                SyncMessageType::AddContent(b1)
+                let b2 = bytes.drain(0..1).next().unwrap();
+                let c_id = u16::from_be_bytes([b1, b2]);
+                SyncMessageType::AppendShelledDatas(c_id)
+            }
+            254 => {
+                let dt = DataType::from(bytes.drain(0..1).next().unwrap());
+                SyncMessageType::AppendContent(dt)
             }
             253 => {
-                let d_type = bytes.drain(0..1).next().unwrap();
+                let d_type = DataType::from(bytes.drain(0..1).next().unwrap());
                 let b1 = bytes.drain(0..1).next().unwrap();
                 let b2 = bytes.drain(0..1).next().unwrap();
                 let c_id = u16::from_be_bytes([b1, b2]);
@@ -183,11 +191,14 @@ impl SyncMessageType {
 
     pub fn as_bytes(&self) -> Vec<u8> {
         match self {
-            SyncMessageType::SetManifest => vec![255],
-            SyncMessageType::AddContent(d_type) => vec![254, *d_type],
+            SyncMessageType::AppendShelledDatas(c_id) => {
+                let [b1, b2] = c_id.to_be_bytes();
+                vec![255, b1, b2]
+            }
+            SyncMessageType::AppendContent(d_type) => vec![254, d_type.byte()],
             SyncMessageType::ChangeContent(d_type, c_id) => {
                 let [b1, b2] = c_id.to_be_bytes();
-                vec![253, *d_type, b1, b2]
+                vec![253, d_type.byte(), b1, b2]
             }
             SyncMessageType::AppendData(c_id) => {
                 let [b1, b2] = c_id.to_be_bytes();
@@ -248,14 +259,18 @@ impl SyncMessage {
         // - 1 byte of message type
         // - 2 bytes of part_no and total_parts
         let data_size = self.data.len();
-        let req_size = 10 * (self.requirements.pre.len() + self.requirements.post.len());
+        let req_size = 2 + 10 * (self.requirements.pre.len() + self.requirements.post.len());
         let netto_size = data_size + req_size;
         let mut partials = vec![];
+        eprintln!("data size: {}", data_size);
+        eprintln!("req size: {}", req_size);
+        eprintln!("netto size: {}", netto_size);
 
         // TODO/DONE? (was 897): recalculate how many bytes to drain, since now
         // message type can take up to 5 bytes, not 1 as previously
         // println!("Netto: {}", netto_size);
         if netto_size < 893 {
+            eprintln!("netto_size < 893 ");
             let mut bytes = Vec::with_capacity(netto_size + 3);
             for byte in self.m_type.as_bytes() {
                 bytes.push(byte);
@@ -268,16 +283,18 @@ impl SyncMessage {
             partials.push(data);
             // partials.push(PartialMessage { m_type, part_no: 0, total_parts:0, data })
         } else {
+            eprintln!("netto_size >= 893 ");
             let mut non_header_parts = 1;
             let mut done = false;
             while !done {
                 let non_header_bytes_consumed = non_header_parts * 1021;
-                if netto_size - non_header_bytes_consumed <= 897 - (8 * non_header_parts) {
+                if netto_size - non_header_bytes_consumed <= 893 - (8 * non_header_parts) {
                     done = true;
                 } else {
                     non_header_parts += 1;
                 }
             }
+            eprintln!("Non header parts: {}", non_header_parts);
             // First we assume worst case scenario - 7 parts
             // Maximum size of SyncMessage is:
             // 1 byte for m_type
@@ -305,13 +322,16 @@ impl SyncMessage {
             header_bytes.push(0);
             header_bytes.push(non_header_parts as u8);
             let first_chunk_size = 893 - hashes_size;
+            eprintln!("first_chunk_size: {}", first_chunk_size);
             // later chunks have up to 1021 bytes (3 bytes for type, part_no, total_parts)
             // First we put hashes (after we calculate them...)
             // Then we put requirements
             let mut req_and_data_bytes = self.requirements.bytes();
+            eprintln!("req_bytes: {}", req_and_data_bytes.len());
             // And at the end we put data_bytes
             let mut data_bytes = self.data.bytes();
             req_and_data_bytes.append(&mut data_bytes);
+            eprintln!("req_and_data_bytes: {}", req_and_data_bytes.len());
             let mut first_chunk_bytes: Vec<u8> =
                 req_and_data_bytes.drain(0..first_chunk_size).collect();
             let mut subsequent_chunks: Vec<SyncData> = vec![];
@@ -327,17 +347,24 @@ impl SyncMessage {
                 } else {
                     bytes_count
                 };
-                // println!("before drain, rem bytes: {}",req_and_data_bytes.len());
+                eprintln!(
+                    "before drain, rem {} bytes from {} remaining",
+                    drain_count,
+                    req_and_data_bytes.len()
+                );
                 vec.append(&mut req_and_data_bytes.drain(0..drain_count).collect());
                 let data = SyncData::new(vec).unwrap();
                 let hash = data.hash();
                 for byte in hash.to_be_bytes() {
                     header_bytes.push(byte);
                 }
+                eprintln!("Pushing {} bytes", data.len());
                 subsequent_chunks.push(data);
             }
             header_bytes.append(&mut first_chunk_bytes);
-            partials.push(SyncData::new(header_bytes).unwrap());
+            let header_data = SyncData::new(header_bytes).unwrap();
+            eprintln!("Pushing {} header bytes", header_data.len());
+            partials.push(header_data);
             partials.append(&mut subsequent_chunks);
         }
 
@@ -346,6 +373,9 @@ impl SyncMessage {
 
     // TODO: this needs rework
     pub fn from_data(idx: Vec<u64>, mut vec_data: HashMap<u64, Data>) -> Result<Self, ()> {
+        for (idx, data) in &vec_data {
+            eprintln!("{} size {} bytes", idx, data.len());
+        }
         let idx_len = idx.len();
         if idx.len() != vec_data.len() {
             return Err(());
@@ -355,15 +385,18 @@ impl SyncMessage {
         let key = idx_iter.next().unwrap();
         let p_data = vec_data.remove(&key).unwrap();
         let mut header_bytes = p_data.bytes();
+        eprintln!("after remove header len: {}", header_bytes.len());
         let m_type = SyncMessageType::new(&mut header_bytes);
         // drop part_no & total_parts
         let _ = header_bytes.drain(0..2);
+        eprintln!("after remove part/total len: {}", header_bytes.len());
 
         let mut non_header_bytes = Vec::with_capacity((idx_len - 1) * 1021);
         for hash in idx_iter {
             let p_data = vec_data.remove(&hash).unwrap();
             let mut p_bytes = p_data.bytes();
-            let _ = p_bytes.drain(0..3);
+            let _m_type = SyncMessageType::new(&mut p_bytes);
+            let _ = p_bytes.drain(0..2);
             let _ = header_bytes.drain(0..8);
             non_header_bytes.append(&mut p_bytes);
         }
@@ -431,7 +464,12 @@ impl SyncMessage {
         //     part_hashes = Some(hashes_vec);
 
         // }
-        let data = Data::new(bytes_iter.collect()).unwrap();
+        let bytes: Vec<u8> = bytes_iter.collect();
+        eprintln!("m_type: {:?}", m_type);
+        eprintln!("pre_req: {:?}", requirements.pre);
+        eprintln!("post_req: {:?}", requirements.post);
+        eprintln!("Bytes size: {}", bytes.len());
+        let data = Data::new(bytes).unwrap();
         Ok(SyncMessage {
             m_type,
             requirements,

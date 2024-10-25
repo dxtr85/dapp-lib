@@ -3,16 +3,17 @@ use crate::prelude::SyncRequirements;
 use crate::prelude::TransformInfo;
 use crate::sync_message::serialize_requests;
 use std::time::Duration;
+mod app_type;
 mod config;
 mod content;
 mod data;
 mod datastore;
 mod error;
 mod manager;
-mod manifest;
 mod message;
 mod registry;
 mod sync_message;
+use app_type::AppType;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use sync_message::deserialize_requests;
@@ -31,7 +32,6 @@ use datastore::Datastore;
 use error::AppError;
 use gnome::prelude::*;
 pub use manager::ApplicationManager;
-use manifest::ApplicationManifest;
 use message::{SyncMessage, SyncMessageType};
 use registry::ChangeRegistry;
 // TODO: probably better to use async channels for this lib where possible
@@ -44,13 +44,13 @@ use async_std::channel::Receiver as AReceiver;
 use async_std::channel::Sender as ASender;
 
 pub mod prelude {
+    pub use crate::app_type::AppType;
     pub use crate::content::{
         double_hash, Content, ContentID, ContentTree, DataType, TransformInfo,
     };
     pub use crate::data::Data;
     pub use crate::error::AppError;
     pub use crate::initialize;
-    pub use crate::manifest::ApplicationManifest;
     pub use crate::message::SyncMessage;
     pub use crate::message::SyncMessageType;
     pub use crate::message::SyncRequirements;
@@ -64,42 +64,35 @@ pub mod prelude {
     pub use gnome::prelude::SyncData;
     pub use gnome::prelude::ToGnome;
 }
-fn manifest() -> ApplicationManifest {
-    let mut header: [u8; 495] = [0; 495];
-    for (i, byte) in "Catalog".bytes().enumerate() {
-        header[i] = byte;
-    }
-
-    ApplicationManifest::new(header, HashMap::new())
-}
 
 pub enum ToApp {
-    ActiveSwarm(GnomeId, SwarmID),
+    ActiveSwarm(GnomeId, SwarmID), //TODO: also send Vec<Data> from CID=0(Manifest)
     Neighbors(SwarmID, Vec<GnomeId>),
     NewContent(SwarmID, ContentID, DataType),
-    ReadResult(SwarmID, ContentID, Vec<Data>),
+    ReadSuccess(SwarmID, ContentID, Vec<Data>),
+    ReadError(SwarmID, ContentID, AppError),
     Disconnected,
 }
 
 pub enum ToAppMgr {
     ReadData(SwarmID, ContentID),
-    ReadResult(SwarmID, ContentID, Vec<Data>),
+    ReadSuccess(SwarmID, ContentID, Vec<Data>),
+    ReadError(SwarmID, ContentID, AppError),
     UploadData,
     SetActiveApp(GnomeId),
     StartUnicast,
     StartBroadcast,
     EndBroadcast,
     UnsubscribeBroadcast,
-    SendManifest,
     ListNeighbors,
     NeighborsListing(SwarmID, Vec<GnomeId>),
-    ChangeContent(DataType, Data),
-    AddContent(SwarmID, Data),
+    ChangeContent(SwarmID, ContentID, DataType, Vec<Data>),
+    AppendContent(SwarmID, Data),
+    // AppendShelledDatas(SwarmID, ContentID, Data),
     ContentAdded(SwarmID, ContentID, DataType),
     TransformLinkRequest(Box<SyncData>),
     Quit,
 }
-// enum ToApp {}
 
 #[derive(Debug)]
 pub enum ToAppData {
@@ -110,20 +103,33 @@ pub enum ToAppData {
     StartBroadcast,
     EndBroadcast,
     UnsubscribeBroadcast,
-    SendManifest,
     ListNeighbors,
     AppDataSynced(bool),
     BCastData(CastID, CastData),
     BCastOrigin(CastID, Sender<CastData>),
-    ChangeContent(DataType, Data),
-    AddContent(Data),
+    ChangeContent(ContentID, DataType, Vec<Data>),
+    UpdateData(ContentID, u16, Data),
+    AppendContent(Data),
+    AppendShelledDatas(ContentID, Data, Vec<Data>),
     CustomRequest(u8, GnomeId, CastData),
     CustomResponse(u8, GnomeId, CastData),
     TransformLinkRequest(SyncData),
     TransformLink(SyncData),
     Terminate,
 }
-// enum ToSwarm {}
+// TODO: We need to define a way where we can update multiple Data of a given ContentID at once
+// I.e. in a Catalog swarm we have defined a Tag, and now Manifest that was 1 Data with single
+// byte in it becomes 4 Datas filled with bytes
+// Procedure to write will be:
+// 1. Update first Data
+// 2. Extend given ContentID with Data shells containing only root hash of Data that is yet to
+//    come. In case some of those Data is filled with all zeros, then we can send 0 as a hash
+//    for that Data, in order not to send all zeros across the net.
+// 3. For any Data initialized in previous point that is not all zeros send it in
+//    a ChangeContent message (or it could be sent via broadcast since Datastore hash
+//    will stay the samy. It was changed after point 2 was evaluated.)
+// For some cases where all extended Data have their hashes equal to zero,
+// point 3 can be skipped.
 
 struct BigChunk(u8, u16);
 impl BigChunk {
@@ -212,11 +218,12 @@ async fn serve_gnome_manager(
                     // TODO: we need a bi-directional comm between AppMgr and user App
                     let (to_app_data_send, to_app_data_recv) = achannel::bounded(32);
                     app_mgr.add_app_data(s_name, s_id, to_app_data_send.clone());
-                    let app_data = ApplicationData::empty();
+                    let app_data = ApplicationData::new(AppType::Catalog);
                     eprintln!("spawning new serve_app_data");
                     spawn(serve_app_data(
                         s_id,
                         app_data,
+                        to_app_data_send.clone(),
                         to_app_data_recv,
                         to_swarm,
                         to_app_mgr.clone(),
@@ -239,14 +246,18 @@ async fn serve_gnome_manager(
                 ToAppMgr::UploadData => {
                     let _ = app_mgr.active_app_data.send(ToAppData::UploadData).await;
                 }
+                //TODO: use s_id to query proper swarm for data
                 ToAppMgr::ReadData(s_id, c_id) => {
                     let _ = app_mgr
                         .active_app_data
                         .send(ToAppData::ReadData(c_id))
                         .await;
                 }
-                ToAppMgr::ReadResult(s_id, c_id, data_vec) => {
-                    let _ = to_user.send(ToApp::ReadResult(s_id, c_id, data_vec));
+                ToAppMgr::ReadSuccess(s_id, c_id, data_vec) => {
+                    let _ = to_user.send(ToApp::ReadSuccess(s_id, c_id, data_vec));
+                }
+                ToAppMgr::ReadError(s_id, c_id, error) => {
+                    let _ = to_user.send(ToApp::ReadError(s_id, c_id, error));
                 }
                 ToAppMgr::TransformLinkRequest(boxed_s_data) => {
                     let _ = app_mgr
@@ -256,7 +267,7 @@ async fn serve_gnome_manager(
                 }
                 ToAppMgr::SetActiveApp(gnome_id) => {
                     if let Ok(s_id) = app_mgr.set_active(&gnome_id) {
-                        to_user.send(ToApp::ActiveSwarm(gnome_id, s_id));
+                        let _ = to_user.send(ToApp::ActiveSwarm(gnome_id, s_id));
                     } else {
                         eprintln!("Unable to find swarm for {}…", gnome_id);
                     }
@@ -281,27 +292,38 @@ async fn serve_gnome_manager(
                         .send(ToAppData::UnsubscribeBroadcast)
                         .await;
                 }
-                ToAppMgr::SendManifest => {
-                    let _ = app_mgr.active_app_data.send(ToAppData::SendManifest).await;
-                }
                 ToAppMgr::ListNeighbors => {
                     let _ = app_mgr.active_app_data.send(ToAppData::ListNeighbors).await;
                 }
                 ToAppMgr::NeighborsListing(s_id, neighbors) => {
                     let _ = to_user.send(ToApp::Neighbors(s_id, neighbors));
                 }
-                ToAppMgr::ChangeContent(d_type, data) => {
+                ToAppMgr::ChangeContent(s_id, c_id, d_type, data_vec) => {
+                    // TODO: make sure we are sending this to correct swarm!
+                    eprintln!("app mgr received CC request, sending to app data");
                     let _ = app_mgr
                         .active_app_data
-                        .send(ToAppData::ChangeContent(d_type, data))
+                        .send(ToAppData::ChangeContent(c_id, d_type, data_vec))
                         .await;
                 }
-                ToAppMgr::AddContent(s_id, data) => {
+                ToAppMgr::AppendContent(_s_id, data) => {
                     let _ = app_mgr
                         .active_app_data
-                        .send(ToAppData::AddContent(data))
+                        .send(ToAppData::AppendContent(data))
                         .await;
                 }
+                // ToAppMgr::AppendShelledDatas(_s_id, c_id, data) => {
+                //     //TODO
+                //     // let mut data_hashes = vec![];
+                //     // let bytes = data.bytes();
+                //     // for chunk in bytes.chunks_exact(8) {
+                //     //     data_hashes.push(u64::from_be_bytes(chunk.try_into().unwrap()))
+                //     // }
+                //     let _ = app_mgr
+                //         .active_app_data
+                //         .send(ToAppData::AppendShelledDatas(c_id, hash_data, data))
+                //         .await;
+                // }
                 ToAppMgr::ContentAdded(s_id, c_id, d_type) => {
                     let _ = to_user.send(ToApp::NewContent(s_id, c_id, d_type));
                 }
@@ -320,6 +342,7 @@ async fn serve_gnome_manager(
 async fn serve_app_data(
     swarm_id: SwarmID,
     mut app_data: ApplicationData,
+    app_data_send: ASender<ToAppData>,
     app_data_recv: AReceiver<ToAppData>,
     to_gnome_sender: Sender<ToGnome>,
     to_app_mgr_send: Sender<ToAppMgr>,
@@ -381,7 +404,64 @@ async fn serve_app_data(
                     // eprintln!("None");
                 }
             }
-            ToAppData::AddContent(data) => {
+            ToAppData::AppendShelledDatas(c_id, hash_data, data_vec) => {
+                eprintln!("evaluating AppendShelledDatas");
+                if let Ok((_d_type, pre_hash)) = app_data.content_root_hash(c_id) {
+                    //TODO: here we need to calculate root hash
+                    let mut c = app_data.shell(c_id).unwrap();
+                    let mut next_data_idx = c.len();
+                    // for h in c.data_hashes() {
+                    //     eprintln!("Original hashes: {:?},len: {}", h.to_be_bytes(), c.len());
+                    // }
+                    let bytes = hash_data.clone().bytes();
+                    for hash_bytes in bytes.chunks_exact(8) {
+                        // eprintln!("Pushing hash: {:?}", hash_bytes);
+                        let _ = c.push_data(Data::empty(u64::from_be_bytes(
+                            hash_bytes.try_into().unwrap(),
+                        )));
+                        for h in c.data_hashes() {
+                            // eprintln!("New hashes: {:?}", h.to_be_bytes());
+                        }
+                        // eprintln!("Len: {}", c.len());
+                    }
+                    let post_hash = c.hash();
+                    // eprintln!("Post hash calculated: {:?}", post_hash.to_be_bytes());
+                    let reqs = SyncRequirements {
+                        pre: vec![(c_id, pre_hash)],
+                        post: vec![(c_id, post_hash)],
+                    };
+                    let msg = SyncMessage::new(
+                        SyncMessageType::AppendShelledDatas(c_id),
+                        reqs,
+                        hash_data,
+                    );
+                    let parts = msg.into_parts();
+                    for part in parts {
+                        let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                    }
+                    let reqs = SyncRequirements {
+                        pre: vec![(c_id, post_hash)],
+                        post: vec![(c_id, post_hash)],
+                    };
+                    for data in data_vec {
+                        let msg = SyncMessage::new(
+                            SyncMessageType::UpdateData(c_id, next_data_idx),
+                            reqs.clone(),
+                            data,
+                        );
+                        next_data_idx += 1;
+                        eprintln!("pre_req: {:?}", reqs.pre);
+                        eprintln!("post_req: {:?}", reqs.post);
+                        let parts = msg.into_parts();
+                        eprintln!("Parts count: {}", parts.len());
+                        for part in parts {
+                            eprintln!("SyncData len: {}", part.len());
+                            let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                        }
+                    }
+                }
+            }
+            ToAppData::AppendContent(data) => {
                 if let Some(next_id) = app_data.next_c_id() {
                     let pre: Vec<(ContentID, u64)> = vec![(next_id, 0)];
                     let post: Vec<(ContentID, u64)> = vec![(next_id, data.get_hash())];
@@ -393,7 +473,11 @@ async fn serve_app_data(
                     // bytes.append(&mut data.bytes());
                     // let data = Data::new(bytes).unwrap();
                     let reqs = SyncRequirements { pre, post };
-                    let msg = SyncMessage::new(SyncMessageType::AddContent(0), reqs, data);
+                    let msg = SyncMessage::new(
+                        SyncMessageType::AppendContent(DataType::from(0)),
+                        reqs,
+                        data,
+                    );
                     let parts = msg.into_parts();
                     for part in parts {
                         let _ = to_gnome_sender.send(ToGnome::AddData(part));
@@ -401,52 +485,113 @@ async fn serve_app_data(
                     next_val += 1;
                 }
             }
-            ToAppData::ChangeContent(d_type, data) => {
-                let c_id: u16 = 1;
+            ToAppData::ChangeContent(c_id, d_type, data_vec) => {
+                eprintln!(
+                    "app data received CC request… for {} with {} data blocks",
+                    c_id,
+                    data_vec.len()
+                );
+                for data in &data_vec {
+                    eprintln!("Hash of data to add: {:?}", data.get_hash().to_be_bytes());
+                }
                 let pre_hash_result = app_data.content_root_hash(c_id);
-                // println!("About to change content {:?}", pre_hash_result);
-                if let Ok(pre_hash) = pre_hash_result {
-                    let pre: Vec<(ContentID, u64)> = vec![(c_id, pre_hash)];
-                    let data = Data::new(vec![next_val]).unwrap();
-                    let post: Vec<(ContentID, u64)> = vec![(c_id, data.get_hash())];
-                    // We prepend 0 to indicate it is not a Link
-                    // let data = Data::new(vec![0, next_val]).unwrap();
-                    let reqs = SyncRequirements { pre, post };
-                    let msg =
-                        SyncMessage::new(SyncMessageType::ChangeContent(d_type, c_id), reqs, data);
-                    let parts = msg.into_parts();
-                    for part in parts {
-                        let _ = to_gnome_sender.send(ToGnome::AddData(part));
-                    }
-                    next_val += 1;
+                let existing_data = app_data.get_all_data(0).unwrap();
+                for data in existing_data {
+                    eprintln!(
+                        "Hash of existing data (len: {}): {:?}",
+                        data.len(),
+                        data.get_hash().to_be_bytes()
+                    );
                 }
-            }
-            ToAppData::SendManifest => {
-                let mut prebytes = vec![0];
-                if let Ok(hash) = app_data.content_root_hash(0) {
-                    for byte in hash.to_be_bytes() {
-                        prebytes.push(byte);
+                // OK, so in order to apply multiple changes we need to:
+                // - verify if d_type allows for this change
+                if let Ok((existing_d_type, pre_hash)) = pre_hash_result {
+                    if existing_d_type == DataType::Link {
+                        if let Ok(hashes) = app_data.get_all_transform_info_hashes(c_id, d_type) {
+                            eprintln!("We can not change a link with TransformInfo");
+                            continue;
+                        }
+                    } else if existing_d_type != d_type {
+                        eprintln!("We can not change content to different DataType");
+                        continue;
                     }
-                } else {
-                    for _i in 0..8 {
-                        prebytes.push(0);
+                    // - make sure there is multiple data blocks that need to change
+                    //   and not just one, or even zero
+                    let existing_hashes = app_data.content_bottom_hashes(c_id).unwrap();
+                    let mut new_hashes = Vec::with_capacity(data_vec.len());
+                    for data in &data_vec {
+                        new_hashes.push(data.get_hash());
                     }
-                };
-                // println!("Prebytes: {:?}", prebytes);
-                let mani = manifest();
-                let pre: Vec<(ContentID, u64)> = vec![(0, 0)];
-                let post: Vec<(ContentID, u64)> = vec![(0, mani.hash())];
-                let reqs = SyncRequirements { pre, post };
-                let msg = SyncMessage::new(SyncMessageType::SetManifest, reqs, mani.to_data(None));
-                let parts = msg.into_parts();
-                // println!(
-                //     "to_data len: {}, hash: {:?}",
-                //     mani.to_data(None).len(),
-                //     mani.to_data(None).hash().to_be_bytes()
-                // );
+                    let existing_len = existing_hashes.len();
+                    let new_len = new_hashes.len();
+                    let mut diff_indices = vec![];
+                    let mut append_indices = vec![];
+                    let mut shrink_indices = vec![];
+                    if existing_len <= new_len {
+                        eprintln!("existing <= new");
+                        for i in 0..existing_len {
+                            if existing_hashes[i] != new_hashes[i] {
+                                diff_indices.push(i);
+                            }
+                        }
+                        for i in existing_len..new_len {
+                            append_indices.push(i);
+                        }
+                    } else {
+                        eprintln!("existing > new");
+                        //We are shrinking content
+                        for i in new_len..existing_len {
+                            shrink_indices.push(i);
+                        }
+                        for i in 0..new_len {
+                            if existing_hashes[i] != new_hashes[i] {
+                                diff_indices.push(i);
+                            }
+                        }
+                    }
+                    //TODO: send request to pop shrinking data blocks
+                    // TODO: this can be a 3-step procedure on a swarm,
+                    // and other users might perform changes in between those
+                    // steps, so it is not guaranteed to succeed completely.
+                    // Probably we should find a better way
+                    // Maybe enqueue subsequent changes from diff_indices?
+                    if !shrink_indices.is_empty() {
+                        eprintln!("We should pop some Data blocks from CID: {}", c_id);
+                        //TODO: new we need to update pre_hash for subsequent requests
+                    } else if new_len - existing_len > 1 {
+                        //TODO: send request to reserve new data blocks
+                        eprintln!("We should reserve some new Data blocks for CID: {}", c_id);
+                        //TODO: new we need to update pre_hash for subsequent requests
+                        let mut new_hashes = vec![];
+                        let mut new_datas = vec![];
+                        for idx in &append_indices {
+                            new_datas.push(data_vec[*idx].clone());
+                        }
+                        for index in &append_indices {
+                            for byte in data_vec[*index].get_hash().to_be_bytes() {
+                                new_hashes.push(byte);
+                            }
+                        }
+                        let _ = app_data_send
+                            .send(ToAppData::AppendShelledDatas(
+                                c_id,
+                                Data::new(new_hashes).unwrap(),
+                                new_datas,
+                            ))
+                            .await;
+                    }
 
-                for part in parts {
-                    let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                    //TODO: for every changed block apply changes one by one
+                    for index in diff_indices {
+                        eprintln!("we should do something with idx: {}", index);
+                        // let reqs = SyncRequirements { pre: vec![(c_id, post)], post:  }
+                        // let msg =
+                        //     SyncMessage::new(SyncMessageType::UpdateData(c_id, index), reqs, data);
+                        // let parts = msg.into_parts();
+                        // for part in parts {
+                        //     let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                        // }
+                    }
                 }
             }
             ToAppData::ListNeighbors => {
@@ -486,7 +631,7 @@ async fn serve_app_data(
                 // 1. Select data to upload
                 // 2. Split data into 64MibiByte chunks
                 //
-                let d_type = 7;
+                let d_type = DataType::from(7);
                 let total_parts = 128;
                 let big_chunks = vec![BigChunk(0, total_parts)];
                 // Then for each big-chunk:
@@ -533,7 +678,11 @@ async fn serve_app_data(
                         eprintln!("Data hash: {}", data.get_hash());
                         let post: Vec<(ContentID, u64)> = vec![(content_id, link_hash)];
                         let reqs = SyncRequirements { pre, post };
-                        let msg = SyncMessage::new(SyncMessageType::AddContent(255), reqs, data);
+                        let msg = SyncMessage::new(
+                            SyncMessageType::AppendContent(DataType::Link),
+                            reqs,
+                            data,
+                        );
                         let parts = msg.into_parts();
                         for part in parts {
                             let _ = to_gnome_sender.send(ToGnome::AddData(part));
@@ -617,40 +766,40 @@ async fn serve_app_data(
 
                 // println!("Received m_type: {:?}", m_type);
                 match m_type {
-                    SyncMessageType::SetManifest => {
-                        let old_manifest = app_data.get_all_data(0);
-                        if !requirements.pre_validate(0, &app_data) {
-                            eprintln!("PRE validation failed");
-                        } else {
-                            let content = Content::Data(0, ContentTree::Filled(data));
-                            let next_id = app_data.next_c_id().unwrap();
-                            let res = if next_id == 0 {
-                                app_data.append(content).is_ok()
-                            } else {
-                                app_data.update(0, content).is_ok()
-                            };
-                            // println!("Manifest result: {:?}", res);
-                            if !requirements.post_validate(0, &app_data) {
-                                eprintln!("POST validation failed");
-                                if let Ok(data_vec) = old_manifest {
-                                    let c_tree = ContentTree::from(data_vec);
-                                    let old_content = Content::Data(0, c_tree);
-                                    let res = app_data.update(0, old_content);
-                                    eprintln!("Restored old manifest {:?}", res.is_ok());
-                                } else {
-                                    let content = Content::Data(0, ContentTree::Empty(0));
-                                    let _ = app_data.update(0, content);
-                                    eprintln!("Zeroed manifest");
-                                }
-                            }
-                            let hash = app_data.root_hash();
-                            eprintln!("Sending updated hash: {}", hash);
-                            let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
-                            eprintln!("Send res: {:?}", res);
-                            // println!("Root hash: {}", app_data.root_hash());
-                        }
-                    }
-                    SyncMessageType::AddContent(d_type) => {
+                    // SyncMessageType::SetManifest => {
+                    //     let old_manifest = app_data.get_all_data(0);
+                    //     if !requirements.pre_validate(0, &app_data) {
+                    //         eprintln!("PRE validation failed");
+                    //     } else {
+                    //         let content = Content::Data(0, ContentTree::Filled(data));
+                    //         let next_id = app_data.next_c_id().unwrap();
+                    //         let res = if next_id == 0 {
+                    //             app_data.append(content).is_ok()
+                    //         } else {
+                    //             app_data.update(0, content).is_ok()
+                    //         };
+                    //         // println!("Manifest result: {:?}", res);
+                    //         if !requirements.post_validate(0, &app_data) {
+                    //             eprintln!("POST validation failed");
+                    //             if let Ok(data_vec) = old_manifest {
+                    //                 let c_tree = ContentTree::from(data_vec);
+                    //                 let old_content = Content::Data(0, c_tree);
+                    //                 let res = app_data.update(0, old_content);
+                    //                 eprintln!("Restored old manifest {:?}", res.is_ok());
+                    //             } else {
+                    //                 let content = Content::Data(0, ContentTree::Empty(0));
+                    //                 let _ = app_data.update(0, content);
+                    //                 eprintln!("Zeroed manifest");
+                    //             }
+                    //         }
+                    //         let hash = app_data.root_hash();
+                    //         eprintln!("Sending updated hash: {}", hash);
+                    //         let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
+                    //         eprintln!("Send res: {:?}", res);
+                    //         // println!("Root hash: {}", app_data.root_hash());
+                    //     }
+                    // }
+                    SyncMessageType::AppendContent(d_type) => {
                         // TODO: potentially for AddContent & ChangeContent
                         // post requirements could be empty
                         // pre requirements can not be empty since we need
@@ -693,6 +842,9 @@ async fn serve_app_data(
                     }
                     SyncMessageType::ChangeContent(d_type, c_id) => {
                         // println!("ChangeContent");
+                        //TODO: we need to verify we actually can change content
+                        // this is possible only if existing and new d_types match
+                        // or if existing d_type is Link
                         if !requirements.pre_validate(c_id, &app_data) {
                             eprintln!("PRE validation failed for ChangeContent");
                             continue;
@@ -713,6 +865,60 @@ async fn serve_app_data(
                             }
                         } else {
                             eprintln!("Update procedure failed: {:?}", res);
+                        }
+                    }
+                    SyncMessageType::AppendShelledDatas(c_id) => {
+                        eprintln!("SyncMessageType::AppendShelledDatas");
+                        if !requirements.pre_validate(c_id, &app_data) {
+                            eprintln!("PRE validation failed for AppendShelledDatas");
+                            continue;
+                        }
+                        //TODO: we unpack hashes from received data, and for each
+                        // hash we create an Data::empty(hash) that we append to
+                        // given c_id in order received
+                        // let mut bytes = data.bytes().into_iter();
+                        let bytes = data.bytes();
+                        let mut hashes = vec![];
+                        for hash_bytes in bytes.chunks_exact(8) {
+                            let hash = u64::from_be_bytes(hash_bytes.try_into().unwrap());
+                            hashes.push(hash);
+                        }
+                        let to_add_total = hashes.len();
+                        let hash_iter = hashes.iter();
+                        // let mut all_res_ok = true;
+                        let mut added_count = 0;
+                        for hash in hash_iter {
+                            let res = app_data.append_data(c_id, Data::empty(*hash));
+                            if res.is_ok() {
+                                added_count += 1;
+                            } else {
+                                eprintln!("Failure adding shelled data: {:?}", res.err().unwrap());
+                                break;
+                            }
+                        }
+                        if added_count == to_add_total {
+                            if !requirements.post_validate(c_id, &app_data) {
+                                eprintln!("POST validation failed for AppendShelledDatas");
+                                // TODO: restore previous order
+                                for i in 0..added_count {
+                                    let res = app_data.pop_data(c_id);
+                                    eprintln!("Pop {} result: {:?}", i, res);
+                                }
+                            } else {
+                                let hash = app_data.root_hash();
+                                eprintln!("Sending updated hash: {}", hash);
+                                let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
+                                eprintln!("Send res: {:?}", res);
+                                eprintln!(
+                                    "Data shells appended successfully ({}, added: {})",
+                                    hash, added_count
+                                );
+                            }
+                        } else {
+                            for i in 0..added_count {
+                                let res = app_data.pop_data(c_id);
+                                eprintln!("Pop {} result: {:?}", i, res);
+                            }
                         }
                     }
                     SyncMessageType::AppendData(c_id) => {
@@ -767,19 +973,21 @@ async fn serve_app_data(
                             continue;
                         }
                         // TODO
-                        let res = app_data.remove_data(c_id, d_id);
-                        if let Ok(removed_data) = res {
+                        // let (_t, len) = app_data.get_type_and_len(c_id).unwrap();
+                        // eprintln!("Before update len: {}", len);
+                        let res = app_data.update_data(c_id, d_id, data);
+                        if let Ok(updated_data) = res {
                             if !requirements.post_validate(c_id, &app_data) {
-                                eprintln!("POST validation failed for RemoveData");
+                                eprintln!("POST validation failed for UpdateData");
                                 // TODO: restore previous order
-                                let res = app_data.insert_data(c_id, d_id, removed_data);
+                                let res = app_data.update_data(c_id, d_id, updated_data);
                                 eprintln!("Restore result: {:?}", res);
                             } else {
                                 let hash = app_data.root_hash();
                                 eprintln!("Sending updated hash: {}", hash);
                                 let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
                                 eprintln!("Send res: {:?}", res);
-                                eprintln!("Data appended successfully ({})", hash);
+                                eprintln!("Data updated successfully ({})", hash);
                             }
                         }
                     }
@@ -892,7 +1100,7 @@ async fn serve_app_data(
                                     {
                                         if data_type == d_type {
                                             app_data.get_all_page_hashes(c_id)
-                                        } else if data_type == 255 {
+                                        } else if data_type == DataType::Link {
                                             app_data.get_all_transform_info_hashes(c_id, d_type)
                                         } else {
                                             Err(AppError::DatatypeMismatch)
@@ -975,7 +1183,7 @@ async fn serve_app_data(
                                                     }
                                                 }
                                             }
-                                        } else if data_type == 255 {
+                                        } else if data_type == DataType::Link {
                                             eprintln!("Link len: {}", len);
                                             if len > 0 {
                                                 let total = len as u16 - 1;
@@ -1101,12 +1309,12 @@ async fn serve_app_data(
                                     //TODO: make it proper
                                     if page_no == 0 {
                                         eprintln!(
-                                            "We've got main page of {}, data type: {}",
+                                            "We've got main page of {}, data type: {:?}",
                                             c_id, data_type
                                         );
                                         if let Ok((d_type, len)) = app_data.get_type_and_len(c_id) {
                                             eprintln!("CID {} already exists", c_id);
-                                            if d_type == 255 {
+                                            if d_type == DataType::Link {
                                                 if len > 0 {
                                                     eprintln!("Update existing Link");
                                                     let _ = app_data.update_transformative_link(
@@ -1123,7 +1331,7 @@ async fn serve_app_data(
                                                     app_data.insert_data(c_id, page_no, data);
                                                 eprintln!("Update existing Data: {:?}", _res);
                                             }
-                                        } else if data_type < 255 {
+                                        } else if data_type < DataType::Link {
                                             eprintln!("Create new Data");
                                             let _ = to_app_mgr_send.send(ToAppMgr::ContentAdded(
                                                 swarm_id, c_id, data_type,
@@ -1152,14 +1360,14 @@ async fn serve_app_data(
                                         if d_type == data_type {
                                             let res = app_data.append_data(c_id, data);
                                             eprintln!("Page #{} add result: {:?}", page_no, res);
-                                        } else if d_type == 255 {
+                                        } else if d_type == DataType::Link {
                                             let res = app_data.update_transformative_link(
                                                 false, c_id, page_no, total, data,
                                             );
                                             // println!("Update TI result: {:?}", res);
                                         } else {
                                             eprintln!(
-                                                "Error: Stored:{} len:{}\nreceived:{} len:{}",
+                                                "Error: Stored:{:?} len:{}\nreceived:{:?} len:{}",
                                                 d_type, len, data_type, total
                                             );
                                         }
@@ -1246,8 +1454,15 @@ async fn serve_app_data(
             }
             ToAppData::ReadData(c_id) => {
                 //TODO:
-                if let Ok(data_vec) = app_data.get_all_data(c_id) {
-                    let _ = to_app_mgr_send.send(ToAppMgr::ReadResult(swarm_id, c_id, data_vec));
+                let (_t, len) = app_data.get_type_and_len(c_id).unwrap();
+                eprintln!("Before read data {} len: {}", c_id, len);
+                let all_data_result = app_data.get_all_data(c_id);
+                if let Ok(data_vec) = all_data_result {
+                    eprintln!("Sending read result with {} data blocks", data_vec.len());
+                    let _ = to_app_mgr_send.send(ToAppMgr::ReadSuccess(swarm_id, c_id, data_vec));
+                } else {
+                    let error = all_data_result.err().unwrap();
+                    let _ = to_app_mgr_send.send(ToAppMgr::ReadError(swarm_id, c_id, error));
                 }
             }
             ToAppData::BCastOrigin(c_id, send) => b_cast_origin = Some((c_id, send)),
@@ -1304,6 +1519,15 @@ async fn serve_app_data(
                     let data = a_msg_res.err().unwrap();
                     eprintln!("App Data: {} ", data);
                 }
+            }
+            ToAppData::UpdateData(c_id, index, data) => {
+                //TODO:serve this
+                eprintln!(
+                    "Got ToAppData::UpdateData({}, {}, {})",
+                    c_id,
+                    index,
+                    data.len()
+                );
             }
             ToAppData::Terminate => {
                 eprintln!("Done serving AppData");
@@ -1573,18 +1797,19 @@ pub struct ApplicationData {
 }
 
 impl ApplicationData {
-    pub fn empty() -> Self {
+    // pub fn empty() -> Self {
+    //     ApplicationData {
+    //         change_reg: ChangeRegistry::new(),
+    //         contents: Datastore::Empty,
+    //         hash_to_temp_idx: HashMap::new(),
+    //         partial_data: HashMap::new(),
+    //     }
+    // }
+    // pub fn new(manifest: Manifest) -> Self {
+    pub fn new(app_type: AppType) -> Self {
         ApplicationData {
             change_reg: ChangeRegistry::new(),
-            contents: Datastore::Empty,
-            hash_to_temp_idx: HashMap::new(),
-            partial_data: HashMap::new(),
-        }
-    }
-    pub fn new(manifest: ApplicationManifest) -> Self {
-        ApplicationData {
-            change_reg: ChangeRegistry::new(),
-            contents: Datastore::new(manifest),
+            contents: Datastore::new(app_type),
             hash_to_temp_idx: HashMap::new(),
             partial_data: HashMap::new(),
         }
@@ -1601,6 +1826,7 @@ impl ApplicationData {
 
     // TODO: this needs rework as well as SyncMessage::from_data
     pub fn process(&mut self, data: SyncData) -> Option<SyncMessage> {
+        let d_len = data.len();
         let mut bytes = data.bytes();
         let m_type = SyncMessageType::new(&mut bytes);
         let mut drained_bytes = m_type.as_bytes();
@@ -1608,12 +1834,16 @@ impl ApplicationData {
         let total_parts = bytes.drain(0..1).next().unwrap();
         drained_bytes.push(part_no);
         drained_bytes.push(total_parts);
-        // println!("[{}/{}]", part_no, total_parts);
+        eprintln!(
+            "Process SyncData {:?} [{}/{}] {} bytes",
+            m_type, part_no, total_parts, d_len,
+        );
         if part_no == 0 {
             if total_parts == 0 {
                 let mut hm = HashMap::new();
                 drained_bytes.append(&mut bytes);
                 hm.insert(0, Data::new(drained_bytes).unwrap());
+                eprintln!("one");
                 Some(SyncMessage::from_data(vec![0], hm).unwrap())
             } else {
                 let mut next_idx = 0;
@@ -1632,13 +1862,14 @@ impl ApplicationData {
                         drained_bytes.push(*item);
                     }
                     let hash = u64::from_be_bytes(hash);
-                    // println!("Expecting hash: {}", hash);
+                    eprintln!("Expecting hash: {}", hash);
                     all_hashes.push(hash);
                     self.hash_to_temp_idx.insert(hash, next_idx);
                 }
                 let mut new_hm = HashMap::new();
                 drained_bytes.append(&mut bytes);
                 let data = Data::new(drained_bytes).unwrap();
+                eprintln!("Inserting data len: {}", data.len());
                 new_hm.insert(0, data);
                 self.partial_data.insert(next_idx, (all_hashes, new_hm));
                 None
@@ -1648,13 +1879,15 @@ impl ApplicationData {
             drained_bytes.append(&mut bytes);
             let data = Data::new(drained_bytes).unwrap();
             let hash = data.get_hash();
-            // println!("Got hash: {}", hash);
+            eprintln!("Got hash: {}", hash);
             if let Some(temp_idx) = self.hash_to_temp_idx.get(&hash) {
                 // println!("Oh yeah");
                 if let Some((vec, mut hm)) = self.partial_data.remove(temp_idx) {
+                    eprintln!("Inserting data len: {}", data.len());
                     hm.insert(hash, data);
                     // println!("{} ==? {}", vec.len(), hm.len());
                     if vec.len() == hm.len() {
+                        eprintln!("two");
                         Some(SyncMessage::from_data(vec, hm).unwrap())
                     } else {
                         self.partial_data.insert(*temp_idx, (vec, hm));
@@ -1672,10 +1905,14 @@ impl ApplicationData {
     pub fn root_hash(&self) -> u64 {
         self.contents.hash()
     }
-    pub fn content_root_hash(&self, c_id: ContentID) -> Result<u64, AppError> {
+
+    pub fn shell(&self, c_id: ContentID) -> Result<Content, AppError> {
+        self.contents.shell(c_id)
+    }
+    pub fn content_root_hash(&self, c_id: ContentID) -> Result<(DataType, u64), AppError> {
         let result = self.contents.get_root_content_typed_hash(c_id);
-        if let Ok((_d_type, hash)) = result {
-            Ok(hash)
+        if let Ok(value) = result {
+            Ok(value)
         } else {
             Err(result.err().unwrap())
         }
@@ -1684,7 +1921,7 @@ impl ApplicationData {
         self.change_reg.read()
     }
 
-    pub fn all_content_typed_root_hashes(&self) -> Vec<Vec<(u8, u64)>> {
+    pub fn all_content_typed_root_hashes(&self) -> Vec<Vec<(DataType, u64)>> {
         self.contents.all_typed_root_hashes()
     }
     pub fn transform_link(&mut self, content_id: ContentID) -> Result<Content, AppError> {
@@ -1737,6 +1974,14 @@ impl ApplicationData {
     pub fn pop_data(&mut self, c_id: ContentID) -> Result<Data, AppError> {
         self.contents.pop_data(c_id)
     }
+    pub fn update_data(
+        &mut self,
+        c_id: ContentID,
+        d_id: u16,
+        data: Data,
+    ) -> Result<Data, AppError> {
+        self.contents.update_data((c_id, d_id), data)
+    }
     pub fn remove_data(&mut self, c_id: ContentID, d_id: u16) -> Result<Data, AppError> {
         self.contents.remove_data(c_id, d_id)
     }
@@ -1744,15 +1989,26 @@ impl ApplicationData {
         self.contents.update(c_id, content)
     }
     pub fn get_all_data(&self, c_id: ContentID) -> Result<Vec<Data>, AppError> {
+        let read_result = self.contents.read_data((c_id, 0));
         let mut data_vec = vec![];
-        for i in 0..u16::MAX {
-            if let Ok(data) = self.contents.read_data((c_id, i)) {
+        if let Ok(data) = read_result {
+            data_vec.push(data);
+        } else {
+            return Err(read_result.err().unwrap());
+        }
+        for i in 1..u16::MAX {
+            let read_result = self.contents.read_data((c_id, i));
+            if let Ok(data) = read_result {
                 data_vec.push(data);
             } else {
                 break;
             }
         }
+        eprintln!("CID-{} has {} Data blocks", c_id, data_vec.len());
         Ok(data_vec)
+    }
+    pub fn content_bottom_hashes(&self, c_id: ContentID) -> Result<Vec<u64>, AppError> {
+        self.contents.content_bottom_hashes(c_id)
     }
     pub fn get_all_page_hashes(&self, c_id: ContentID) -> Result<Vec<Data>, AppError> {
         let hashes_vec = self.contents.content_bottom_hashes(c_id)?;

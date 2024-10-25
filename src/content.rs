@@ -8,7 +8,27 @@ use std::hash::Hasher;
 use crate::prelude::AppError;
 use crate::prelude::Data;
 pub type ContentID = u16;
-pub type DataType = u8;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DataType {
+    Link,
+    Data(u8),
+}
+impl DataType {
+    pub fn from(val: u8) -> Self {
+        if val == 255 {
+            DataType::Link
+        } else {
+            DataType::Data(val)
+        }
+    }
+    pub fn byte(&self) -> u8 {
+        match self {
+            DataType::Link => 255,
+            DataType::Data(val) => *val,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum Content {
@@ -128,7 +148,7 @@ impl TransformInfo {
             let data_len = u16::from_be_bytes([b1, b2]);
 
             Some(TransformInfo {
-                d_type,
+                d_type: DataType::from(d_type),
                 tags,
                 size,
                 root_hash,
@@ -180,7 +200,7 @@ impl TransformInfo {
     }
     pub fn bytes(self) -> Vec<u8> {
         // pub d_type: DataType,
-        let mut bytes = vec![self.d_type];
+        let mut bytes = vec![self.d_type.byte()];
         // pub size: u16,
         for byte in self.size.to_be_bytes() {
             bytes.push(byte);
@@ -349,7 +369,7 @@ impl TransformInfo {
 // We can have up to 256 such synchronizations occur simultaneously per swarm
 // and still stay in Sync and update Datastore.
 impl Content {
-    pub fn from(d_type: u8, data: Data) -> Result<Self, AppError> {
+    pub fn from(d_type: DataType, data: Data) -> Result<Self, AppError> {
         let bytes = data.bytes();
         // println!("Bytes: {:?}", bytes);
         let mut bytes_iter = bytes.into_iter();
@@ -357,7 +377,7 @@ impl Content {
         // println!("First byte: {:?}", first_byte);
         match d_type {
             // None => Err(AppError::Smthg),
-            255 => {
+            DataType::Link => {
                 // first 8 bytes is GnomeId
                 let b1 = bytes_iter.next().unwrap();
                 let b2 = bytes_iter.next().unwrap();
@@ -389,15 +409,15 @@ impl Content {
             // at it's bottom root data hashes
             // TODO: once we have all root data hashes we can start
             // replacing them one-by-one
-            other => {
+            DataType::Data(other) => {
                 let tree = ContentTree::new(Data::new(bytes_iter.collect()).unwrap());
-                Ok(Content::Data(other, tree))
+                Ok(Content::Data(DataType::from(other), tree))
             }
         }
     }
     pub fn data_type(&self) -> DataType {
         match self {
-            Self::Link(_g, _sn, _c, _ti) => 255,
+            Self::Link(_g, _sn, _c, _ti) => DataType::Link,
             Self::Data(d_type, _ct) => *d_type,
         }
     }
@@ -422,6 +442,7 @@ impl Content {
         }
     }
     pub fn read_data(&self, data_id: u16) -> Result<Data, AppError> {
+        eprintln!("Internal read_data {}", data_id);
         match self {
             Self::Link(g_id, s_name, c_id, ti) => {
                 // if let Some(ti) = ti {
@@ -435,17 +456,12 @@ impl Content {
                     eprintln!("Converting link to data, TI: {:?}", ti.is_some());
                     Ok(link_to_data(*g_id, s_name.clone(), *c_id, ti.clone()))
                 } else {
+                    eprintln!("Link indexing error");
                     Err(AppError::IndexingError)
                 }
                 // }
             }
-            Self::Data(_type, c_tree) => {
-                if data_id == 0 {
-                    c_tree.read(data_id)
-                } else {
-                    Err(AppError::IndexingError)
-                }
-            }
+            Self::Data(_type, c_tree) => c_tree.read(data_id),
         }
     }
     pub fn read_link_data(&self, d_type: DataType, data_id: u16) -> Result<(Data, u16), AppError> {
@@ -497,7 +513,10 @@ impl Content {
         }
     }
     pub fn update_data(&mut self, data_id: u16, data: Data) -> Result<Data, AppError> {
-        let myself = std::mem::replace(self, Content::Data(0, ContentTree::Empty(0)));
+        let myself = std::mem::replace(
+            self,
+            Content::Data(DataType::Data(0), ContentTree::Empty(0)),
+        );
         match myself {
             Self::Link(g_id, s_name, c_id, ti) => {
                 if data_id != 0 {
@@ -736,11 +755,17 @@ impl ContentTree {
         }
     }
 
+    // TODO: shell should preserve data structure, only replace Data with it's hash
     pub fn shell(&self) -> Self {
         match self {
             Self::Empty(hash) => Self::Empty(*hash),
-            Self::Filled(data) => Self::Empty(data.get_hash()),
-            Self::Hashed(sub_tree) => Self::Empty(sub_tree.hash),
+            Self::Filled(data) => Self::Filled(Data::empty(data.get_hash())),
+            Self::Hashed(sub_tree) => Self::Hashed(Box::new(Subtree {
+                data_count: sub_tree.data_count,
+                hash: sub_tree.hash,
+                left: sub_tree.left.shell(),
+                right: sub_tree.right.shell(),
+            })),
         }
     }
     pub fn hash(&self) -> u64 {
@@ -751,22 +776,29 @@ impl ContentTree {
         }
     }
     pub fn get_data_hash(&self, data_id: u16) -> Result<u64, AppError> {
+        eprintln!("Getting data hash {}", data_id);
         match self {
             Self::Empty(hash) => {
                 if data_id == 0 {
+                    eprintln!("empty {:?}", hash.to_be_bytes());
                     Ok(*hash)
                 } else {
                     Err(AppError::IndexingError)
                 }
             }
             Self::Filled(data) => {
+                // eprintln!("filled");
                 if data_id == 0 {
+                    eprintln!("filled{:?}", data.get_hash().to_be_bytes());
                     Ok(data.get_hash())
                 } else {
                     Err(AppError::IndexingError)
                 }
             }
-            Self::Hashed(sub_tree) => sub_tree.get_data_hash(data_id),
+            Self::Hashed(sub_tree) => {
+                eprintln!("hashed…");
+                sub_tree.get_data_hash(data_id)
+            }
         }
     }
 
@@ -811,12 +843,18 @@ impl ContentTree {
     }
     pub fn append(&mut self, data: Data) -> Result<u64, AppError> {
         let hash = data.get_hash();
-        // we only balance a tree every time we are inserting data
-        // appending has it's own logic regarding tree structure
         match self {
             Self::Filled(existing_data) => {
-                let first_hash = existing_data.hash();
+                eprintln!(
+                    "I am filled {:?} {},\n{:?}",
+                    existing_data.clone().bytes(),
+                    existing_data.len(),
+                    existing_data.get_hash().to_be_bytes(),
+                );
+                let first_hash = existing_data.get_hash();
+                // eprintln!("first hash: {:?}", first_hash.to_be_bytes());
                 let d_hash = double_hash(first_hash, hash);
+                // eprintln!("double hash: {:?}", d_hash.to_be_bytes());
                 let prev_tree = std::mem::replace(self, Self::Empty(0));
                 let new_tree = ContentTree::Hashed(Box::new(Subtree {
                     data_count: 2,
@@ -824,10 +862,13 @@ impl ContentTree {
                     left: prev_tree,
                     right: ContentTree::Filled(data),
                 }));
-                let _ = std::mem::replace(self, new_tree);
+                // let _ = std::mem::replace(self, new_tree);
+                *self = new_tree;
+                eprintln!("1 Len after append: {}", self.len());
                 Ok(d_hash)
             }
             Self::Hashed(subtree) => {
+                eprintln!("I am hashed");
                 //  Here we choose between two paths
                 //   of growing this tree by another level
                 //   by reassigning *self to new Hashed
@@ -847,9 +888,11 @@ impl ContentTree {
                             right: ContentTree::Filled(data),
                         }));
                         let _ = std::mem::replace(self, new_tree);
+                        eprintln!("2 Len after append: {}", self.len());
                         Ok(d_hash)
                     } else {
                         let app_res = subtree.append(data);
+                        eprintln!("3 Len after append: {}", self.len());
                         if let Ok(_hash) = app_res {
                             Ok(self.hash())
                         } else {
@@ -861,8 +904,25 @@ impl ContentTree {
                 }
             }
             Self::Empty(_hash) => {
-                *self = ContentTree::Filled(data);
-                Ok(hash)
+                eprintln!("I am empty");
+                if data.is_empty() {
+                    eprintln!("data empty");
+                    let double_hash = double_hash(*_hash, data.get_hash());
+                    let s_tree = Subtree {
+                        data_count: 2,
+                        hash: double_hash,
+                        left: ContentTree::Empty(*_hash),
+                        right: ContentTree::Empty(data.get_hash()),
+                    };
+                    *self = ContentTree::Hashed(Box::new(s_tree));
+                    eprintln!("4 Len after append: {}", self.len());
+                    Ok(double_hash)
+                } else {
+                    eprintln!("data not empty");
+                    *self = ContentTree::Filled(data);
+                    eprintln!("5 Len after append: {}", self.len());
+                    Ok(hash)
+                }
             }
         }
     }
@@ -1118,11 +1178,12 @@ impl Subtree {
     // result of remove function
     pub fn remove_data(&mut self, idx: u16) -> Result<Data, AppError> {
         let chunks_count = self.len();
+        eprintln!("remove_data({}), count: {}", idx, chunks_count);
         if idx >= chunks_count {
             return Err(AppError::IndexingError);
         }
         let mut shifted_data = self.pop();
-        for i in (idx..chunks_count).rev() {
+        for i in (idx..chunks_count - 1).rev() {
             shifted_data = self.replace(i, shifted_data).unwrap();
         }
         Ok(shifted_data)

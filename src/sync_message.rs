@@ -10,7 +10,7 @@ pub fn serialize_requests(requests: Vec<SyncRequest>) -> Vec<u8> {
                 let [c_1, c_2] = c_id.to_be_bytes();
                 bytes.push(c_1);
                 bytes.push(c_2);
-                bytes.push(d_type);
+                bytes.push(d_type.byte());
                 let [hl_1, hl_2] = (hash_ids.len() as u16).to_be_bytes();
                 bytes.push(hl_1);
                 bytes.push(hl_2);
@@ -25,7 +25,7 @@ pub fn serialize_requests(requests: Vec<SyncRequest>) -> Vec<u8> {
                 let [c_1, c_2] = c_id.to_be_bytes();
                 bytes.push(c_1);
                 bytes.push(c_2);
-                bytes.push(d_type);
+                bytes.push(d_type.byte());
                 let [pl_1, pl_2] = (page_ids.len() as u16).to_be_bytes();
                 bytes.push(pl_1);
                 bytes.push(pl_2);
@@ -62,7 +62,7 @@ pub fn deserialize_requests(bytes: Vec<u8>) -> Vec<SyncRequest> {
                 let c_1 = bytes_iter.next().unwrap();
                 let c_2 = bytes_iter.next().unwrap();
                 let c_id = u16::from_be_bytes([c_1, c_2]);
-                let d_type = bytes_iter.next().unwrap();
+                let d_type = DataType::from(bytes_iter.next().unwrap());
 
                 let hl_1 = bytes_iter.next().unwrap();
                 let hl_2 = bytes_iter.next().unwrap();
@@ -93,7 +93,7 @@ pub fn deserialize_requests(bytes: Vec<u8>) -> Vec<SyncRequest> {
                     let p_2 = bytes_iter.next().unwrap();
                     page_ids.push(u16::from_be_bytes([p_1, p_2]));
                 }
-                requests.push(SyncRequest::Pages(c_id, d_type, page_ids));
+                requests.push(SyncRequest::Pages(c_id, DataType::from(d_type), page_ids));
             }
             4 => {
                 let cl_1 = bytes_iter.next().unwrap();
@@ -126,7 +126,7 @@ pub enum SyncRequest {
 
 #[derive(Debug)]
 pub enum SyncResponse {
-    Datastore(u16, u16, Vec<(u8, u64)>),
+    Datastore(u16, u16, Vec<(DataType, u64)>),
     Hashes(ContentID, u16, u16, Data),
     Page(ContentID, DataType, u16, u16, Data),
 }
@@ -139,7 +139,7 @@ impl SyncResponse {
                 let [total_1, total_2] = (total as u16).to_be_bytes();
                 let mut byte_hashes = vec![];
                 for (d_type, hash) in group.iter() {
-                    byte_hashes.push(*d_type);
+                    byte_hashes.push(d_type.byte());
                     for byte in hash.to_be_bytes() {
                         byte_hashes.push(byte);
                     }
@@ -171,7 +171,7 @@ impl SyncResponse {
                 bytes.push(2);
                 bytes.push(c_1);
                 bytes.push(c_2);
-                bytes.push(data_type);
+                bytes.push(data_type.byte());
                 bytes.push(page_1);
                 bytes.push(page_2);
                 bytes.push(total_1);
@@ -204,8 +204,10 @@ impl SyncResponse {
                     let b6 = bytes_iter.next().unwrap();
                     let b7 = bytes_iter.next().unwrap();
                     let b8 = bytes_iter.next().unwrap();
-                    typed_hashes
-                        .push((d_type, u64::from_be_bytes([b1, b2, b3, b4, b5, b6, b7, b8])));
+                    typed_hashes.push((
+                        DataType::from(d_type),
+                        u64::from_be_bytes([b1, b2, b3, b4, b5, b6, b7, b8]),
+                    ));
                 }
                 return Ok(Self::Datastore(part_no, total, typed_hashes));
             }
@@ -234,7 +236,7 @@ impl SyncResponse {
                 let c_1 = bytes_iter.next().unwrap();
                 let c_2 = bytes_iter.next().unwrap();
                 let c_id = u16::from_be_bytes([c_1, c_2]);
-                let data_type = bytes_iter.next().unwrap();
+                let data_type = DataType::from(bytes_iter.next().unwrap());
                 let p_1 = bytes_iter.next().unwrap();
                 let p_2 = bytes_iter.next().unwrap();
                 let page_no = u16::from_be_bytes([p_1, p_2]);
