@@ -636,7 +636,7 @@ async fn serve_app_data(
                 let big_chunks = vec![BigChunk(0, total_parts)];
                 // Then for each big-chunk:
                 for mut big_chunk in big_chunks.into_iter() {
-                    let description = String::new();
+                    let description = content::Description::new(String::new()).unwrap();
                     let missing_hashes = HashSet::new();
                     let data_hashes = vec![];
                     let mut data_vec = Vec::with_capacity(big_chunk.1 as usize);
@@ -653,11 +653,10 @@ async fn serve_app_data(
                     eprintln!("// 6. Instantiate TransformInfo");
                     let ti = TransformInfo {
                         d_type,
-                        tags: vec![],
                         size: 0,
                         root_hash,
                         broadcast_id,
-                        description,
+                        // description,
                         missing_hashes,
                         data_hashes,
                         data: HashMap::new(),
@@ -669,8 +668,16 @@ async fn serve_app_data(
                     if let Some(content_id) = app_data.next_c_id() {
                         eprintln!("ContentID: {}", content_id);
                         let pre: Vec<(ContentID, u64)> = vec![(content_id, 0)];
-                        let link =
-                            Content::Link(GnomeId(u64::MAX), String::new(), u16::MAX, Some(ti));
+                        let link = Content::Link(
+                            SwarmName {
+                                founder: GnomeId(u64::MAX),
+                                name: String::new(),
+                            },
+                            u16::MAX,
+                            description,
+                            Data::empty(0),
+                            Some(ti),
+                        );
                         let link_hash = link.hash();
                         eprintln!("Link hash: {}", link_hash);
                         let data = link.to_data().unwrap();

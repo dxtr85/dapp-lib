@@ -7,6 +7,7 @@ use crate::content::double_hash;
 use crate::content::DataType;
 use crate::prelude::TransformInfo;
 use crate::Data;
+use gnome::prelude::SwarmName;
 // use std::collections::HashSet;
 
 // A Datastore is an append-only data structure built as a binary tree,
@@ -177,13 +178,13 @@ impl Datastore {
             Self::Filled(content) => {
                 if c_id == 0 {
                     match content {
-                        Content::Link(g_id, s_name, c_id, ti) => {
+                        Content::Link(s_name, c_id, descr, data, ti) => {
                             let result = if let Some(ti) = ti {
                                 Ok(ti)
                             } else {
                                 Err(AppError::LinkNonTransformative)
                             };
-                            *self = Self::Filled(Content::Link(g_id, s_name, c_id, None));
+                            *self = Self::Filled(Content::Link(s_name, c_id, descr, data, None));
                             result
                         }
                         other => {
@@ -215,8 +216,9 @@ impl Datastore {
             Self::Filled(content) => {
                 if c_id == 0 {
                     match content {
-                        Content::Link(g_id, s_name, c_id, _ti) => {
-                            *self = Self::Filled(Content::Link(g_id, s_name, c_id, Some(ti)));
+                        Content::Link(s_name, c_id, descr, data, _ti) => {
+                            *self =
+                                Self::Filled(Content::Link(s_name, c_id, descr, data, Some(ti)));
                             Ok(())
                         }
                         other => {
@@ -246,7 +248,7 @@ impl Datastore {
             Self::Filled(old_content) => {
                 if c_id == 0 {
                     match old_content {
-                        Content::Link(_g_id, ref _s_name, _c_id, ref ti_opt) => {
+                        Content::Link(ref _s_name, _c_id, ref _descr, ref _data, ref ti_opt) => {
                             if ti_opt.is_some() {
                                 *self = Self::Filled(old_content);
                                 Err(AppError::Smthg)
