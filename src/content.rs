@@ -9,7 +9,7 @@ use crate::prelude::AppError;
 use crate::prelude::Data;
 pub type ContentID = u16;
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DataType {
     Link,
     Data(u8),

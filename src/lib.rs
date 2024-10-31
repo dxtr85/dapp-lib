@@ -87,7 +87,7 @@ pub enum ToAppMgr {
     ListNeighbors,
     NeighborsListing(SwarmID, Vec<GnomeId>),
     ChangeContent(SwarmID, ContentID, DataType, Vec<Data>),
-    AppendContent(SwarmID, Data),
+    AppendContent(SwarmID, DataType, Data),
     // AppendShelledDatas(SwarmID, ContentID, Data),
     ContentAdded(SwarmID, ContentID, DataType),
     TransformLinkRequest(Box<SyncData>),
@@ -109,7 +109,7 @@ pub enum ToAppData {
     BCastOrigin(CastID, Sender<CastData>),
     ChangeContent(ContentID, DataType, Vec<Data>),
     UpdateData(ContentID, u16, Data),
-    AppendContent(Data),
+    AppendContent(DataType, Data),
     AppendShelledDatas(ContentID, Data, Vec<Data>),
     CustomRequest(u8, GnomeId, CastData),
     CustomResponse(u8, GnomeId, CastData),
@@ -306,10 +306,10 @@ async fn serve_gnome_manager(
                         .send(ToAppData::ChangeContent(c_id, d_type, data_vec))
                         .await;
                 }
-                ToAppMgr::AppendContent(_s_id, data) => {
+                ToAppMgr::AppendContent(_s_id, d_type, data) => {
                     let _ = app_mgr
                         .active_app_data
-                        .send(ToAppData::AppendContent(data))
+                        .send(ToAppData::AppendContent(d_type, data))
                         .await;
                 }
                 // ToAppMgr::AppendShelledDatas(_s_id, c_id, data) => {
@@ -461,7 +461,7 @@ async fn serve_app_data(
                     }
                 }
             }
-            ToAppData::AppendContent(data) => {
+            ToAppData::AppendContent(d_type, data) => {
                 if let Some(next_id) = app_data.next_c_id() {
                     let pre: Vec<(ContentID, u64)> = vec![(next_id, 0)];
                     let post: Vec<(ContentID, u64)> = vec![(next_id, data.get_hash())];
@@ -473,11 +473,7 @@ async fn serve_app_data(
                     // bytes.append(&mut data.bytes());
                     // let data = Data::new(bytes).unwrap();
                     let reqs = SyncRequirements { pre, post };
-                    let msg = SyncMessage::new(
-                        SyncMessageType::AppendContent(DataType::from(0)),
-                        reqs,
-                        data,
-                    );
+                    let msg = SyncMessage::new(SyncMessageType::AppendContent(d_type), reqs, data);
                     let parts = msg.into_parts();
                     for part in parts {
                         let _ = to_gnome_sender.send(ToGnome::AddData(part));
