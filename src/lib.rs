@@ -179,7 +179,7 @@ async fn serve_gnome_manager(
     } else {
         GnomeId(u64::MAX)
     };
-    eprintln!("My-ID: {}", my_id);
+    // eprintln!("My-ID: {}", my_id);
     let mut app_mgr = ApplicationManager::new(my_id);
 
     let sleep_time = Duration::from_millis(128);
@@ -207,7 +207,12 @@ async fn serve_gnome_manager(
                 }
                 FromGnomeManager::NewSwarmAvailable(swarm_name) => {
                     eprintln!("NewSwarm available, joining: {}", swarm_name);
-                    let _ = to_gnome_mgr.send(ToGnomeManager::JoinSwarm(swarm_name));
+                    if !own_swarm_started && swarm_name.founder == my_id {
+                        eprintln!("Oh, seems like my swarm is already there, I'll just join it");
+                        own_swarm_started = true;
+                    }
+                    let _res = to_gnome_mgr.send(ToGnomeManager::JoinSwarm(swarm_name));
+                    // eprintln!("Join sent: {:?}", _res);
                 }
                 FromGnomeManager::SwarmJoined(s_id, s_name, to_swarm, from_swarm) => {
                     eprintln!("{:?} joined {}", s_id, s_name);
@@ -219,7 +224,7 @@ async fn serve_gnome_manager(
                     let (to_app_data_send, to_app_data_recv) = achannel::bounded(32);
                     app_mgr.add_app_data(s_name, s_id, to_app_data_send.clone());
                     let app_data = ApplicationData::new(AppType::Catalog);
-                    eprintln!("spawning new serve_app_data");
+                    // eprintln!("spawning new serve_app_data");
                     spawn(serve_app_data(
                         s_id,
                         app_data,
@@ -325,6 +330,7 @@ async fn serve_gnome_manager(
                 //         .await;
                 // }
                 ToAppMgr::ContentAdded(s_id, c_id, d_type) => {
+                    eprintln!("ToApp::NewContent({:?},{:?})", c_id, d_type);
                     let _ = to_user.send(ToApp::NewContent(s_id, c_id, d_type));
                 }
                 ToAppMgr::Quit => {
@@ -1236,6 +1242,7 @@ async fn serve_app_data(
                                     );
                                     let sync_type = 0;
                                     for c_id in c_ids {
+                                        eprintln!("Sending CID {}", c_id);
                                         if let Ok(data_vec) = app_data.get_all_data(c_id) {
                                             if data_vec.is_empty() {
                                                 continue;
@@ -1279,19 +1286,32 @@ async fn serve_app_data(
                     0 => {
                         if let Ok(response) = SyncResponse::deserialize(cast_data.bytes()) {
                             //TODO:
-                            // println!("Deserialized response!: {:?}", response);
+                            eprintln!("Deserialized response!: {:?}", response);
                             match response {
                                 SyncResponse::Datastore(part_no, total, hashes) => {
                                     //TODO: we need to cover case where parts come out of order
+
+                                    let c_id = app_data.next_c_id().unwrap();
+                                    let mut curr_cid = 0;
+
                                     for (data_type, hash) in hashes {
                                         let tree = ContentTree::empty(hash);
                                         let content = Content::Data(data_type, tree);
-                                        let c_id = app_data.next_c_id().unwrap();
-                                        let res = app_data.append(content);
-                                        let _ = to_app_mgr_send.send(ToAppMgr::ContentAdded(
-                                            swarm_id, c_id, data_type,
-                                        ));
-                                        eprintln!("Datastore add: {:?}", res);
+                                        // eprintln!("Next CID: {}", c_id);
+                                        if curr_cid < c_id {
+                                            let _ = app_data.update(curr_cid, content);
+                                        } else {
+                                            let c_id = app_data.next_c_id().unwrap();
+                                            let _res = app_data.append(content);
+                                            let _ = to_app_mgr_send.send(ToAppMgr::ContentAdded(
+                                                swarm_id, c_id, data_type,
+                                            ));
+                                        }
+                                        eprintln!(
+                                            "SyncResponse::Datastore [{}/{}] ",
+                                            part_no, total,
+                                        );
+                                        curr_cid = curr_cid + 1;
                                     }
                                 }
                                 SyncResponse::Hashes(c_id, part_no, total, hashes) => {

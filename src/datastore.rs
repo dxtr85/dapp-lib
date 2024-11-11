@@ -47,13 +47,13 @@ impl Datastore {
     // failing when all possible slots are already taken
     pub fn insert_data(&mut self, c_id: ContentID, d_id: u16, data: Data) -> Result<u64, AppError> {
         let take_result = self.take(c_id);
-        eprintln!("Take result: {:?}", take_result);
+        // eprintln!("Take result: {:?}", take_result);
         if let Err(e) = take_result {
             return Err(e);
         }
         let mut content = take_result.unwrap();
         let insert_result = content.insert(d_id, data);
-        eprintln!("Insert result: {:?}", insert_result);
+        // eprintln!("Insert result: {:?}", insert_result);
         let _ = self.update(c_id, content);
         insert_result
     }
@@ -70,7 +70,7 @@ impl Datastore {
         let append_result = content.push_data(data);
         let _r = self.update(c_id, content);
         let (_t, len) = self.type_and_len(c_id).unwrap();
-        eprintln!("Update result: {}, len: {}", _r.is_ok(), len);
+        // eprintln!("Update result: {}, len: {}", _r.is_ok(), len);
         append_result
     }
 
@@ -332,7 +332,7 @@ impl Datastore {
             // println!("Update res: {:?}", _res);
             Ok((d_type, missing_hashes, missing_parts))
         } else {
-            eprintln!("Link has no TI");
+            // eprintln!("Link has no TI");
             // let _ = self.update(content_id, Content::Link(g_id, s_name, lc_id, ti));
             Err(AppError::LinkNonTransformative)
         }
@@ -344,18 +344,18 @@ impl Datastore {
 
     // This fn should be used for reading selected datachunk
     pub fn read_data(&self, (c_id, data_id): (ContentID, u16)) -> Result<Data, AppError> {
-        eprintln!("Read request: {}-{}", c_id, data_id);
+        // eprintln!("Read request: {}-{}", c_id, data_id);
         match self {
             Self::Empty => {
-                eprintln!("EMPTY");
+                // eprintln!("EMPTY");
                 Err(AppError::IndexingError)
             }
             Self::Filled(content) => {
                 if c_id == 0 {
-                    eprintln!("Read OK");
+                    // eprintln!("Read OK");
                     content.read_data(data_id)
                 } else {
-                    eprintln!("Read Error");
+                    // eprintln!("Read Error");
                     Err(AppError::IndexingError)
                 }
             }
@@ -430,7 +430,7 @@ impl Datastore {
         match self {
             Self::Empty => Err(AppError::ContentEmpty),
             Self::Filled(content) => {
-                eprintln!("Sending bottom hashes up");
+                // eprintln!("Sending bottom hashes up");
                 if c_id == 0 {
                     content.link_ti_hashes()
                 } else {

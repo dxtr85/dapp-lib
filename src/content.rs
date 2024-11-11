@@ -954,12 +954,12 @@ impl ContentTree {
         let hash = data.get_hash();
         match self {
             Self::Filled(existing_data) => {
-                eprintln!(
-                    "I am filled {:?} {},\n{:?}",
-                    existing_data.clone().bytes(),
-                    existing_data.len(),
-                    existing_data.get_hash().to_be_bytes(),
-                );
+                // eprintln!(
+                //     "I am filled {:?} {},\n{:?}",
+                //     existing_data.clone().bytes(),
+                //     existing_data.len(),
+                //     existing_data.get_hash().to_be_bytes(),
+                // );
                 let first_hash = existing_data.get_hash();
                 // eprintln!("first hash: {:?}", first_hash.to_be_bytes());
                 let d_hash = double_hash(first_hash, hash);
@@ -977,7 +977,7 @@ impl ContentTree {
                 Ok(d_hash)
             }
             Self::Hashed(subtree) => {
-                eprintln!("I am hashed");
+                // eprintln!("I am hashed");
                 //  Here we choose between two paths
                 //   of growing this tree by another level
                 //   by reassigning *self to new Hashed
@@ -1013,9 +1013,9 @@ impl ContentTree {
                 }
             }
             Self::Empty(_hash) => {
-                eprintln!("I am empty");
+                // eprintln!("I am empty");
                 if data.is_empty() {
-                    eprintln!("data empty");
+                    // eprintln!("data empty");
                     let double_hash = double_hash(*_hash, data.get_hash());
                     let s_tree = Subtree {
                         data_count: 2,
@@ -1024,12 +1024,12 @@ impl ContentTree {
                         right: ContentTree::Empty(data.get_hash()),
                     };
                     *self = ContentTree::Hashed(Box::new(s_tree));
-                    eprintln!("4 Len after append: {}", self.len());
+                    // eprintln!("4 Len after append: {}", self.len());
                     Ok(double_hash)
                 } else {
-                    eprintln!("data not empty");
+                    // eprintln!("data not empty");
                     *self = ContentTree::Filled(data);
-                    eprintln!("5 Len after append: {}", self.len());
+                    // eprintln!("5 Len after append: {}", self.len());
                     Ok(hash)
                 }
             }

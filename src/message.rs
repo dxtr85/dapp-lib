@@ -262,15 +262,15 @@ impl SyncMessage {
         let req_size = 2 + 10 * (self.requirements.pre.len() + self.requirements.post.len());
         let netto_size = data_size + req_size;
         let mut partials = vec![];
-        eprintln!("data size: {}", data_size);
-        eprintln!("req size: {}", req_size);
-        eprintln!("netto size: {}", netto_size);
+        // eprintln!("data size: {}", data_size);
+        // eprintln!("req size: {}", req_size);
+        // eprintln!("netto size: {}", netto_size);
 
         // TODO/DONE? (was 897): recalculate how many bytes to drain, since now
         // message type can take up to 5 bytes, not 1 as previously
         // println!("Netto: {}", netto_size);
         if netto_size < 893 {
-            eprintln!("netto_size < 893 ");
+            // eprintln!("netto_size < 893 ");
             let mut bytes = Vec::with_capacity(netto_size + 3);
             for byte in self.m_type.as_bytes() {
                 bytes.push(byte);
@@ -283,7 +283,7 @@ impl SyncMessage {
             partials.push(data);
             // partials.push(PartialMessage { m_type, part_no: 0, total_parts:0, data })
         } else {
-            eprintln!("netto_size >= 893 ");
+            // eprintln!("netto_size >= 893 ");
             let mut non_header_parts = 1;
             let mut done = false;
             while !done {
@@ -294,7 +294,7 @@ impl SyncMessage {
                     non_header_parts += 1;
                 }
             }
-            eprintln!("Non header parts: {}", non_header_parts);
+            // eprintln!("Non header parts: {}", non_header_parts);
             // First we assume worst case scenario - 7 parts
             // Maximum size of SyncMessage is:
             // 1 byte for m_type
@@ -322,16 +322,16 @@ impl SyncMessage {
             header_bytes.push(0);
             header_bytes.push(non_header_parts as u8);
             let first_chunk_size = 893 - hashes_size;
-            eprintln!("first_chunk_size: {}", first_chunk_size);
+            // eprintln!("first_chunk_size: {}", first_chunk_size);
             // later chunks have up to 1021 bytes (3 bytes for type, part_no, total_parts)
             // First we put hashes (after we calculate them...)
             // Then we put requirements
             let mut req_and_data_bytes = self.requirements.bytes();
-            eprintln!("req_bytes: {}", req_and_data_bytes.len());
+            // eprintln!("req_bytes: {}", req_and_data_bytes.len());
             // And at the end we put data_bytes
             let mut data_bytes = self.data.bytes();
             req_and_data_bytes.append(&mut data_bytes);
-            eprintln!("req_and_data_bytes: {}", req_and_data_bytes.len());
+            // eprintln!("req_and_data_bytes: {}", req_and_data_bytes.len());
             let mut first_chunk_bytes: Vec<u8> =
                 req_and_data_bytes.drain(0..first_chunk_size).collect();
             let mut subsequent_chunks: Vec<SyncData> = vec![];
@@ -347,23 +347,23 @@ impl SyncMessage {
                 } else {
                     bytes_count
                 };
-                eprintln!(
-                    "before drain, rem {} bytes from {} remaining",
-                    drain_count,
-                    req_and_data_bytes.len()
-                );
+                // eprintln!(
+                //     "before drain, rem {} bytes from {} remaining",
+                //     drain_count,
+                //     req_and_data_bytes.len()
+                // );
                 vec.append(&mut req_and_data_bytes.drain(0..drain_count).collect());
                 let data = SyncData::new(vec).unwrap();
                 let hash = data.hash();
                 for byte in hash.to_be_bytes() {
                     header_bytes.push(byte);
                 }
-                eprintln!("Pushing {} bytes", data.len());
+                // eprintln!("Pushing {} bytes", data.len());
                 subsequent_chunks.push(data);
             }
             header_bytes.append(&mut first_chunk_bytes);
             let header_data = SyncData::new(header_bytes).unwrap();
-            eprintln!("Pushing {} header bytes", header_data.len());
+            // eprintln!("Pushing {} header bytes", header_data.len());
             partials.push(header_data);
             partials.append(&mut subsequent_chunks);
         }
@@ -373,9 +373,9 @@ impl SyncMessage {
 
     // TODO: this needs rework
     pub fn from_data(idx: Vec<u64>, mut vec_data: HashMap<u64, Data>) -> Result<Self, ()> {
-        for (idx, data) in &vec_data {
-            eprintln!("{} size {} bytes", idx, data.len());
-        }
+        // for (idx, data) in &vec_data {
+        //     eprintln!("{} size {} bytes", idx, data.len());
+        // }
         let idx_len = idx.len();
         if idx.len() != vec_data.len() {
             return Err(());
@@ -385,11 +385,11 @@ impl SyncMessage {
         let key = idx_iter.next().unwrap();
         let p_data = vec_data.remove(&key).unwrap();
         let mut header_bytes = p_data.bytes();
-        eprintln!("after remove header len: {}", header_bytes.len());
+        // eprintln!("after remove header len: {}", header_bytes.len());
         let m_type = SyncMessageType::new(&mut header_bytes);
         // drop part_no & total_parts
         let _ = header_bytes.drain(0..2);
-        eprintln!("after remove part/total len: {}", header_bytes.len());
+        // eprintln!("after remove part/total len: {}", header_bytes.len());
 
         let mut non_header_bytes = Vec::with_capacity((idx_len - 1) * 1021);
         for hash in idx_iter {
@@ -465,10 +465,10 @@ impl SyncMessage {
 
         // }
         let bytes: Vec<u8> = bytes_iter.collect();
-        eprintln!("m_type: {:?}", m_type);
-        eprintln!("pre_req: {:?}", requirements.pre);
-        eprintln!("post_req: {:?}", requirements.post);
-        eprintln!("Bytes size: {}", bytes.len());
+        // eprintln!("m_type: {:?}", m_type);
+        // eprintln!("pre_req: {:?}", requirements.pre);
+        // eprintln!("post_req: {:?}", requirements.post);
+        // eprintln!("Bytes size: {}", bytes.len());
         let data = Data::new(bytes).unwrap();
         Ok(SyncMessage {
             m_type,

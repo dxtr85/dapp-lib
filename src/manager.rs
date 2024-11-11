@@ -39,11 +39,11 @@ impl ApplicationManager {
             self.gnome_to_swarm.keys(),
             g_id
         );
-        for key in self.gnome_to_swarm.keys() {
-            if let Some(value) = self.gnome_to_swarm.get(&key) {
-                eprintln!("K: {:?} - V: {:?}", key, value);
-            }
-        }
+        // for key in self.gnome_to_swarm.keys() {
+        //     if let Some(value) = self.gnome_to_swarm.get(&key) {
+        //         eprintln!("K: {:?} - V: {:?}", key, value);
+        //     }
+        // }
         if let Some(s_id) = self.gnome_to_swarm.get(g_id) {
             if let Some(sender) = self.app_data_store.get(s_id) {
                 self.active_app_data = sender.clone();
