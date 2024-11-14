@@ -29,16 +29,16 @@ impl ApplicationManager {
             if swarm_id != s_id {
                 self.gnome_to_swarm.insert(GnomeId::any(), swarm_id);
             } else {
-                eprintln!("Removed generic gnome to swarm mapping from AppMgr");
+                // eprintln!("Removed generic gnome to swarm mapping from AppMgr");
             }
         }
     }
     pub fn set_active(&mut self, g_id: &GnomeId) -> Result<SwarmID, ()> {
-        eprintln!(
-            "Known gnomes: {:?}, searching for: {:?}",
-            self.gnome_to_swarm.keys(),
-            g_id
-        );
+        // eprintln!(
+        //     "Known gnomes: {:?}, searching for: {:?}",
+        //     self.gnome_to_swarm.keys(),
+        //     g_id
+        // );
         // for key in self.gnome_to_swarm.keys() {
         //     if let Some(value) = self.gnome_to_swarm.get(&key) {
         //         eprintln!("K: {:?} - V: {:?}", key, value);

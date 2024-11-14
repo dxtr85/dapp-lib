@@ -829,12 +829,12 @@ async fn serve_app_data(
                             let (recv_id, recv_hash) = requirements.post[0];
                             if recv_id == next_id && recv_hash == content.hash() {
                                 let d_type = content.data_type();
-                                let res = app_data.append(content);
-                                eprintln!("Content added: {:?}", res);
+                                let _res = app_data.append(content);
+                                // eprintln!("Content added: {:?}", res);
                                 let hash = app_data.root_hash();
                                 eprintln!("Sending updated hash: {}", hash);
-                                let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
-                                eprintln!("Send res: {:?}", res);
+                                let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
+                                // eprintln!("Send res: {:?}", res);
                                 let _to_mgr_res = to_app_mgr_send
                                     .send(ToAppMgr::ContentAdded(swarm_id, recv_id, d_type));
                             } else {
@@ -869,7 +869,7 @@ async fn serve_app_data(
                                 let hash = app_data.root_hash();
                                 eprintln!("Sending updated hash: {}", hash);
                                 let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
-                                eprintln!("Send res: {:?}", res);
+                                // eprintln!("Send res: {:?}", res);
                                 eprintln!("ChangeContent completed successfully ({})", hash);
                             }
                         } else {
@@ -917,7 +917,7 @@ async fn serve_app_data(
                                 let hash = app_data.root_hash();
                                 eprintln!("Sending updated hash: {}", hash);
                                 let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
-                                eprintln!("Send res: {:?}", res);
+                                // eprintln!("Send res: {:?}", res);
                                 eprintln!(
                                     "Data shells appended successfully ({}, added: {})",
                                     hash, added_count
@@ -948,8 +948,8 @@ async fn serve_app_data(
                             } else {
                                 let hash = app_data.root_hash();
                                 eprintln!("Sending updated hash: {}", hash);
-                                let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
-                                eprintln!("Send res: {:?}", res);
+                                let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
+                                // eprintln!("Send res: {:?}", res);
                                 eprintln!("Data appended successfully ({})", hash);
                             }
                         }
@@ -994,8 +994,8 @@ async fn serve_app_data(
                             } else {
                                 let hash = app_data.root_hash();
                                 eprintln!("Sending updated hash: {}", hash);
-                                let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
-                                eprintln!("Send res: {:?}", res);
+                                let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
+                                // eprintln!("Send res: {:?}", res);
                                 eprintln!("Data updated successfully ({})", hash);
                             }
                         }
@@ -1574,7 +1574,7 @@ async fn serve_swarm(
             // println!("SUR: {:?}", resp);
             match resp {
                 GnomeToApp::AppDataSynced(synced) => {
-                    eprintln!("Gnome says if synced: {}", synced);
+                    // eprintln!("Gnome says if synced: {}", synced);
                     let _ = to_app_data_send
                         .send(ToAppData::AppDataSynced(synced))
                         .await;
@@ -1857,16 +1857,16 @@ impl ApplicationData {
         let total_parts = bytes.drain(0..1).next().unwrap();
         drained_bytes.push(part_no);
         drained_bytes.push(total_parts);
-        eprintln!(
-            "Process SyncData {:?} [{}/{}] {} bytes",
-            m_type, part_no, total_parts, d_len,
-        );
+        // eprintln!(
+        //     "Process SyncData {:?} [{}/{}] {} bytes",
+        //     m_type, part_no, total_parts, d_len,
+        // );
         if part_no == 0 {
             if total_parts == 0 {
                 let mut hm = HashMap::new();
                 drained_bytes.append(&mut bytes);
                 hm.insert(0, Data::new(drained_bytes).unwrap());
-                eprintln!("one");
+                // eprintln!("one");
                 Some(SyncMessage::from_data(vec![0], hm).unwrap())
             } else {
                 let mut next_idx = 0;
@@ -1892,7 +1892,7 @@ impl ApplicationData {
                 let mut new_hm = HashMap::new();
                 drained_bytes.append(&mut bytes);
                 let data = Data::new(drained_bytes).unwrap();
-                eprintln!("Inserting data len: {}", data.len());
+                // eprintln!("Inserting data len: {}", data.len());
                 new_hm.insert(0, data);
                 self.partial_data.insert(next_idx, (all_hashes, new_hm));
                 None
@@ -1902,7 +1902,7 @@ impl ApplicationData {
             drained_bytes.append(&mut bytes);
             let data = Data::new(drained_bytes).unwrap();
             let hash = data.get_hash();
-            eprintln!("Got hash: {}", hash);
+            // eprintln!("Got hash: {}", hash);
             if let Some(temp_idx) = self.hash_to_temp_idx.get(&hash) {
                 // println!("Oh yeah");
                 if let Some((vec, mut hm)) = self.partial_data.remove(temp_idx) {
@@ -1910,7 +1910,7 @@ impl ApplicationData {
                     hm.insert(hash, data);
                     // println!("{} ==? {}", vec.len(), hm.len());
                     if vec.len() == hm.len() {
-                        eprintln!("two");
+                        // eprintln!("two");
                         Some(SyncMessage::from_data(vec, hm).unwrap())
                     } else {
                         self.partial_data.insert(*temp_idx, (vec, hm));
