@@ -14,6 +14,7 @@ mod message;
 mod registry;
 mod sync_message;
 use app_type::AppType;
+use async_std::net::ToSocketAddrs;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use sync_message::deserialize_requests;
@@ -69,6 +70,7 @@ pub enum ToApp {
     ActiveSwarm(GnomeId, SwarmID), //TODO: also send Vec<Data> from CID=0(Manifest)
     Neighbors(SwarmID, Vec<GnomeId>),
     NewContent(SwarmID, ContentID, DataType),
+    ContentChanged(SwarmID, ContentID),
     ReadSuccess(SwarmID, ContentID, Vec<Data>),
     ReadError(SwarmID, ContentID, AppError),
     Disconnected,
@@ -90,6 +92,7 @@ pub enum ToAppMgr {
     AppendContent(SwarmID, DataType, Data),
     // AppendShelledDatas(SwarmID, ContentID, Data),
     ContentAdded(SwarmID, ContentID, DataType),
+    ContentChanged(SwarmID, ContentID),
     TransformLinkRequest(Box<SyncData>),
     Quit,
 }
@@ -110,6 +113,7 @@ pub enum ToAppData {
     ChangeContent(ContentID, DataType, Vec<Data>),
     UpdateData(ContentID, u16, Data),
     AppendContent(DataType, Data),
+    AppendData(ContentID, Data),
     AppendShelledDatas(ContentID, Data, Vec<Data>),
     CustomRequest(u8, GnomeId, CastData),
     CustomResponse(u8, GnomeId, CastData),
@@ -305,7 +309,10 @@ async fn serve_gnome_manager(
                 }
                 ToAppMgr::ChangeContent(s_id, c_id, d_type, data_vec) => {
                     // TODO: make sure we are sending this to correct swarm!
-                    eprintln!("app mgr received CC request, sending to app data");
+                    // eprintln!("app mgr received CC request, sending to app data");
+                    // for data in &data_vec {
+                    //     eprintln!("h:{}, d: {:?}", data.get_hash(), data);
+                    // }
                     let _ = app_mgr
                         .active_app_data
                         .send(ToAppData::ChangeContent(c_id, d_type, data_vec))
@@ -332,6 +339,10 @@ async fn serve_gnome_manager(
                 ToAppMgr::ContentAdded(s_id, c_id, d_type) => {
                     eprintln!("ToApp::NewContent({:?},{:?})", c_id, d_type);
                     let _ = to_user.send(ToApp::NewContent(s_id, c_id, d_type));
+                }
+                ToAppMgr::ContentChanged(s_id, c_id) => {
+                    eprintln!("ToApp::ContentChanged({:?})", c_id,);
+                    let _ = to_user.send(ToApp::ContentChanged(s_id, c_id));
                 }
                 ToAppMgr::Quit => {
                     // eprintln!("AppMgr received Quit");
@@ -487,114 +498,395 @@ async fn serve_app_data(
                     next_val += 1;
                 }
             }
-            ToAppData::ChangeContent(c_id, d_type, data_vec) => {
+            ToAppData::AppendData(c_id, data) => {
+                let pre_hash = app_data.content_root_hash(c_id).unwrap();
+                let pre: Vec<(ContentID, u64)> = vec![(c_id, pre_hash.1)];
+                let append_result = app_data.append_data(c_id, data);
+                let post: Vec<(ContentID, u64)> = vec![(c_id, append_result.unwrap())];
+                let data = app_data.pop_data(c_id).unwrap();
+                //TODO: we push this 0 to inform Content::from that we are dealing
+                // Not with a Content::Link, which is 255 but with Content::Data,
+                // whose DataType = 0
+                // We should probably send this in SyncMessage header instead
+                // let mut bytes = vec![0];
+                // bytes.append(&mut data.bytes());
+                // let data = Data::new(bytes).unwrap();
+                let reqs = SyncRequirements { pre, post };
+                let msg = SyncMessage::new(SyncMessageType::AppendData(c_id), reqs, data);
+                let parts = msg.into_parts();
+                for part in parts {
+                    let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                }
+            }
+            // A local request from application to synchronize with swarm
+            ToAppData::UpdateData(c_id, d_id, data) => {
+                //TODO:serve this
                 eprintln!(
-                    "app data received CC request… for {} with {} data blocks",
+                    "Got ToAppData::UpdateData({}, {}, Dlen: {})",
                     c_id,
-                    data_vec.len()
+                    d_id,
+                    data.len()
                 );
+                let pre_hash = app_data.content_root_hash(c_id).unwrap();
+                let pre: Vec<(ContentID, u64)> = vec![(c_id, pre_hash.1)];
+                let prev_data = app_data
+                    .update_data(c_id, d_id, Data::empty(data.get_hash()))
+                    .unwrap();
+                let post_hash = app_data.content_root_hash(c_id).unwrap();
+                let post: Vec<(ContentID, u64)> = vec![(c_id, post_hash.1)];
+                let _res = app_data.update_data(c_id, d_id, prev_data);
+                let reqs = SyncRequirements { pre, post };
+                let msg = SyncMessage::new(SyncMessageType::UpdateData(c_id, d_id), reqs, data);
+                let parts = msg.into_parts();
+                for part in parts {
+                    let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                }
+            }
+            // A local request from application to synchronize with swarm
+            ToAppData::ChangeContent(c_id, d_type, data_vec) => {
+                let (curr_d_type, curr_content_len) = app_data.get_type_and_len(c_id).unwrap();
+                let curr_hash = app_data.content_root_hash(c_id).unwrap();
+                if curr_d_type == DataType::Link && curr_content_len > 0 {
+                    // if let Ok(_hashes) = app_data.read_link_ti_data(c_id, 0, curr_d_type) {
+                    eprintln!("We can not change a link with TransformInfo");
+                    continue;
+                    // }
+                } else if curr_d_type != d_type {
+                    eprintln!("We can not change content to different DataType");
+                    continue;
+                }
+                // Step #1: We take hashes of provided Data from data_vec
+                // There can be up to 65536 of 8-byte hashes so those can fill
+                // up to 512 of 1024-byte Data blocks.
+                let data_count = data_vec.len();
+                let mut bottom_hashes_as_data_blocks = Vec::with_capacity((data_count >> 7) + 1);
+                let mut hash_hash_data = Vec::with_capacity(4);
+                let mut bottom_hashes = Vec::with_capacity(data_count);
                 for data in &data_vec {
-                    eprintln!("Hash of data to add: {:?}", data.get_hash().to_be_bytes());
+                    bottom_hashes.push(data.get_hash());
                 }
-                let pre_hash_result = app_data.content_root_hash(c_id);
-                let existing_data = app_data.get_all_data(0).unwrap();
-                for data in existing_data {
-                    eprintln!(
-                        "Hash of existing data (len: {}): {:?}",
-                        data.len(),
-                        data.get_hash().to_be_bytes()
-                    );
-                }
-                // OK, so in order to apply multiple changes we need to:
-                // - verify if d_type allows for this change
-                if let Ok((existing_d_type, pre_hash)) = pre_hash_result {
-                    if existing_d_type == DataType::Link {
-                        if let Ok(hashes) = app_data.get_all_transform_info_hashes(c_id, d_type) {
-                            eprintln!("We can not change a link with TransformInfo");
-                            continue;
-                        }
-                    } else if existing_d_type != d_type {
-                        eprintln!("We can not change content to different DataType");
-                        continue;
-                    }
-                    // - make sure there is multiple data blocks that need to change
-                    //   and not just one, or even zero
-                    let existing_hashes = app_data.content_bottom_hashes(c_id).unwrap();
-                    let mut new_hashes = Vec::with_capacity(data_vec.len());
-                    for data in &data_vec {
-                        new_hashes.push(data.get_hash());
-                    }
-                    let existing_len = existing_hashes.len();
-                    let new_len = new_hashes.len();
-                    let mut diff_indices = vec![];
-                    let mut append_indices = vec![];
-                    let mut shrink_indices = vec![];
-                    if existing_len <= new_len {
-                        eprintln!("existing <= new");
-                        for i in 0..existing_len {
-                            if existing_hashes[i] != new_hashes[i] {
-                                diff_indices.push(i);
-                            }
-                        }
-                        for i in existing_len..new_len {
-                            append_indices.push(i);
-                        }
-                    } else {
-                        eprintln!("existing > new");
-                        //We are shrinking content
-                        for i in new_len..existing_len {
-                            shrink_indices.push(i);
-                        }
-                        for i in 0..new_len {
-                            if existing_hashes[i] != new_hashes[i] {
-                                diff_indices.push(i);
+                // TODO: check if only a single Data block has changed
+                let existing_hashes = app_data.content_bottom_hashes(c_id).unwrap();
+                let ex_len = existing_hashes.len();
+                if ex_len == data_count {
+                    let mut only_difference: Option<u16> = None;
+                    for i in 0..data_count {
+                        if bottom_hashes[i] != existing_hashes[i] {
+                            if only_difference.is_some() {
+                                only_difference = None;
+                                break;
+                            } else {
+                                only_difference = Some(i as u16);
                             }
                         }
                     }
-                    //TODO: send request to pop shrinking data blocks
-                    // TODO: this can be a 3-step procedure on a swarm,
-                    // and other users might perform changes in between those
-                    // steps, so it is not guaranteed to succeed completely.
-                    // Probably we should find a better way
-                    // Maybe enqueue subsequent changes from diff_indices?
-                    if !shrink_indices.is_empty() {
-                        eprintln!("We should pop some Data blocks from CID: {}", c_id);
-                        //TODO: new we need to update pre_hash for subsequent requests
-                    } else if new_len - existing_len > 1 {
-                        //TODO: send request to reserve new data blocks
-                        eprintln!("We should reserve some new Data blocks for CID: {}", c_id);
-                        //TODO: new we need to update pre_hash for subsequent requests
-                        let mut new_hashes = vec![];
-                        let mut new_datas = vec![];
-                        for idx in &append_indices {
-                            new_datas.push(data_vec[*idx].clone());
-                        }
-                        for index in &append_indices {
-                            for byte in data_vec[*index].get_hash().to_be_bytes() {
-                                new_hashes.push(byte);
-                            }
-                        }
+                    if let Some(d_id) = only_difference {
+                        eprintln!("Transforming ChangeContent -> UpdateData");
                         let _ = app_data_send
-                            .send(ToAppData::AppendShelledDatas(
+                            .send(ToAppData::UpdateData(
                                 c_id,
-                                Data::new(new_hashes).unwrap(),
-                                new_datas,
+                                d_id,
+                                data_vec[d_id as usize].clone(),
                             ))
                             .await;
-                    }
-
-                    //TODO: for every changed block apply changes one by one
-                    for index in diff_indices {
-                        eprintln!("we should do something with idx: {}", index);
-                        // let reqs = SyncRequirements { pre: vec![(c_id, post)], post:  }
-                        // let msg =
-                        //     SyncMessage::new(SyncMessageType::UpdateData(c_id, index), reqs, data);
-                        // let parts = msg.into_parts();
-                        // for part in parts {
-                        //     let _ = to_gnome_sender.send(ToGnome::AddData(part));
-                        // }
+                        continue;
                     }
                 }
+                // TODO: there can also be a case where a single data has been inserted
+                // and all other data stays the same
+                // TODO: there can also be a case where a single data has been removed
+                // and all other data stays the same
+                // eprintln!("bottom hashes: {:?}", bottom_hashes);
+                // eprintln!("pre root hash: {}", get_root_hash(&bottom_hashes));
+                let bottom_chunks = bottom_hashes.chunks_exact(128);
+                let bottom_remainder = bottom_chunks.remainder();
+                for chunk in bottom_chunks {
+                    let mut bytes = Vec::with_capacity(1024);
+                    for hash in chunk {
+                        for byte in hash.to_be_bytes() {
+                            bytes.push(byte);
+                        }
+                    }
+                    bottom_hashes_as_data_blocks.push(Data::new(bytes).unwrap());
+                }
+                if !bottom_remainder.is_empty() {
+                    let mut bytes = Vec::with_capacity(1024);
+                    for hash in bottom_remainder {
+                        for byte in hash.to_be_bytes() {
+                            bytes.push(byte);
+                        }
+                    }
+                    bottom_hashes_as_data_blocks.push(Data::new(bytes).unwrap());
+                }
+
+                // If data_count <= 128 we can immediately update entire Content,
+                // by sending a SyncMessage with all the hashes of new Data.
+                // So in this case we go directly to Step #4, skipping Steps #2 and #3.
+                //
+                //
+                // Step #2: If data_count > 128 Data blocks we need to make second
+                // round for taking hashes from resulting HashData blocks
+                //  - now there can be up to 4 new HashHashData blocks.
+                if data_count > 128 {
+                    panic!("THIS IS NOT FULLY IMPLEMENTED!!!");
+                    let hash_hash_chunks = bottom_hashes_as_data_blocks.chunks_exact(128);
+                    let hash_hash_remainder = hash_hash_chunks.remainder();
+
+                    for chunk in hash_hash_chunks {
+                        let mut bytes = Vec::with_capacity(1024);
+                        for data in chunk {
+                            for byte in data.get_hash().to_be_bytes() {
+                                bytes.push(byte);
+                            }
+                        }
+                        hash_hash_data.push(Data::new(bytes).unwrap());
+                    }
+                    if !hash_hash_remainder.is_empty() {
+                        let mut bytes = Vec::with_capacity(1024);
+                        for data in hash_hash_remainder {
+                            for byte in data.get_hash().to_be_bytes() {
+                                bytes.push(byte);
+                            }
+                        }
+                        hash_hash_data.push(Data::new(bytes).unwrap());
+                    }
+                    //
+                    //
+                    // Step #3: If we needed two rounds to fit hashes into single SyncMessage the
+                    // procedure has to be more complicated.
+                    // There can be two scenarios that can happen here:
+                    // 1. We have enough data_ids available to hold all Data blocks from
+                    // first round of counting hashes (up to 512 new Data blocks);
+                    // 2. we do not have enough data_ids.
+                    let available_data_ids = u16::MAX - curr_content_len;
+                    if available_data_ids > data_count as u16 {
+                        //
+                        // Scenario 1:
+                        // We send a SyncMessage requesting to append multiple Datas to current
+                        // CID with provided list of hashes - here we change root hash of
+                        // our Content.
+                        // Then we send multiple Updates with actual HashHashData corresponding
+                        // to hashes from AppendMultipleDatas SyncMessage.
+                        // Next we send one more SyncMessage that requests to
+                        // pop all recently appended HashHashDatas (there can only be up to 4 of those)
+                        // use their contents as HashData hashes and once again expand CID with as many
+                        // Data::empty(hash) as needed.
+                        // This action is a second change of Content root hash.
+                        // Now we need to fill those appended Data::empty(hash) slots with actual data.
+                        // This Data blocks contain all of the bottom hashes of our Content ID.
+                        //
+                    } else {
+                        // Scenario 2:
+                        // Here we need to first make enough room for as many new Data blocks as needed
+                        // (changing Content's root hash) and then proceed with scenario 1.
+                        // This Data removal can be done in a brute-force way by just removing
+                        // last N Data blocks,
+                        // or in a more sophisticated way removing selected data_ids starting from
+                        // data_ids with greatest value and moving down.
+                        // One SyncMessage is enough for both scenarios so second one is preffered.
+                    }
+                    //
+                    // So Step #3 requires at least two additional changes to Content root hash.
+                    // But right now we do not have any mechanism preventing other Data changes
+                    // in between. If there are any and we have precalculated pre- and post- hashes
+                    // then those values become obsolete and entire procedure fails with some
+                    // invalid Data blocks somewhere in ContentTree.
+                    // On the other hand if we calculate every pre- and post- hash just before
+                    // sending a SyncMessage those other changes that happened in between will get
+                    // wiped out.
+                    // So for now it is recommended to first make sure that there is no other
+                    // change being submitted to given swarm that modifies given Content
+                    // that is undergoing extended change content process.
+                    // A solution involving a Reconfigure message comes to mind but for now
+                    // this entire procedure is complicated enough to give one a headache.
+
+                    //TODO: implement above
+                } else {
+                    //
+                    //
+                    // Step #4: A SyncMessage requesting change of entire Content is issued.
+                    // In this step Content root hash is updated with final hash value.
+                    // We move all existing Data blocks aside into a HashMap<Hash, Data>
+                    // and starting from scratch push Data::empty(hash) one by one into CID.
+                    // If there happens to be a match for given hash in a hashmap we've just
+                    // created we take that Data and put it in place.
+                    //
+                    // Additionally we can send all remaining Data blocks in an UpdateData
+                    // sync message that does not change Content's root hash.
+                    //
+                    // All of above means entire Swarm is always synchronized,
+                    // so even if a Gnome joins in the middle of this procedure,
+                    //  he will stay synced (will just need to ask his Neighbors for
+                    // Data to catch up).
+                    // TODO: implement above
+                    let new_hash = get_root_hash(&bottom_hashes);
+                    // eprintln!("New hash: {}", new_hash);
+                    let reqs = SyncRequirements {
+                        pre: vec![(c_id, curr_hash.1)],
+                        post: vec![(c_id, new_hash)],
+                    };
+                    let msg = SyncMessage::new(
+                        SyncMessageType::ChangeContent(d_type, c_id),
+                        reqs,
+                        bottom_hashes_as_data_blocks[0].clone(),
+                    );
+                    let parts = msg.into_parts();
+                    for part in parts {
+                        let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                    }
+
+                    //TODO: now we need to send actual Data as well
+                    // TODO: we should only send Data blocks that did not exist before CC
+                    let reqs = SyncRequirements {
+                        pre: vec![(c_id, new_hash)],
+                        post: vec![(c_id, new_hash)],
+                    };
+                    let existing_bottom_hashes = app_data.content_bottom_hashes(c_id).unwrap();
+                    for (d_id, data) in data_vec.iter().enumerate() {
+                        if existing_bottom_hashes.contains(&data.get_hash()) {
+                            eprintln!("Not sending Page {}-{} as it was not changed", c_id, d_id);
+                            continue;
+                        }
+                        let msg = SyncMessage::new(
+                            SyncMessageType::UpdateData(c_id, d_id as u16),
+                            reqs.clone(),
+                            data.clone(),
+                        );
+                        let parts = msg.into_parts();
+                        for part in parts {
+                            let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                        }
+                    }
+                }
+                //
+                //
+                // Following is old solution
+                // eprintln!(
+                //     "app data received CC request… for {} with {} data blocks",
+                //     c_id,
+                //     data_vec.len()
+                // );
+                // let mut content_to_work_on = app_data.clone_content(c_id).unwrap();
+                // for data in &data_vec {
+                //     eprintln!("Hash of data to add: {:?}", data.get_hash().to_be_bytes());
+                // }
+                // let pre_hash = content_to_work_on.hash();
+                // let existing_d_type = content_to_work_on.data_type();
+                // // OK, so in order to apply multiple changes we need to:
+                // // - verify if d_type allows for this change
+                // if existing_d_type == DataType::Link {
+                //     if let Ok(_hashes) = content_to_work_on.link_ti_hashes() {
+                //         eprintln!("We can not change a link with TransformInfo");
+                //         continue;
+                //     }
+                // } else if existing_d_type != d_type {
+                //     eprintln!("We can not change content to different DataType");
+                //     continue;
+                // }
+                // // - make sure there is multiple data blocks that need to change
+                // //   and not just one, or even zero
+                // let existing_hashes = content_to_work_on.data_hashes();
+                // let mut new_hashes = Vec::with_capacity(data_vec.len());
+                // for data in &data_vec {
+                //     new_hashes.push(data.get_hash());
+                // }
+                // let existing_len = existing_hashes.len();
+                // let new_len = new_hashes.len();
+                // let mut diff_indices = vec![];
+                // let mut append_indices = vec![];
+                // let mut shrink_indices = vec![];
+                // if existing_len <= new_len {
+                //     eprintln!("existing <= new");
+                //     for i in 0..existing_len {
+                //         if existing_hashes[i] != new_hashes[i] {
+                //             diff_indices.push(i);
+                //         }
+                //     }
+                //     for i in existing_len..new_len {
+                //         append_indices.push(i);
+                //     }
+                // } else {
+                //     eprintln!("existing > new");
+                //     //We are shrinking content
+                //     for i in new_len..existing_len {
+                //         shrink_indices.push(i);
+                //     }
+                //     for i in 0..new_len {
+                //         if existing_hashes[i] != new_hashes[i] {
+                //             diff_indices.push(i);
+                //         }
+                //     }
+                // }
+                // //TODO: send request to pop shrinking data blocks
+                // // TODO: this can be a 3-step procedure on a swarm,
+                // // and other users might perform changes in between those
+                // // steps, so it is not guaranteed to succeed completely.
+                // // Probably we should find a better way
+                // // Maybe enqueue subsequent changes from diff_indices?
+                // if !shrink_indices.is_empty() {
+                //     eprintln!("We should pop some Data blocks from CID: {}", c_id);
+                //     //TODO: new we need to update pre_hash for subsequent requests
+                // } else if new_len - existing_len > 1 {
+                //     //TODO: send request to reserve new data blocks
+                //     eprintln!("We should reserve some new Data blocks for CID: {}", c_id);
+                //     //TODO: new we need to update pre_hash for subsequent requests
+                //     let mut new_hashes = vec![];
+                //     let mut new_datas = vec![];
+                //     for idx in &append_indices {
+                //         new_datas.push(data_vec[*idx].clone());
+                //     }
+                //     for index in &append_indices {
+                //         for byte in data_vec[*index].get_hash().to_be_bytes() {
+                //             new_hashes.push(byte);
+                //         }
+                //     }
+                //     let _ = app_data_send
+                //         .send(ToAppData::AppendShelledDatas(
+                //             c_id,
+                //             Data::new(new_hashes).unwrap(),
+                //             new_datas,
+                //         ))
+                //         .await;
+                // } else if new_len - existing_len == 1 {
+                //     eprintln!(
+                //         "New len {} - existing len {} = {}",
+                //         new_len,
+                //         existing_len,
+                //         new_len - existing_len
+                //     );
+                //     eprintln!("Append indices: {:?}", append_indices);
+                //     let _ = app_data_send
+                //         .send(ToAppData::AppendData(
+                //             c_id,
+                //             data_vec[append_indices[0]].clone(),
+                //         ))
+                //         .await;
+                // }
+
+                // //TODO: for every changed block apply changes one by one
+                // // We assume no data was appended nor removed!!!
+                // for index in diff_indices {
+                //     eprintln!("we should do something with idx: {}", index);
+                //     let hash_bundle = app_data.content_root_hash(c_id).unwrap();
+                //     let old_data = app_data
+                //         .update_data(c_id, index as u16, data_vec[index].clone())
+                //         .unwrap();
+                //     let new_hash_bundle = app_data.content_root_hash(c_id).unwrap();
+                //     let reqs = SyncRequirements {
+                //         pre: vec![(c_id, hash_bundle.1)],
+                //         post: vec![(c_id, new_hash_bundle.1)],
+                //     };
+                //     let _data = app_data.update_data(c_id, index as u16, old_data);
+                //     let msg = SyncMessage::new(
+                //         SyncMessageType::UpdateData(c_id, index as u16),
+                //         reqs,
+                //         data_vec[index].clone(),
+                //     );
+                //     let parts = msg.into_parts();
+                //     for part in parts {
+                //         let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                //     }
+                // }
             }
             ToAppData::ListNeighbors => {
                 let _ = to_gnome_sender.send(ToGnome::ListNeighbors);
@@ -858,18 +1150,60 @@ async fn serve_app_data(
                             eprintln!("PRE validation failed for ChangeContent");
                             continue;
                         }
-                        let content = Content::from(d_type, data).unwrap();
-                        let res = app_data.update(c_id, content);
-                        if let Ok(old_content) = res {
+                        //TODO: take 8-byte hashes from data and push Data::empty(hash)
+                        // to new Content
+                        let bytes = data.bytes();
+                        let mut byte_groups_iter = bytes.chunks_exact(8);
+                        let new_data_len = byte_groups_iter.len() as u16;
+                        let first_hash = u64::from_be_bytes(
+                            byte_groups_iter.next().unwrap().try_into().unwrap(),
+                        );
+                        let mut new_hashes = vec![first_hash];
+                        // eprintln!("New content\n{}", first_hash);
+                        let mut new_content =
+                            Content::from(d_type, Data::empty(first_hash)).unwrap();
+                        // eprintln!("New content hash: {}", new_content.hash());
+                        while let Some(bytes_group) = byte_groups_iter.next() {
+                            let hash = u64::from_be_bytes(bytes_group.try_into().unwrap());
+                            // eprintln!("push: {}", hash);
+                            let _ = new_content.push_data(Data::empty(hash));
+                            new_hashes.push(hash);
+                            // let d_hashes = new_content.data_hashes();
+                            // for d_hash in d_hashes {
+                            // eprintln!("NCDH: {:?}", d_hashes);
+                            // }
+                            // eprintln!("New content hash: {}", new_content.hash());
+                        }
+                        // let d_hashes = new_content.data_hashes();
+                        // for d_hash in d_hashes {
+                        // eprintln!("Final NCDH: {:?}", d_hashes);
+                        // }
+                        let res = app_data.update(c_id, new_content);
+                        if let Ok(mut old_content) = res {
                             if !requirements.post_validate(c_id, &app_data) {
                                 let restore_res = app_data.update(c_id, old_content);
                                 eprintln!("POST validation failed on ChangeContent");
                                 eprintln!("Restore result: {:?}", restore_res);
                             } else {
+                                //TODO: insert any old Data with same hash into new content
+                                let mut old_data =
+                                    HashMap::with_capacity(old_content.len() as usize);
+                                while let Ok(data) = old_content.pop_data() {
+                                    old_data.insert(data.get_hash(), data);
+                                }
+                                for (d_id, hash) in new_hashes.iter().enumerate() {
+                                    if let Some(data) = old_data.remove(&hash) {
+                                        eprintln!(
+                                            "Restoring Page {}-{} from existing data",
+                                            c_id, d_id
+                                        );
+                                        let _ = app_data.update_data(c_id, d_id as u16, data);
+                                    }
+                                }
+                                let _to_mgr_res =
+                                    to_app_mgr_send.send(ToAppMgr::ContentChanged(swarm_id, c_id));
                                 let hash = app_data.root_hash();
-                                eprintln!("Sending updated hash: {}", hash);
-                                let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
-                                // eprintln!("Send res: {:?}", res);
+                                let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
                                 eprintln!("ChangeContent completed successfully ({})", hash);
                             }
                         } else {
@@ -976,7 +1310,13 @@ async fn serve_app_data(
                     }
                     SyncMessageType::UpdateData(c_id, d_id) => {
                         //TODO
-                        eprintln!("SyncMessageType::UpdateData ");
+                        eprintln!("SyncMessageType::UpdateData {}-{}", c_id, d_id);
+                        let (_t, len) = app_data.get_type_and_len(c_id).unwrap();
+                        // eprintln!("Len: {}", len);
+                        // let bot_hashes = app_data.content_bottom_hashes(c_id).unwrap();
+                        // for bot in bot_hashes {
+                        //     eprintln!("hash: {}", bot);
+                        // }
                         if !requirements.pre_validate(c_id, &app_data) {
                             eprintln!("PRE validation failed for UpdateData");
                             continue;
@@ -984,6 +1324,11 @@ async fn serve_app_data(
                         // TODO
                         // let (_t, len) = app_data.get_type_and_len(c_id).unwrap();
                         // eprintln!("Before update len: {}", len);
+                        // eprintln!("all current hashes: {}", c_id);
+                        // let bottoms = app_data.get_all_page_hashes(c_id).unwrap();
+                        // for bot in bottoms {
+                        //     eprintln!("hash2: {}", bot);
+                        // }
                         let res = app_data.update_data(c_id, d_id, data);
                         if let Ok(updated_data) = res {
                             if !requirements.post_validate(c_id, &app_data) {
@@ -993,11 +1338,15 @@ async fn serve_app_data(
                                 eprintln!("Restore result: {:?}", res);
                             } else {
                                 let hash = app_data.root_hash();
-                                eprintln!("Sending updated hash: {}", hash);
+                                // eprintln!("Sending updated hash: {}", hash);
                                 let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
                                 // eprintln!("Send res: {:?}", res);
                                 eprintln!("Data updated successfully ({})", hash);
+                                let _to_mgr_res =
+                                    to_app_mgr_send.send(ToAppMgr::ContentChanged(swarm_id, c_id));
                             }
+                        } else {
+                            eprintln!("UpdateData failed: {}", res.err().unwrap());
                         }
                     }
                     SyncMessageType::InsertData(c_id, d_id) => {
@@ -1038,13 +1387,38 @@ async fn serve_app_data(
                         let sync_requests = deserialize_requests(cast_data.bytes());
                         // println!("Sync Request: {:?}", sync_requests);
                         // println!("Got AppSync inquiry");
+                        // TODO: we have to unconditionally sync partial_data!!!
+                        let sync_type = 0;
+                        let partial_hashes = app_data.get_partial_hashes();
+                        for hdata in partial_hashes.into_iter() {
+                            let sync_response = SyncResponse::Partial(true, hdata);
+                            let _ = to_gnome_sender.send(ToGnome::SendData(
+                                neighbor_id,
+                                NeighborResponse::Custom(
+                                    sync_type,
+                                    CastData::new(sync_response.serialize()).unwrap(),
+                                ),
+                            ));
+                        }
+                        let partial_datas = app_data.get_partial_data();
+                        for hdata in partial_datas.into_iter() {
+                            let sync_response = SyncResponse::Partial(false, hdata);
+                            let _ = to_gnome_sender.send(ToGnome::SendData(
+                                neighbor_id,
+                                NeighborResponse::Custom(
+                                    sync_type,
+                                    CastData::new(sync_response.serialize()).unwrap(),
+                                ),
+                            ));
+                        }
+                        eprintln!("Sent Partial response");
                         let mut sync_req_iter = sync_requests.into_iter();
                         while let Some(req) = sync_req_iter.next() {
                             match req {
                                 SyncRequest::Datastore => {
                                     // TODO: here we should trigger a separate task for sending
                                     // all root hashes to specified Neighbor
-                                    let sync_type = 0;
+                                    // let sync_type = 0;
                                     let hashes = app_data.all_content_typed_root_hashes();
                                     let hashes_len = hashes.len() as u16;
                                     for (part_no, group) in hashes.into_iter().enumerate() {
@@ -1288,6 +1662,9 @@ async fn serve_app_data(
                             //TODO:
                             eprintln!("Deserialized response!: {:?}", response);
                             match response {
+                                SyncResponse::Partial(is_hash_data, data) => {
+                                    app_data.update_partial(is_hash_data, data);
+                                }
                                 SyncResponse::Datastore(part_no, total, hashes) => {
                                     //TODO: we need to cover case where parts come out of order
 
@@ -1478,10 +1855,10 @@ async fn serve_app_data(
             ToAppData::ReadData(c_id) => {
                 //TODO:
                 let (_t, len) = app_data.get_type_and_len(c_id).unwrap();
-                eprintln!("Before read data {} len: {}", c_id, len);
+                // eprintln!("Before read data {} len: {}", c_id, len);
                 let all_data_result = app_data.get_all_data(c_id);
                 if let Ok(data_vec) = all_data_result {
-                    eprintln!("Sending read result with {} data blocks", data_vec.len());
+                    // eprintln!("Sending read result with {} data blocks", data_vec.len());
                     let _ = to_app_mgr_send.send(ToAppMgr::ReadSuccess(swarm_id, c_id, data_vec));
                 } else {
                     let error = all_data_result.err().unwrap();
@@ -1542,15 +1919,6 @@ async fn serve_app_data(
                     let data = a_msg_res.err().unwrap();
                     eprintln!("App Data: {} ", data);
                 }
-            }
-            ToAppData::UpdateData(c_id, index, data) => {
-                //TODO:serve this
-                eprintln!(
-                    "Got ToAppData::UpdateData({}, {}, {})",
-                    c_id,
-                    index,
-                    data.len()
-                );
             }
             ToAppData::Terminate => {
                 eprintln!("Done serving AppData");
@@ -1846,7 +2214,57 @@ impl ApplicationData {
             None
         }
     }
-
+    pub fn update_partial(&mut self, is_hash_data: bool, data: Data) {
+        if is_hash_data {
+            let mut next_idx = 0;
+            for i in 0..=u16::MAX {
+                if !self.partial_data.contains_key(&i) {
+                    next_idx = i;
+                    break;
+                }
+            }
+            let total_parts = data.len() >> 3;
+            let mut all_hashes = Vec::with_capacity(total_parts);
+            let mut bytes = data.clone().bytes();
+            all_hashes.push(0);
+            for _i in 0..total_parts {
+                let mut hash: [u8; 8] = [0; 8];
+                for item in &mut hash {
+                    *item = bytes.drain(0..1).next().unwrap();
+                }
+                let hash = u64::from_be_bytes(hash);
+                eprintln!("Expecting hash: {}", hash);
+                all_hashes.push(hash);
+                self.hash_to_temp_idx.insert(hash, next_idx);
+            }
+            let mut new_hm = HashMap::new();
+            // eprintln!("Inserting data len: {}", data.len());
+            new_hm.insert(0, data);
+            self.partial_data.insert(next_idx, (all_hashes, new_hm));
+        } else {
+            let hash = data.get_hash();
+            // eprintln!("Got hash: {}", hash);
+            if let Some(temp_idx) = self.hash_to_temp_idx.get(&hash) {
+                // println!("Oh yeah");
+                if let Some((vec, mut hm)) = self.partial_data.remove(temp_idx) {
+                    eprintln!("Inserting data len: {}", data.len());
+                    hm.insert(hash, data);
+                    // println!("{} ==? {}", vec.len(), hm.len());
+                    if vec.len() == hm.len() {
+                        // eprintln!("two");
+                        // Some(SyncMessage::from_data(vec, hm).unwrap())
+                    } else {
+                        self.partial_data.insert(*temp_idx, (vec, hm));
+                        // None
+                    }
+                } else {
+                    // None
+                }
+            } else {
+                // None
+            }
+        }
+    }
     // TODO: this needs rework as well as SyncMessage::from_data
     pub fn process(&mut self, data: SyncData) -> Option<SyncMessage> {
         let d_len = data.len();
@@ -1931,6 +2349,9 @@ impl ApplicationData {
 
     pub fn shell(&self, c_id: ContentID) -> Result<Content, AppError> {
         self.contents.shell(c_id)
+    }
+    pub fn clone_content(&self, c_id: ContentID) -> Result<Content, AppError> {
+        self.contents.clone_content(c_id)
     }
     pub fn content_root_hash(&self, c_id: ContentID) -> Result<(DataType, u64), AppError> {
         let result = self.contents.get_root_content_typed_hash(c_id);
@@ -2027,7 +2448,7 @@ impl ApplicationData {
                 break;
             }
         }
-        eprintln!("CID-{} has {} Data blocks", c_id, data_vec.len());
+        // eprintln!("CID-{} has {} Data blocks", c_id, data_vec.len());
         Ok(data_vec)
     }
     pub fn content_bottom_hashes(&self, c_id: ContentID) -> Result<Vec<u64>, AppError> {
@@ -2080,6 +2501,29 @@ impl ApplicationData {
         // }
         // results.push(Data::new(bytes).unwrap());
         // Ok(results)
+    }
+
+    pub fn get_partial_hashes(&self) -> Vec<Data> {
+        let mut results = Vec::with_capacity(self.partial_data.len());
+        for (_vec, pdata) in self.partial_data.values() {
+            if let Some(hdata) = pdata.get(&0) {
+                results.push(hdata.clone());
+            }
+        }
+        results
+    }
+    pub fn get_partial_data(&self) -> Vec<Data> {
+        let mut results = Vec::with_capacity(self.partial_data.len());
+        for (_vec, pdata) in self.partial_data.values() {
+            for (h, data) in pdata {
+                if *h == 0 {
+                    continue;
+                } else {
+                    results.push(data.clone());
+                }
+            }
+        }
+        results
     }
 
     // TODO: design application level interface

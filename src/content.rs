@@ -40,7 +40,7 @@ impl Description {
         Ok(Self(text))
     }
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Content {
     // Link's Data contains application level header data (if Catalog -> Tags)
     // When we copy a Link we only have to take first two values,
@@ -411,8 +411,10 @@ impl TransformInfo {
 // and still stay in Sync and update Datastore.
 impl Content {
     pub fn from(d_type: DataType, data: Data) -> Result<Self, AppError> {
+        let d_hash = data.get_hash();
+        let data_empty = data.is_empty();
         let bytes = data.bytes();
-        // println!("Bytes: {:?}", bytes);
+        // eprintln!("Content from bytes: {:?}", bytes);
         let mut bytes_iter = bytes.into_iter();
         // let d_type = bytes_iter.next();
         // println!("First byte: {:?}", first_byte);
@@ -473,7 +475,11 @@ impl Content {
             // TODO: once we have all root data hashes we can start
             // replacing them one-by-one
             DataType::Data(other) => {
-                let tree = ContentTree::new(Data::new(bytes_iter.collect()).unwrap());
+                let tree = if data_empty {
+                    ContentTree::empty(d_hash)
+                } else {
+                    ContentTree::new(Data::new(bytes_iter.collect()).unwrap())
+                };
                 Ok(Content::Data(DataType::from(other), tree))
             }
         }
@@ -505,7 +511,7 @@ impl Content {
         }
     }
     pub fn read_data(&self, data_id: u16) -> Result<Data, AppError> {
-        eprintln!("Internal read_data {}", data_id);
+        // eprintln!("Internal read_data {}", data_id);
         match self {
             Self::Link(s_name, c_id, descr, data, ti) => {
                 // if let Some(ti) = ti {
@@ -693,6 +699,7 @@ impl Content {
             }
             _other => {
                 for d_id in 0..u16::MAX {
+                    // eprintln!("try {}", d_id);
                     if let Ok(hash) = self.get_data_hash(d_id) {
                         v.push(hash)
                     } else {
@@ -820,14 +827,14 @@ fn link_to_data(
 //   b) increasing existing data and all subsequent data indeces by one
 // - remove data at index with decreasing all subsequent data indeces by one
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ContentTree {
     Empty(u64),
     Filled(Data),
     Hashed(Box<Subtree>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Subtree {
     data_count: u16,
     hash: u64,
@@ -858,7 +865,13 @@ impl ContentTree {
 
     pub fn len(&self) -> u16 {
         match self {
-            Self::Empty(_h) => 0,
+            Self::Empty(h) => {
+                if *h == 0 {
+                    0
+                } else {
+                    1
+                }
+            }
             Self::Filled(_d) => 1,
             Self::Hashed(sub_tree) => sub_tree.len(),
         }
@@ -879,17 +892,23 @@ impl ContentTree {
     }
     pub fn hash(&self) -> u64 {
         match self {
-            Self::Empty(hash) => *hash,
+            Self::Empty(hash) => {
+                // eprintln!("cont empty {}", hash);
+                *hash
+            }
             Self::Filled(data) => data.get_hash(),
-            Self::Hashed(sub_tree) => sub_tree.hash,
+            Self::Hashed(sub_tree) => {
+                // eprintln!("subtree.hash");
+                sub_tree.hash
+            }
         }
     }
     pub fn get_data_hash(&self, data_id: u16) -> Result<u64, AppError> {
-        eprintln!("Getting data hash {}", data_id);
+        // eprintln!("Getting data hash {}", data_id);
         match self {
             Self::Empty(hash) => {
                 if data_id == 0 {
-                    eprintln!("empty {:?}", hash.to_be_bytes());
+                    // eprintln!("empty {} {:?}", hash, hash.to_be_bytes());
                     Ok(*hash)
                 } else {
                     Err(AppError::IndexingError)
@@ -898,14 +917,18 @@ impl ContentTree {
             Self::Filled(data) => {
                 // eprintln!("filled");
                 if data_id == 0 {
-                    eprintln!("filled{:?}", data.get_hash().to_be_bytes());
+                    // eprintln!(
+                    //     "filled {} {:?}",
+                    //     data.get_hash(),
+                    //     data.get_hash().to_be_bytes()
+                    // );
                     Ok(data.get_hash())
                 } else {
                     Err(AppError::IndexingError)
                 }
             }
             Self::Hashed(sub_tree) => {
-                eprintln!("hashed…");
+                // eprintln!("hashed…");
                 sub_tree.get_data_hash(data_id)
             }
         }
@@ -926,6 +949,7 @@ impl ContentTree {
     }
 
     pub fn replace(&mut self, idx: u16, mut new_data: Data) -> Result<Data, AppError> {
+        // eprintln!("replace {}", idx);
         match self {
             Self::Filled(data) => {
                 if idx == 0 {
@@ -938,6 +962,8 @@ impl ContentTree {
             }
             Self::Hashed(sub_tree) => sub_tree.replace(idx, new_data),
             Self::Empty(hash) => {
+                // eprintln!("Existing hash: {}", hash);
+                // eprintln!("New data hash: {} {}", new_data.get_hash(), new_data.hash());
                 let new_hash = new_data.hash();
                 if idx == 0 && *hash == new_hash {
                     *self = Self::Filled(new_data);
@@ -986,22 +1012,29 @@ impl ContentTree {
                 //   but this way the tree will become unbalanced
                 if subtree.can_grow() {
                     if subtree.should_extend() {
+                        // eprintln!("should extend");
                         let data_count = subtree.len() + 1;
                         let subtree_hash = subtree.hash;
                         let d_hash = double_hash(subtree_hash, hash);
                         let prev_tree = std::mem::replace(self, Self::Empty(0));
+                        let right = if data.is_empty() {
+                            ContentTree::Empty(data.get_hash())
+                        } else {
+                            ContentTree::Filled(data)
+                        };
                         let new_tree = ContentTree::Hashed(Box::new(Subtree {
                             data_count,
                             hash: d_hash,
                             left: prev_tree,
-                            right: ContentTree::Filled(data),
+                            right,
                         }));
                         let _ = std::mem::replace(self, new_tree);
-                        eprintln!("2 Len after append: {}", self.len());
+                        // eprintln!("2 Len after append: {}", self.len());
                         Ok(d_hash)
                     } else {
+                        // eprintln!("no extend");
                         let app_res = subtree.append(data);
-                        eprintln!("3 Len after append: {}", self.len());
+                        // eprintln!("3 Len after append: {}", self.len());
                         if let Ok(_hash) = app_res {
                             Ok(self.hash())
                         } else {
@@ -1013,10 +1046,10 @@ impl ContentTree {
                 }
             }
             Self::Empty(_hash) => {
-                // eprintln!("I am empty");
+                // eprintln!("append I am empty");
                 if data.is_empty() {
-                    // eprintln!("data empty");
                     let double_hash = double_hash(*_hash, data.get_hash());
+                    // eprintln!("data empty {}", double_hash);
                     let s_tree = Subtree {
                         data_count: 2,
                         hash: double_hash,
@@ -1027,7 +1060,7 @@ impl ContentTree {
                     // eprintln!("4 Len after append: {}", self.len());
                     Ok(double_hash)
                 } else {
-                    // eprintln!("data not empty");
+                    // eprintln!("append data not empty");
                     *self = ContentTree::Filled(data);
                     // eprintln!("5 Len after append: {}", self.len());
                     Ok(hash)
@@ -1143,7 +1176,7 @@ impl ContentTree {
                         panic!("Something went wrong in pop")
                     }
                 } else if subtree.len().count_ones() == 1 {
-                    eprintln!("Shrinking, right size: {}", subtree.right.len());
+                    // eprintln!("Shrinking, right size: {}", subtree.right.len());
                     *self = subtree.left;
                 } else {
                     *self = Self::Hashed(subtree);
@@ -1182,9 +1215,12 @@ impl Subtree {
             Err(AppError::IndexingError)
         } else {
             let left_count = self.left.len();
+            // eprintln!("left count {}", left_count);
             if idx >= left_count {
+                // eprintln!("get right hash @{}", idx - left_count);
                 self.right.get_data_hash(idx - left_count)
             } else {
+                // eprintln!("get left hash @{}", idx);
                 self.left.get_data_hash(idx)
             }
         }

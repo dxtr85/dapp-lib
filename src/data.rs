@@ -23,6 +23,7 @@ impl Data {
     }
 
     pub fn empty(hash: u64) -> Self {
+        // eprintln!("new empty {}", hash);
         Data(hash, vec![])
     }
 
@@ -60,6 +61,7 @@ impl Data {
         self.1.len()
     }
     pub fn get_hash(&self) -> u64 {
+        // eprintln!("data.get_hash() {} {:?}", self.0, self.1);
         self.0
     }
     pub fn hash(&mut self) -> u64 {

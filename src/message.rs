@@ -64,9 +64,11 @@ impl SyncRequirements {
             if let Ok((_d_type, d_hash)) = app.content_root_hash(*c_id) {
                 if d_hash != *hash {
                     eprintln!(
-                        "{} stored  hash: {:?},\nmessage hash: {:?}",
+                        "{} stored  hash: {}={:?},\nmessage hash: {}={:?}",
                         c_id,
+                        d_hash,
                         d_hash.to_be_bytes(),
+                        hash,
                         hash.to_be_bytes()
                     );
                     return false;

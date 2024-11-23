@@ -158,6 +158,19 @@ impl Datastore {
             }
         }
     }
+    pub fn clone_content(&self, c_id: ContentID) -> Result<Content, AppError> {
+        match self {
+            Self::Empty => Err(AppError::IndexingError),
+            Self::Filled(content) => {
+                if c_id == 0 {
+                    Ok(content.clone())
+                } else {
+                    Err(AppError::IndexingError)
+                }
+            }
+            Self::Hashed(ref s_store) => s_store.clone_content(c_id),
+        }
+    }
     pub fn shell(&self, c_id: ContentID) -> Result<Content, AppError> {
         match self {
             Self::Empty => Err(AppError::IndexingError),
@@ -445,7 +458,7 @@ impl Datastore {
         match self {
             Self::Empty => Err(AppError::ContentEmpty),
             Self::Filled(content) => {
-                println!("Sending bottom hashes up");
+                // println!("Sending bottom hashes up");
                 Ok(content.data_hashes())
             }
             Self::Hashed(s_store) => s_store.content_bottom_hashes(c_id),
@@ -528,6 +541,17 @@ impl Substore {
             self.right.take(c_id - left_len)
         } else {
             self.left.take(c_id)
+        }
+    }
+    pub fn clone_content(&self, c_id: ContentID) -> Result<Content, AppError> {
+        if c_id >= self.data_count {
+            return Err(AppError::IndexingError);
+        }
+        let left_len = self.left.len();
+        if c_id >= left_len {
+            self.right.clone_content(c_id - left_len)
+        } else {
+            self.left.clone_content(c_id)
         }
     }
     pub fn shell(&self, c_id: ContentID) -> Result<Content, AppError> {

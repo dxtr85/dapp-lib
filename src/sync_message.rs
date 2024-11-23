@@ -126,6 +126,7 @@ pub enum SyncRequest {
 
 #[derive(Debug)]
 pub enum SyncResponse {
+    Partial(bool, Data),
     Datastore(u16, u16, Vec<(DataType, u64)>),
     Hashes(ContentID, u16, u16, Data),
     Page(ContentID, DataType, u16, u16, Data),
@@ -176,6 +177,17 @@ impl SyncResponse {
                 bytes.push(page_2);
                 bytes.push(total_1);
                 bytes.push(total_2);
+                bytes.append(&mut data.bytes());
+                bytes
+            }
+            SyncResponse::Partial(hashes, data) => {
+                let mut bytes = Vec::with_capacity(1450);
+                bytes.push(3);
+                if hashes {
+                    bytes.push(1);
+                } else {
+                    bytes.push(0);
+                }
                 bytes.append(&mut data.bytes());
                 bytes
             }
@@ -254,6 +266,15 @@ impl SyncResponse {
                     total,
                     Data::new(bytes).unwrap(),
                 ))
+            }
+            3 => {
+                let is_hashes_byte = bytes_iter.next().unwrap();
+                let hashes = is_hashes_byte == 1;
+                let mut bytes = Vec::with_capacity(1450);
+                while let Some(byte) = bytes_iter.next() {
+                    bytes.push(byte);
+                }
+                Ok(SyncResponse::Partial(hashes, Data::new(bytes).unwrap()))
             }
             other => {
                 println!("Unexpected SyncResponse header: {}", other);
