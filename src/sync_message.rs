@@ -1,10 +1,22 @@
+use std::ascii::AsciiExt;
+
 use crate::{content::DataType, prelude::ContentID, Data};
 pub fn serialize_requests(requests: Vec<SyncRequest>) -> Vec<u8> {
     let mut bytes = vec![];
     for req in requests {
         match req {
             SyncRequest::Datastore => bytes.push(0),
-            SyncRequest::AllFirstPages => bytes.push(1),
+            SyncRequest::AllFirstPages(opt_tags) => {
+                bytes.push(1);
+                if let Some(tags) = opt_tags {
+                    bytes.push(tags.len() as u8);
+                    for tag in tags {
+                        bytes.push(tag);
+                    }
+                } else {
+                    bytes.push(0);
+                }
+            }
             SyncRequest::Hashes(c_id, d_type, hash_ids) => {
                 bytes.push(2);
                 let [c_1, c_2] = c_id.to_be_bytes();
@@ -57,7 +69,19 @@ pub fn deserialize_requests(bytes: Vec<u8>) -> Vec<SyncRequest> {
     while let Some(req_type) = bytes_iter.next() {
         match req_type {
             0 => requests.push(SyncRequest::Datastore),
-            1 => requests.push(SyncRequest::AllFirstPages),
+            1 => {
+                let tags_count = bytes_iter.next().unwrap();
+                let arg = if tags_count > 0 {
+                    let mut tags = Vec::with_capacity(tags_count as usize);
+                    for _i in 0..tags_count {
+                        tags.push(bytes_iter.next().unwrap());
+                    }
+                    Some(tags)
+                } else {
+                    None
+                };
+                requests.push(SyncRequest::AllFirstPages(arg))
+            }
             2 => {
                 let c_1 = bytes_iter.next().unwrap();
                 let c_2 = bytes_iter.next().unwrap();
@@ -118,7 +142,7 @@ pub fn deserialize_requests(bytes: Vec<u8>) -> Vec<SyncRequest> {
 
 pub enum SyncRequest {
     Datastore,
-    AllFirstPages,
+    AllFirstPages(Option<Vec<u8>>),
     Hashes(ContentID, DataType, Vec<u16>),
     Pages(ContentID, DataType, Vec<u16>),
     AllPages(Vec<ContentID>),

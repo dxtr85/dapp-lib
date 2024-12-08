@@ -71,14 +71,17 @@ pub enum ToApp {
     Neighbors(SwarmID, Vec<GnomeId>),
     NewContent(SwarmID, ContentID, DataType),
     ContentChanged(SwarmID, ContentID),
-    ReadSuccess(SwarmID, ContentID, Vec<Data>),
+    ReadSuccess(SwarmID, ContentID, DataType, Vec<Data>),
     ReadError(SwarmID, ContentID, AppError),
+    GetCIDsForTags(SwarmID, GnomeId, Vec<u8>, Vec<(ContentID, Data)>),
     Disconnected,
 }
 
 pub enum ToAppMgr {
+    GetCIDsForTags(SwarmID, GnomeId, Vec<u8>, Vec<(ContentID, Data)>),
+    CIDsForTag(SwarmID, GnomeId, u8, ContentID, Data),
     ReadData(SwarmID, ContentID),
-    ReadSuccess(SwarmID, ContentID, Vec<Data>),
+    ReadSuccess(SwarmID, ContentID, DataType, Vec<Data>),
     ReadError(SwarmID, ContentID, AppError),
     UploadData,
     SetActiveApp(GnomeId),
@@ -101,6 +104,7 @@ pub enum ToAppMgr {
 pub enum ToAppData {
     Response(GnomeToApp),
     ReadData(ContentID),
+    SendFirstPage(GnomeId, ContentID, Data),
     UploadData,
     StartUnicast,
     StartBroadcast,
@@ -255,15 +259,27 @@ async fn serve_gnome_manager(
                 ToAppMgr::UploadData => {
                     let _ = app_mgr.active_app_data.send(ToAppData::UploadData).await;
                 }
-                //TODO: use s_id to query proper swarm for data
                 ToAppMgr::ReadData(s_id, c_id) => {
-                    let _ = app_mgr
-                        .active_app_data
-                        .send(ToAppData::ReadData(c_id))
-                        .await;
+                    if let Some(to_app_data) = app_mgr.app_data_store.get(&s_id) {
+                        let _ = to_app_data.send(ToAppData::ReadData(c_id)).await;
+                    }
                 }
-                ToAppMgr::ReadSuccess(s_id, c_id, data_vec) => {
-                    let _ = to_user.send(ToApp::ReadSuccess(s_id, c_id, data_vec));
+                ToAppMgr::GetCIDsForTags(swarm_id, n_id, tags, all_first_pages) => {
+                    eprintln!("We are requesting tags {:?} for {:?} swarm", tags, swarm_id);
+                    let _ =
+                        to_user.send(ToApp::GetCIDsForTags(swarm_id, n_id, tags, all_first_pages));
+                }
+                ToAppMgr::CIDsForTag(s_id, n_id, _tag, cid, data) => {
+                    // eprintln!("We are supposed to send those back to select swarm and neighbor");
+
+                    if let Some(to_app_data) = app_mgr.app_data_store.get(&s_id) {
+                        let _ = to_app_data
+                            .send(ToAppData::SendFirstPage(n_id, cid, data))
+                            .await;
+                    }
+                }
+                ToAppMgr::ReadSuccess(s_id, c_id, dtype, data_vec) => {
+                    let _ = to_user.send(ToApp::ReadSuccess(s_id, c_id, dtype, data_vec));
                 }
                 ToAppMgr::ReadError(s_id, c_id, error) => {
                     let _ = to_user.send(ToApp::ReadError(s_id, c_id, error));
@@ -376,7 +392,7 @@ async fn serve_app_data(
                     eprintln!("App not synced!");
                     let sync_requests: Vec<SyncRequest> = vec![
                         SyncRequest::Datastore,
-                        SyncRequest::AllFirstPages,
+                        SyncRequest::AllFirstPages(Some(vec![0])),
                         SyncRequest::AllPages(vec![0]),
                     ];
                     // let sync_requests: Vec<u8> = vec![
@@ -1052,6 +1068,22 @@ async fn serve_app_data(
             ToAppData::Response(GnomeToApp::Neighbors(s_id, neighbors)) => {
                 let _ = to_app_mgr_send.send(ToAppMgr::NeighborsListing(s_id, neighbors));
             }
+            ToAppData::SendFirstPage(n_id, c_id, data) => {
+                let sync_type = 0;
+                let (data_type, len) = app_data.get_type_and_len(c_id).unwrap();
+                let sync_response = SyncResponse::Page(c_id, data_type, 0, len, data);
+                // println!("Sending bytes: {:?}", bytes);
+                let res = to_gnome_sender.send(ToGnome::SendData(
+                    n_id,
+                    NeighborResponse::Custom(
+                        sync_type,
+                        CastData::new(sync_response.serialize()).unwrap(),
+                    ),
+                ));
+                if res.is_ok() {
+                    eprintln!("SFP Main page of {} sent successfully.", c_id,);
+                }
+            }
             ToAppData::Response(GnomeToApp::Block(_id, data)) => {
                 // println!("Processing data...");
                 let process_result = app_data.process(data);
@@ -1437,37 +1469,65 @@ async fn serve_app_data(
                                     }
                                     eprintln!("Sent Datastore response");
                                 }
-                                SyncRequest::AllFirstPages => {
+                                SyncRequest::AllFirstPages(tags_opt) => {
                                     // TODO: here we should trigger a separate task for sending
                                     // all Content's main pages to specified Neighbor
                                     eprintln!(
-                                        "We are requested to send all main pages to neighbor."
+                                        "We are requested to send all first pages to neighbor."
                                     );
-                                    let sync_type = 0;
-                                    for c_id in 1..app_data.next_c_id().unwrap() {
-                                        eprintln!(
-                                            "We need to send main page of ContentID-{}",
-                                            c_id
-                                        );
-                                        if let Ok(data) = app_data.read_data(c_id, 0) {
-                                            let (data_type, len) =
-                                                app_data.get_type_and_len(c_id).unwrap();
-                                            let sync_response =
-                                                SyncResponse::Page(c_id, data_type, 0, len, data);
-                                            // println!("Sending bytes: {:?}", bytes);
-                                            let res = to_gnome_sender.send(ToGnome::SendData(
-                                                neighbor_id,
-                                                NeighborResponse::Custom(
-                                                    sync_type,
-                                                    CastData::new(sync_response.serialize())
-                                                        .unwrap(),
-                                                ),
-                                            ));
-                                            if res.is_ok() {
-                                                eprintln!(
-                                                    "Main page of {} sent successfully.",
-                                                    c_id,
+                                    if let Some(tags) = tags_opt {
+                                        //TODO: we send tags and all first pages to App and wait
+                                        // when we get response we send first pages to Neighbor
+                                        // (Different apps may implement different tagging strategies)
+                                        eprintln!("Only first pages of select Contents");
+
+                                        let next_c_id = app_data.next_c_id().unwrap();
+                                        let mut all_first_pages =
+                                            Vec::with_capacity(next_c_id as usize);
+                                        for c_id in 1..next_c_id {
+                                            if let Ok(data) = app_data.read_data(c_id, 0) {
+                                                all_first_pages.push((c_id, data));
+                                                // let (data_type, len) =
+                                                //     app_data.get_type_and_len(c_id).unwrap();
+                                                // let sync_response = SyncResponse::Page(
+                                                //     c_id, data_type, 0, len, data,
+                                                // );
+                                            }
+                                        }
+                                        let _ = to_app_mgr_send.send(ToAppMgr::GetCIDsForTags(
+                                            swarm_id,
+                                            neighbor_id,
+                                            tags,
+                                            all_first_pages,
+                                        ));
+                                    } else {
+                                        let sync_type = 0;
+                                        for c_id in 1..app_data.next_c_id().unwrap() {
+                                            eprintln!(
+                                                "We need to send main page of ContentID-{}",
+                                                c_id
+                                            );
+                                            if let Ok(data) = app_data.read_data(c_id, 0) {
+                                                let (data_type, len) =
+                                                    app_data.get_type_and_len(c_id).unwrap();
+                                                let sync_response = SyncResponse::Page(
+                                                    c_id, data_type, 0, len, data,
                                                 );
+                                                // println!("Sending bytes: {:?}", bytes);
+                                                let res = to_gnome_sender.send(ToGnome::SendData(
+                                                    neighbor_id,
+                                                    NeighborResponse::Custom(
+                                                        sync_type,
+                                                        CastData::new(sync_response.serialize())
+                                                            .unwrap(),
+                                                    ),
+                                                ));
+                                                if res.is_ok() {
+                                                    eprintln!(
+                                                        "Main page of {} sent successfully.",
+                                                        c_id,
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -1708,31 +1768,31 @@ async fn serve_app_data(
                                 SyncResponse::Page(c_id, data_type, page_no, total, data) => {
                                     //TODO: make it proper
                                     if page_no == 0 {
-                                        eprintln!(
-                                            "We've got main page of {}, data type: {:?}",
-                                            c_id, data_type
-                                        );
+                                        // eprintln!(
+                                        //     "We've got main page of {}, data type: {:?}",
+                                        //     c_id, data_type
+                                        // );
                                         if let Ok((d_type, len)) = app_data.get_type_and_len(c_id) {
-                                            eprintln!("CID {} already exists", c_id);
+                                            // eprintln!("CID {} already exists", c_id);
                                             if d_type == DataType::Link {
                                                 if len > 0 {
-                                                    eprintln!("Update existing Link");
+                                                    // eprintln!("Update existing Link");
                                                     let _ = app_data.update_transformative_link(
                                                         false, c_id, page_no, total, data,
                                                     );
                                                 } else {
-                                                    eprintln!("Create new Link");
+                                                    // eprintln!("Create new Link");
                                                     let res = app_data
                                                         .update(c_id, data_to_link(data).unwrap());
-                                                    eprintln!("Update result: {:?}", res);
+                                                    // eprintln!("Update result: {:?}", res);
                                                 }
                                             } else {
                                                 let _res =
                                                     app_data.insert_data(c_id, page_no, data);
-                                                eprintln!("Update existing Data: {:?}", _res);
+                                                // eprintln!("Update existing Data: {:?}", _res);
                                             }
                                         } else if data_type < DataType::Link {
-                                            eprintln!("Create new Data");
+                                            // eprintln!("Create new Data");
                                             let _ = to_app_mgr_send.send(ToAppMgr::ContentAdded(
                                                 swarm_id, c_id, data_type,
                                             ));
@@ -1741,25 +1801,23 @@ async fn serve_app_data(
                                                 Content::Data(data_type, ContentTree::Filled(data)),
                                             );
                                         } else {
-                                            eprintln!("Create new Link 2");
+                                            // eprintln!("Create new Link 2");
                                             let _ = to_app_mgr_send.send(ToAppMgr::ContentAdded(
                                                 swarm_id, c_id, data_type,
                                             ));
                                             let res =
                                                 app_data.update(c_id, data_to_link(data).unwrap());
-                                            eprintln!("Update result: {:?}", res);
+                                            // eprintln!("Update result: {:?}", res);
                                         }
-
-                                        // if data_type < 255 {
-                                        // } else {
-                                        //     //TODO if we received data for existinglink with TransformInfo
-                                        // };
                                     } else if let Ok((d_type, len)) =
                                         app_data.get_type_and_len(c_id)
                                     {
                                         if d_type == data_type {
                                             let res = app_data.append_data(c_id, data);
-                                            eprintln!("Page #{} add result: {:?}", page_no, res);
+                                            eprintln!(
+                                                "C-{} Page #{} add result: {:?}",
+                                                c_id, page_no, res
+                                            );
                                         } else if d_type == DataType::Link {
                                             let res = app_data.update_transformative_link(
                                                 false, c_id, page_no, total, data,
@@ -1777,76 +1835,7 @@ async fn serve_app_data(
                                 }
                             }
                         }
-                        // Datastore sync root hashes
-                        // println!("Response 0, {}", cast_data);
-                        // let mut bytes = cast_data.bytes().into_iter();
-                        // let data_type = bytes.next().unwrap();
-                        // let _content_id_1 = bytes.next().unwrap();
-                        // let _content_id_2 = bytes.next().unwrap();
-                        // let _part_no_1 = bytes.next().unwrap();
-                        // let _part_no_2 = bytes.next().unwrap();
-                        // let _total_1 = bytes.next().unwrap();
-                        // let _total_2 = bytes.next().unwrap();
-                        // let bytes: Vec<u8> = bytes.collect();
-
-                        // for chunk in bytes.chunks(8) {
-                        //     let hash = u64::from_be_bytes(chunk[0..8].try_into().unwrap());
-                        //     let tree = ContentTree::empty(hash);
-                        //     let content = Content::Data(data_type, tree);
-                        //     let res = app_data.append(content);
-                        //     println!("Datastore add: {:?}", res);
-                        // }
                     }
-                    // 1 => {
-                    // // Datastore sync Content
-                    // println!("Response 1");
-                    //     let mut bytes = cast_data.bytes().into_iter();
-                    //     // println!("bytes: {:?}", bytes);
-                    //     let data_subtype = bytes.next().unwrap();
-                    //     let data_type = bytes.next().unwrap();
-                    //     println!("subtype: {}", data_subtype);
-                    //     let content_id_1 = bytes.next().unwrap();
-                    //     let content_id_2 = bytes.next().unwrap();
-                    //     let c_id = u16::from_be_bytes([content_id_1, content_id_2]);
-                    //     let part_no_1 = bytes.next().unwrap();
-                    //     let part_no_2 = bytes.next().unwrap();
-                    //     let part_no = u16::from_be_bytes([part_no_1, part_no_2]);
-                    //     let total_1 = bytes.next().unwrap();
-                    //     let total_2 = bytes.next().unwrap();
-                    //     let total = u16::from_be_bytes([total_1, total_2]);
-                    //     let bytes: Vec<u8> = bytes.collect();
-                    //     if data_subtype == 1 {
-                    //         // println!("Content {} add part {} of {}", c_id, part_no, total);
-                    //         if c_id == 0 {
-                    //             println!("App manifest to add");
-                    //             let content = Content::Data(
-                    //                 data_type,
-                    //                 ContentTree::Filled(Data::new(bytes).unwrap()),
-                    //             );
-                    //             let res = app_data.update(0, content);
-                    //             println!("App manifest add result: {:?}", res);
-                    //         } else {
-                    //             println!("Content {} of type {} to add", c_id, data_type);
-                    //         }
-                    //     } else if data_subtype == 0 {
-                    //         println!(
-                    //             "We have page #{} out of {} belonging to ContentID {}({}).",
-                    //             part_no, total, c_id, data_type
-                    //         );
-                    //         let data = Data::new(bytes).unwrap();
-                    //         let content = if data_type < 255 {
-                    //             Content::Data(data_type, ContentTree::Filled(data))
-                    //         } else {
-                    //             data_to_link(data).unwrap()
-                    //         };
-
-                    //         let res = app_data.update(c_id, content);
-                    //         println!("Page #{} add result: {:?}", part_no, res);
-                    //     }
-                    // }
-                    // 2 => {
-                    //     println!("Response 2");
-                    // }
                     other => {
                         eprintln!("Response {}", other);
                     }
@@ -1854,12 +1843,15 @@ async fn serve_app_data(
             }
             ToAppData::ReadData(c_id) => {
                 //TODO:
-                let (_t, len) = app_data.get_type_and_len(c_id).unwrap();
+                let (t, _len) = app_data.get_type_and_len(c_id).unwrap();
                 // eprintln!("Before read data {} len: {}", c_id, len);
                 let all_data_result = app_data.get_all_data(c_id);
                 if let Ok(data_vec) = all_data_result {
-                    // eprintln!("Sending read result with {} data blocks", data_vec.len());
-                    let _ = to_app_mgr_send.send(ToAppMgr::ReadSuccess(swarm_id, c_id, data_vec));
+                    if c_id == 0 {
+                        eprintln!("Sending read result with {} data blocks", data_vec.len());
+                    }
+                    let _ =
+                        to_app_mgr_send.send(ToAppMgr::ReadSuccess(swarm_id, c_id, t, data_vec));
                 } else {
                     let error = all_data_result.err().unwrap();
                     let _ = to_app_mgr_send.send(ToAppMgr::ReadError(swarm_id, c_id, error));
