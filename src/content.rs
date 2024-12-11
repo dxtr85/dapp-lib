@@ -999,7 +999,7 @@ impl ContentTree {
                 }));
                 // let _ = std::mem::replace(self, new_tree);
                 *self = new_tree;
-                eprintln!("1 Len after append: {}", self.len());
+                // eprintln!("1 Len after append: {}", self.len());
                 Ok(d_hash)
             }
             Self::Hashed(subtree) => {

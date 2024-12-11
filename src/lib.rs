@@ -1720,7 +1720,7 @@ async fn serve_app_data(
                     0 => {
                         if let Ok(response) = SyncResponse::deserialize(cast_data.bytes()) {
                             //TODO:
-                            eprintln!("Deserialized response!: {:?}", response);
+                            // eprintln!("Deserialized response!: {:?}", response);
                             match response {
                                 SyncResponse::Partial(is_hash_data, data) => {
                                     app_data.update_partial(is_hash_data, data);
