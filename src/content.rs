@@ -1046,6 +1046,7 @@ impl ContentTree {
                 }
             }
             Self::Empty(_hash) => {
+                //TODO: what to do if existing hash = 0?
                 // eprintln!("append I am empty");
                 if data.is_empty() {
                     let double_hash = double_hash(*_hash, data.get_hash());
@@ -1165,9 +1166,14 @@ impl ContentTree {
         let myself = std::mem::replace(self, Self::Empty(0));
         match myself {
             Self::Empty(_hash) => Data::empty(0),
-            Self::Filled(data) => data,
+            Self::Filled(data) => {
+                // eprintln!("t pop 0 self: {:?}", self);
+                data
+            }
             Self::Hashed(mut subtree) => {
+                // eprintln!("t pop 1 stlen before: {}", subtree.len());
                 let taken = subtree.pop();
+                subtree.hash();
                 if subtree.len() == 0 {
                 } else if subtree.len() == 1 {
                     if let Ok(data) = subtree.replace(0, Data::empty(0)) {
@@ -1181,6 +1187,7 @@ impl ContentTree {
                 } else {
                     *self = Self::Hashed(subtree);
                 }
+                // eprintln!("t pop 1 len after: {}", self.len());
                 taken
             }
         }
@@ -1276,11 +1283,14 @@ impl Subtree {
 
     pub fn pop(&mut self) -> Data {
         if self.data_count == 0 {
+            // eprintln!("st pop 0");
             Data::empty(0)
         } else if !self.right.is_empty() {
+            // eprintln!("st pop 1");
             self.data_count -= 1;
             self.right.pop()
         } else {
+            // eprintln!("st pop 2");
             // TODO: we need to make sure that after pop this Subtree
             // is converted into ContentTree, since it's right side is empty
             self.data_count -= 1;

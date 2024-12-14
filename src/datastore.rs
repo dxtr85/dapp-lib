@@ -115,7 +115,7 @@ impl Datastore {
                 // println!("Append to Filled");
                 let hash = double_hash(prev_content.hash(), content.hash());
                 let substore = Substore {
-                    data_count: 2,
+                    content_count: 2,
                     hash,
                     left: Datastore::Filled(prev_content),
                     right: Datastore::Filled(content),
@@ -493,14 +493,14 @@ impl Datastore {
         match self {
             Self::Empty => 0,
             Self::Filled(_c) => 1,
-            Self::Hashed(s_store) => s_store.data_count,
+            Self::Hashed(s_store) => s_store.content_count,
         }
     }
 }
 
 #[derive(Debug)]
 pub struct Substore {
-    data_count: u16,
+    content_count: u16,
     hash: u64,
     left: Datastore,
     right: Datastore,
@@ -509,10 +509,10 @@ pub struct Substore {
 impl Substore {
     pub fn append(&mut self, content: Content) -> Result<u64, AppError> {
         // println!("Substore count: {}", self.data_count);
-        if self.data_count < u16::MAX {
+        if self.content_count < u16::MAX {
             let result = self.right.append(content);
             if let Ok(_h) = result {
-                self.data_count += 1;
+                self.content_count += 1;
                 Ok(self.hash())
             } else {
                 result
@@ -522,7 +522,7 @@ impl Substore {
         }
     }
     pub fn type_and_len(&self, c_id: ContentID) -> Result<(DataType, u16), AppError> {
-        if c_id >= self.data_count {
+        if c_id >= self.content_count {
             return Err(AppError::IndexingError);
         }
         let left_len = self.left.len();
@@ -533,7 +533,7 @@ impl Substore {
         }
     }
     pub fn take(&mut self, c_id: ContentID) -> Result<Content, AppError> {
-        if c_id >= self.data_count {
+        if c_id >= self.content_count {
             return Err(AppError::IndexingError);
         }
         let left_len = self.left.len();
@@ -544,7 +544,7 @@ impl Substore {
         }
     }
     pub fn clone_content(&self, c_id: ContentID) -> Result<Content, AppError> {
-        if c_id >= self.data_count {
+        if c_id >= self.content_count {
             return Err(AppError::IndexingError);
         }
         let left_len = self.left.len();
@@ -555,7 +555,7 @@ impl Substore {
         }
     }
     pub fn shell(&self, c_id: ContentID) -> Result<Content, AppError> {
-        if c_id >= self.data_count {
+        if c_id >= self.content_count {
             return Err(AppError::IndexingError);
         }
         let left_len = self.left.len();
@@ -566,7 +566,7 @@ impl Substore {
         }
     }
     pub fn take_transform_info(&mut self, c_id: ContentID) -> Result<TransformInfo, AppError> {
-        if c_id >= self.data_count {
+        if c_id >= self.content_count {
             return Err(AppError::IndexingError);
         }
         let left_len = self.left.len();
@@ -581,7 +581,7 @@ impl Substore {
         c_id: ContentID,
         ti: TransformInfo,
     ) -> Result<(), AppError> {
-        if c_id >= self.data_count {
+        if c_id >= self.content_count {
             return Err(AppError::IndexingError);
         }
         let left_len = self.left.len();
@@ -596,7 +596,7 @@ impl Substore {
         (c_id, data_id): (ContentID, u16),
         d_type: DataType,
     ) -> Result<(Data, u16), AppError> {
-        if c_id >= self.data_count {
+        if c_id >= self.content_count {
             return Err(AppError::IndexingError);
         }
         let left_len = self.left.len();
@@ -608,7 +608,7 @@ impl Substore {
         }
     }
     pub fn read_data(&self, (c_id, data_id): (ContentID, u16)) -> Result<Data, AppError> {
-        if c_id >= self.data_count {
+        if c_id >= self.content_count {
             return Err(AppError::IndexingError);
         }
         let left_len = self.left.len();
@@ -620,7 +620,7 @@ impl Substore {
     }
 
     pub fn update(&mut self, c_id: ContentID, content: Content) -> Result<Content, AppError> {
-        if c_id >= self.data_count {
+        if c_id >= self.content_count {
             return Err(AppError::IndexingError);
         }
         let left_len = self.left.len();
@@ -638,7 +638,7 @@ impl Substore {
         (c_id, data_id): (ContentID, u16),
         data: Data,
     ) -> Result<Data, AppError> {
-        if c_id >= self.data_count {
+        if c_id >= self.content_count {
             return Err(AppError::IndexingError);
         }
         let left_len = self.left.len();
@@ -659,7 +659,7 @@ impl Substore {
         c_id: ContentID,
         d_type: DataType,
     ) -> Result<Vec<Data>, AppError> {
-        if c_id >= self.data_count {
+        if c_id >= self.content_count {
             return Err(AppError::IndexingError);
         }
         let left_len = self.left.len();
@@ -671,7 +671,7 @@ impl Substore {
         }
     }
     pub fn content_bottom_hashes(&self, c_id: ContentID) -> Result<Vec<u64>, AppError> {
-        if c_id >= self.data_count {
+        if c_id >= self.content_count {
             return Err(AppError::Smthg);
         }
         let left_len = self.left.len();
@@ -682,7 +682,7 @@ impl Substore {
         }
     }
     fn get_root_content_hash(&self, c_id: ContentID) -> Result<(DataType, u64), AppError> {
-        if c_id >= self.data_count {
+        if c_id >= self.content_count {
             return Err(AppError::IndexingError);
         }
         let left_len = self.left.len();

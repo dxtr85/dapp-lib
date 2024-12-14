@@ -93,6 +93,7 @@ pub enum ToAppMgr {
     NeighborsListing(SwarmID, Vec<GnomeId>),
     ChangeContent(SwarmID, ContentID, DataType, Vec<Data>),
     AppendContent(SwarmID, DataType, Data),
+    AppendData(SwarmID, ContentID, Data),
     // AppendShelledDatas(SwarmID, ContentID, Data),
     ContentAdded(SwarmID, ContentID, DataType),
     ContentChanged(SwarmID, ContentID),
@@ -340,6 +341,11 @@ async fn serve_gnome_manager(
                         .send(ToAppData::AppendContent(d_type, data))
                         .await;
                 }
+                ToAppMgr::AppendData(s_id, c_id, data) => {
+                    if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
+                        let _ = sender.send(ToAppData::AppendData(c_id, data)).await;
+                    }
+                }
                 // ToAppMgr::AppendShelledDatas(_s_id, c_id, data) => {
                 //     //TODO
                 //     // let mut data_hashes = vec![];
@@ -516,10 +522,18 @@ async fn serve_app_data(
             }
             ToAppData::AppendData(c_id, data) => {
                 let pre_hash = app_data.content_root_hash(c_id).unwrap();
+                // eprintln!("Initial AppendData PRE hash: {}", pre_hash.1);
+                // let bottom_hashes = app_data.content_bottom_hashes(c_id).unwrap();
+                // eprintln!("Initial AppendData bottom hashes: {:?}", bottom_hashes);
                 let pre: Vec<(ContentID, u64)> = vec![(c_id, pre_hash.1)];
                 let append_result = app_data.append_data(c_id, data);
                 let post: Vec<(ContentID, u64)> = vec![(c_id, append_result.unwrap())];
+                // eprintln!("Initial AppendData POST hash: {}", post[0].1);
                 let data = app_data.pop_data(c_id).unwrap();
+                // let bottom_hashes = app_data.content_bottom_hashes(c_id).unwrap();
+                // eprintln!("Restored AppendData bottom hashes: {:?}", bottom_hashes);
+                // let pre_hash = app_data.content_root_hash(c_id).unwrap();
+                // eprintln!("Later AppendData PRE hash: {}", pre_hash.1);
                 //TODO: we push this 0 to inform Content::from that we are dealing
                 // Not with a Content::Link, which is 255 but with Content::Data,
                 // whose DataType = 0
@@ -1299,6 +1313,10 @@ async fn serve_app_data(
                     SyncMessageType::AppendData(c_id) => {
                         //TODO
                         eprintln!("SyncMessageType::AppendData ");
+                        // eprintln!(
+                        //     "Sync Append bottom hashes before: {:?}",
+                        //     app_data.content_bottom_hashes(c_id).unwrap()
+                        // );
                         if !requirements.pre_validate(c_id, &app_data) {
                             eprintln!("PRE validation failed for AppendData");
                             continue;
@@ -1787,9 +1805,17 @@ async fn serve_app_data(
                                                     // eprintln!("Update result: {:?}", res);
                                                 }
                                             } else {
+                                                // let (_type, orig_hash) =
+                                                //     app_data.content_root_hash(c_id).unwrap();
+
                                                 let _res =
                                                     app_data.insert_data(c_id, page_no, data);
-                                                // eprintln!("Update existing Data: {:?}", _res);
+                                                // let (_type, updt_hash) =
+                                                //     app_data.content_root_hash(c_id).unwrap();
+                                                // eprintln!(
+                                                //     "Update existing Data: {:?}\nfrom:{}\nto{}",
+                                                //     _res, orig_hash, updt_hash
+                                                // );
                                             }
                                         } else if data_type < DataType::Link {
                                             // eprintln!("Create new Data");
@@ -1842,11 +1868,14 @@ async fn serve_app_data(
                 }
             }
             ToAppData::ReadData(c_id) => {
-                //TODO:
-                let (t, _len) = app_data.get_type_and_len(c_id).unwrap();
-                // eprintln!("Before read data {} len: {}", c_id, len);
+                //TODO: find a way to decide if we are completely synced with swarm, or not
+                //      if not request to sync from any Neighbor
+                let (t, len) = app_data.get_type_and_len(c_id).unwrap();
+                let (t, root_hash) = app_data.content_root_hash(c_id).unwrap();
+                eprintln!("Read {}, data len: {}", c_id, len);
                 let all_data_result = app_data.get_all_data(c_id);
                 if let Ok(data_vec) = all_data_result {
+                    // let calculated_hash =
                     if c_id == 0 {
                         eprintln!("Sending read result with {} data blocks", data_vec.len());
                     }
@@ -1854,6 +1883,17 @@ async fn serve_app_data(
                         to_app_mgr_send.send(ToAppMgr::ReadSuccess(swarm_id, c_id, t, data_vec));
                 } else {
                     let error = all_data_result.err().unwrap();
+                    if matches!(error, AppError::ContentEmpty) {
+                        let sync_requests: Vec<SyncRequest> =
+                            vec![SyncRequest::AllPages(vec![c_id])];
+                        let _ = to_gnome_sender.send(ToGnome::AskData(
+                            GnomeId::any(),
+                            NeighborRequest::Custom(
+                                0,
+                                CastData::new(serialize_requests(sync_requests)).unwrap(),
+                            ),
+                        ));
+                    }
                     let _ = to_app_mgr_send.send(ToAppMgr::ReadError(swarm_id, c_id, error));
                 }
             }

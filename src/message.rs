@@ -45,11 +45,14 @@ impl SyncRequirements {
         for (c_id, hash) in self.pre.iter() {
             if let Ok((_d_type, d_hash)) = app.content_root_hash(*c_id) {
                 if d_hash != *hash {
-                    println!("Stored  hash: {},\nmessage hash: {}", d_hash, hash);
+                    eprintln!(
+                        "PRE validate\n Stored  hash: {},\nmessage hash: {}",
+                        d_hash, hash
+                    );
                     return false;
                 }
             } else if *hash != 0 {
-                println!("Datastore has no CID: {}, hash: {}", c_id, hash);
+                eprintln!("Datastore has no CID: {}, hash: {}", c_id, hash);
                 return false;
             }
         }
@@ -64,7 +67,7 @@ impl SyncRequirements {
             if let Ok((_d_type, d_hash)) = app.content_root_hash(*c_id) {
                 if d_hash != *hash {
                     eprintln!(
-                        "{} stored  hash: {}={:?},\nmessage hash: {}={:?}",
+                        "POST validate\n{} stored  hash: {}={:?},\nmessage hash: {}={:?}",
                         c_id,
                         d_hash,
                         d_hash.to_be_bytes(),
