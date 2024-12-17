@@ -12,6 +12,7 @@ pub enum AppError {
     DatatypeMismatch,
     DatastoreFull,
     DatastoreInsertCalledOnFilled,
+    AppDataNotSynced,
 }
 impl Error for AppError {}
 impl Display for AppError {
@@ -26,6 +27,7 @@ impl Display for AppError {
             Self::DatatypeMismatch => write!(f, "DatatypeMismatch"),
             Self::DatastoreFull => write!(f, "DatastoreFull"),
             Self::DatastoreInsertCalledOnFilled => write!(f, "DatastoreInsertCalledOnFilled"),
+            Self::AppDataNotSynced => write!(f, "AppDataNotSynced"),
         }
     }
 }

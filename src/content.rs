@@ -699,7 +699,6 @@ impl Content {
             }
             _other => {
                 for d_id in 0..u16::MAX {
-                    // eprintln!("try {}", d_id);
                     if let Ok(hash) = self.get_data_hash(d_id) {
                         v.push(hash)
                     } else {
@@ -1047,19 +1046,25 @@ impl ContentTree {
             }
             Self::Empty(_hash) => {
                 //TODO: what to do if existing hash = 0?
-                // eprintln!("append I am empty");
+                // eprintln!("append I am empty {}", _hash);
                 if data.is_empty() {
-                    let double_hash = double_hash(*_hash, data.get_hash());
-                    // eprintln!("data empty {}", double_hash);
-                    let s_tree = Subtree {
-                        data_count: 2,
-                        hash: double_hash,
-                        left: ContentTree::Empty(*_hash),
-                        right: ContentTree::Empty(data.get_hash()),
-                    };
-                    *self = ContentTree::Hashed(Box::new(s_tree));
-                    // eprintln!("4 Len after append: {}", self.len());
-                    Ok(double_hash)
+                    if *_hash == 0 {
+                        let new_hash = data.get_hash();
+                        *self = ContentTree::Empty(new_hash);
+                        Ok(new_hash)
+                    } else {
+                        let double_hash = double_hash(*_hash, data.get_hash());
+                        // eprintln!("data empty {}", double_hash);
+                        let s_tree = Subtree {
+                            data_count: 2,
+                            hash: double_hash,
+                            left: ContentTree::Empty(*_hash),
+                            right: ContentTree::Empty(data.get_hash()),
+                        };
+                        *self = ContentTree::Hashed(Box::new(s_tree));
+                        // eprintln!("4 Len after append: {}", self.len());
+                        Ok(double_hash)
+                    }
                 } else {
                     // eprintln!("append data not empty");
                     *self = ContentTree::Filled(data);
@@ -1072,15 +1077,23 @@ impl ContentTree {
 
     pub fn insert(&mut self, idx: u16, data: Data) -> Result<u64, AppError> {
         // Use append in this case
+        // eprintln!("insert {:?} @ {}", data, idx);
         if idx > 0 && idx >= self.len() {
-            // eprintln!("idx {} >= {} self.len()", idx, self.len());
+            // eprintln!("IE: idx {} >= {} self.len()", idx, self.len());
             return Err(AppError::IndexingError);
         }
         let remove_last = self.len() == u16::MAX;
         let result = match self {
             Self::Empty(_hash) => {
+                // eprintln!("Insert Empty {}", _hash);
                 if idx == 0 {
                     let hash = data.get_hash();
+                    // eprintln!(
+                    //     "Empty, replacing {} with {}, dlen: {}",
+                    //     _hash,
+                    //     hash,
+                    //     data.len()
+                    // );
                     *self = Self::Filled(data);
                     Ok(hash)
                 } else {
@@ -1089,6 +1102,7 @@ impl ContentTree {
                 }
             }
             Self::Filled(old_data) => {
+                // eprintln!("Insert Filled {}", old_data.get_hash());
                 if idx == 0 {
                     // if overwrite {
                     //     let hash = data.hash();
@@ -1112,7 +1126,10 @@ impl ContentTree {
                     Err(AppError::IndexingError)
                 }
             }
-            Self::Hashed(subtree) => subtree.insert(idx, data),
+            Self::Hashed(subtree) => {
+                // eprintln!("Insert hashed");
+                subtree.insert(idx, data)
+            }
         };
         if remove_last && result.is_ok() {
             let _ = self.pop();

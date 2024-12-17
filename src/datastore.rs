@@ -23,7 +23,6 @@ impl Datastore {
     // pub fn new(manifest: Manifest) -> Datastore {
     pub fn new(app_type: AppType) -> Datastore {
         let mut content_tree = ContentTree::empty(0);
-        // let _ = content_tree.append(manifest.to_data(None));
         let _ = content_tree.append(Data::new(vec![app_type.byte()]).unwrap());
         let content = Content::Data(DataType::Data(0), content_tree);
         Datastore::Filled(content)
@@ -52,9 +51,15 @@ impl Datastore {
             return Err(e);
         }
         let mut content = take_result.unwrap();
+        // eprintln!("Inserting to {} data:\n{:?}", d_id, data);
         let insert_result = content.insert(d_id, data);
-        // eprintln!("Insert result: {:?}", insert_result);
-        let _ = self.update(c_id, content);
+        // eprintln!(
+        //     "Insert result: {:?}, {}",
+        //     insert_result,
+        //     content.read_data(d_id).unwrap()
+        // );
+        let update_result = self.update(c_id, content);
+        // eprintln!("Update result: {:?}", update_result);
         insert_result
     }
 
@@ -399,13 +404,12 @@ impl Datastore {
     // bottom layer hashes from left to right.
     // Those are also called Content root hashes.
     pub fn all_typed_root_hashes(&self) -> Vec<Vec<(DataType, u64)>> {
-        // println!("Next")
-
         let mut count = 0;
         let mut total = vec![];
         let mut v = vec![];
         for c_id in 0..u16::MAX {
             if let Ok(typed_hash) = self.get_root_content_typed_hash(c_id) {
+                // eprintln!("CID {} existing hash: {}", c_id, typed_hash.1);
                 v.push(typed_hash);
                 count += 1;
                 if count == 128 {
@@ -435,11 +439,7 @@ impl Datastore {
     // This fn should return a Vec<u64> of all of given CID's data hashes
     // So only bottom layer hashes (Data hashes).
 
-    pub fn link_transform_info_hashes(
-        &self,
-        c_id: ContentID,
-        d_type: DataType,
-    ) -> Result<Vec<Data>, AppError> {
+    pub fn link_transform_info_hashes(&self, c_id: ContentID) -> Result<Vec<Data>, AppError> {
         match self {
             Self::Empty => Err(AppError::ContentEmpty),
             Self::Filled(content) => {
@@ -450,7 +450,7 @@ impl Datastore {
                     Err(AppError::IndexingError)
                 }
             }
-            Self::Hashed(s_store) => s_store.link_transform_info_hashes(c_id, d_type),
+            Self::Hashed(s_store) => s_store.link_transform_info_hashes(c_id),
         }
     }
 
@@ -654,20 +654,15 @@ impl Substore {
         self.hash
     }
 
-    pub fn link_transform_info_hashes(
-        &self,
-        c_id: ContentID,
-        d_type: DataType,
-    ) -> Result<Vec<Data>, AppError> {
+    pub fn link_transform_info_hashes(&self, c_id: ContentID) -> Result<Vec<Data>, AppError> {
         if c_id >= self.content_count {
             return Err(AppError::IndexingError);
         }
         let left_len = self.left.len();
         if c_id >= left_len {
-            self.right
-                .link_transform_info_hashes(c_id - left_len, d_type)
+            self.right.link_transform_info_hashes(c_id - left_len)
         } else {
-            self.left.link_transform_info_hashes(c_id, d_type)
+            self.left.link_transform_info_hashes(c_id)
         }
     }
     pub fn content_bottom_hashes(&self, c_id: ContentID) -> Result<Vec<u64>, AppError> {

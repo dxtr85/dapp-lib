@@ -17,12 +17,12 @@ pub fn serialize_requests(requests: Vec<SyncRequest>) -> Vec<u8> {
                     bytes.push(0);
                 }
             }
-            SyncRequest::Hashes(c_id, d_type, hash_ids) => {
+            SyncRequest::Hashes(c_id, hash_ids) => {
                 bytes.push(2);
                 let [c_1, c_2] = c_id.to_be_bytes();
                 bytes.push(c_1);
                 bytes.push(c_2);
-                bytes.push(d_type.byte());
+                // bytes.push(d_type.byte());
                 let [hl_1, hl_2] = (hash_ids.len() as u16).to_be_bytes();
                 bytes.push(hl_1);
                 bytes.push(hl_2);
@@ -60,9 +60,11 @@ pub fn serialize_requests(requests: Vec<SyncRequest>) -> Vec<u8> {
             }
         }
     }
+    // eprintln!("serialize_requests: {:?}", bytes);
     bytes
 }
 pub fn deserialize_requests(bytes: Vec<u8>) -> Vec<SyncRequest> {
+    // eprintln!("deserialize_requests: {:?}", bytes);
     let mut requests = vec![];
     let mut bytes_iter = bytes.into_iter();
     // let mut type_known = false;
@@ -86,7 +88,7 @@ pub fn deserialize_requests(bytes: Vec<u8>) -> Vec<SyncRequest> {
                 let c_1 = bytes_iter.next().unwrap();
                 let c_2 = bytes_iter.next().unwrap();
                 let c_id = u16::from_be_bytes([c_1, c_2]);
-                let d_type = DataType::from(bytes_iter.next().unwrap());
+                // let d_type = DataType::from(bytes_iter.next().unwrap());
 
                 let hl_1 = bytes_iter.next().unwrap();
                 let hl_2 = bytes_iter.next().unwrap();
@@ -98,7 +100,7 @@ pub fn deserialize_requests(bytes: Vec<u8>) -> Vec<SyncRequest> {
                     let h_2 = bytes_iter.next().unwrap();
                     hash_ids.push(u16::from_be_bytes([h_1, h_2]));
                 }
-                requests.push(SyncRequest::Hashes(c_id, d_type, hash_ids));
+                requests.push(SyncRequest::Hashes(c_id, hash_ids));
             }
             3 => {
                 let c_1 = bytes_iter.next().unwrap();
@@ -143,7 +145,7 @@ pub fn deserialize_requests(bytes: Vec<u8>) -> Vec<SyncRequest> {
 pub enum SyncRequest {
     Datastore,
     AllFirstPages(Option<Vec<u8>>),
-    Hashes(ContentID, DataType, Vec<u16>),
+    Hashes(ContentID, Vec<u16>),
     Pages(ContentID, DataType, Vec<u16>),
     AllPages(Vec<ContentID>),
 }

@@ -94,7 +94,7 @@ pub enum ToAppMgr {
     ChangeContent(SwarmID, ContentID, DataType, Vec<Data>),
     AppendContent(SwarmID, DataType, Data),
     AppendData(SwarmID, ContentID, Data),
-    // AppendShelledDatas(SwarmID, ContentID, Data),
+    UpdateData(SwarmID, ContentID, u16, Data),
     ContentAdded(SwarmID, ContentID, DataType),
     ContentChanged(SwarmID, ContentID),
     TransformLinkRequest(Box<SyncData>),
@@ -346,6 +346,11 @@ async fn serve_gnome_manager(
                         let _ = sender.send(ToAppData::AppendData(c_id, data)).await;
                     }
                 }
+                ToAppMgr::UpdateData(s_id, c_id, d_id, data) => {
+                    if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
+                        let _ = sender.send(ToAppData::UpdateData(c_id, d_id, data)).await;
+                    }
+                }
                 // ToAppMgr::AppendShelledDatas(_s_id, c_id, data) => {
                 //     //TODO
                 //     // let mut data_hashes = vec![];
@@ -359,7 +364,7 @@ async fn serve_gnome_manager(
                 //         .await;
                 // }
                 ToAppMgr::ContentAdded(s_id, c_id, d_type) => {
-                    eprintln!("ToApp::NewContent({:?},{:?})", c_id, d_type);
+                    // eprintln!("GENERATE ToApp::NewContent({:?},{:?})", c_id, d_type);
                     let _ = to_user.send(ToApp::NewContent(s_id, c_id, d_type));
                 }
                 ToAppMgr::ContentChanged(s_id, c_id) => {
@@ -390,6 +395,8 @@ async fn serve_app_data(
     let mut link_with_transform_info: Option<ContentID> = None;
     let mut b_req_sent = false;
     let mut next_val = 0;
+    let mut datastore_sync: Option<(u16, HashMap<u16, Vec<(DataType, u64)>>)> =
+        Some((0, HashMap::new()));
     let sleep_time = Duration::from_millis(32);
     while let Ok(resp) = app_data_recv.recv().await {
         match resp {
@@ -399,7 +406,13 @@ async fn serve_app_data(
                     let sync_requests: Vec<SyncRequest> = vec![
                         SyncRequest::Datastore,
                         SyncRequest::AllFirstPages(Some(vec![0])),
-                        SyncRequest::AllPages(vec![0]),
+                        SyncRequest::Hashes(0, vec![]),
+                        SyncRequest::Hashes(1, vec![]),
+                        SyncRequest::Hashes(2, vec![]),
+                        SyncRequest::Hashes(3, vec![]),
+                        // SyncRequest::Hashes(2, vec![]),
+                        // SyncRequest::Hashes(3, vec![]),
+                        SyncRequest::AllPages(vec![0, 1, 2, 3]),
                     ];
                     // let sync_requests: Vec<u8> = vec![
                     //     0, // We want all root hashes from Datastore
@@ -415,6 +428,8 @@ async fn serve_app_data(
                     ));
                 } else {
                     eprintln!("App synced");
+                    // eprintln!("Set DStore to None");
+                    datastore_sync = None;
                 }
             }
             ToAppData::StartUnicast => {
@@ -1550,21 +1565,22 @@ async fn serve_app_data(
                                         }
                                     }
                                 }
-                                SyncRequest::Hashes(c_id, d_type, h_ids) => {
+                                // SyncRequest::Hashes(c_id, d_type, h_ids) => {
+                                SyncRequest::Hashes(c_id, h_ids) => {
                                     //TODO
                                     eprintln!(
                                         "We should send some page hashes of Contents: {:?}",
                                         c_id
                                     );
-                                    let hash_res = if let Ok((data_type, len)) =
+                                    let hash_res = if let Ok((data_type, _len)) =
                                         app_data.get_type_and_len(c_id)
                                     {
-                                        if data_type == d_type {
-                                            app_data.get_all_page_hashes(c_id)
-                                        } else if data_type == DataType::Link {
-                                            app_data.get_all_transform_info_hashes(c_id, d_type)
+                                        // if data_type == d_type {
+                                        if data_type == DataType::Link {
+                                            app_data.get_all_transform_info_hashes(c_id)
                                         } else {
-                                            Err(AppError::DatatypeMismatch)
+                                            // Err(AppError::DatatypeMismatch)
+                                            app_data.get_all_page_hashes(c_id)
                                         }
                                     } else {
                                         Err(AppError::IndexingError)
@@ -1573,14 +1589,15 @@ async fn serve_app_data(
                                         if !hashes.is_empty() {
                                             let sync_type = 0;
                                             let hashes_len = hashes.len() as u16 - 1;
-                                            for h_id in h_ids {
-                                                if h_id <= hashes_len {
+                                            if h_ids.is_empty() {
+                                                // eprintln!("We send all hashes of CID {}", c_id);
+                                                for i in 0..=hashes_len {
                                                     let hash_data = std::mem::replace(
-                                                        &mut hashes[h_id as usize],
+                                                        &mut hashes[i as usize],
                                                         Data::empty(0),
                                                     );
                                                     let sync_response = SyncResponse::Hashes(
-                                                        c_id, h_id, hashes_len, hash_data,
+                                                        c_id, i, hashes_len, hash_data,
                                                     );
                                                     let res =
                                                         to_gnome_sender.send(ToGnome::SendData(
@@ -1596,8 +1613,38 @@ async fn serve_app_data(
                                                     if res.is_ok() {
                                                         eprintln!(
                                                             "Hashes [{}/{}] of {} sent",
-                                                            h_id, hashes_len, c_id
+                                                            i, hashes_len, c_id
                                                         );
+                                                    }
+                                                }
+                                            } else {
+                                                for h_id in h_ids {
+                                                    if h_id <= hashes_len {
+                                                        let hash_data = std::mem::replace(
+                                                            &mut hashes[h_id as usize],
+                                                            Data::empty(0),
+                                                        );
+                                                        let sync_response = SyncResponse::Hashes(
+                                                            c_id, h_id, hashes_len, hash_data,
+                                                        );
+                                                        let res = to_gnome_sender.send(
+                                                            ToGnome::SendData(
+                                                                neighbor_id,
+                                                                NeighborResponse::Custom(
+                                                                    sync_type,
+                                                                    CastData::new(
+                                                                        sync_response.serialize(),
+                                                                    )
+                                                                    .unwrap(),
+                                                                ),
+                                                            ),
+                                                        );
+                                                        if res.is_ok() {
+                                                            eprintln!(
+                                                                "Hashes [{}/{}] of {} sent",
+                                                                h_id, hashes_len, c_id
+                                                            );
+                                                        }
                                                     }
                                                 }
                                             }
@@ -1689,12 +1736,14 @@ async fn serve_app_data(
                                     // each ContentID received in order to send
                                     // all Content's pages to specified Neighbor
                                     eprintln!(
-                                        "We are requested to send all pages to neighbor ({:?}).",
+                                        "We are requested to send all pages of Contents: {:?}.",
                                         c_ids
                                     );
                                     let sync_type = 0;
                                     for c_id in c_ids {
                                         eprintln!("Sending CID {}", c_id);
+                                        //TODO: first we send all page hashes
+                                        //      second we send pages
                                         if let Ok(data_vec) = app_data.get_all_data(c_id) {
                                             if data_vec.is_empty() {
                                                 continue;
@@ -1721,7 +1770,6 @@ async fn serve_app_data(
                                                     ),
                                                 ));
                                             }
-                                            eprintln!("Sent CID response");
                                         }
                                     }
                                 }
@@ -1743,34 +1791,77 @@ async fn serve_app_data(
                                 SyncResponse::Partial(is_hash_data, data) => {
                                     app_data.update_partial(is_hash_data, data);
                                 }
-                                SyncResponse::Datastore(part_no, total, hashes) => {
-                                    //TODO: we need to cover case where parts come out of order
+                                SyncResponse::Datastore(part_no, total, mut hashes) => {
+                                    let prev_dstore_sync =
+                                        std::mem::replace(&mut datastore_sync, None);
+                                    if let Some((next_awaited_part_no, mut missing_hashes)) =
+                                        prev_dstore_sync
+                                    {
+                                        if next_awaited_part_no != part_no {
+                                            missing_hashes.insert(part_no, hashes);
+                                            datastore_sync =
+                                                Some((next_awaited_part_no, missing_hashes));
+                                            continue;
+                                        }
+                                        //TODO: append all existing hashes
+                                        //    we have cached until now to hashes
+                                        //    and then decide value of datastore_sync
+                                        let mut last_processed = part_no;
+                                        for i in part_no + 1..=total {
+                                            if let Some(mut append_hashes) =
+                                                missing_hashes.remove(&i)
+                                            {
+                                                hashes.append(&mut append_hashes);
+                                                last_processed = i;
+                                            } else {
+                                                break;
+                                            }
+                                        }
+                                        if last_processed != total {
+                                            datastore_sync =
+                                                Some((last_processed + 1, missing_hashes))
+                                        }
 
-                                    let c_id = app_data.next_c_id().unwrap();
-                                    let mut curr_cid = 0;
+                                        let c_id = app_data.next_c_id().unwrap();
+                                        let mut curr_cid = 0;
 
-                                    for (data_type, hash) in hashes {
-                                        let tree = ContentTree::empty(hash);
-                                        let content = Content::Data(data_type, tree);
-                                        // eprintln!("Next CID: {}", c_id);
-                                        if curr_cid < c_id {
-                                            let _ = app_data.update(curr_cid, content);
-                                        } else {
-                                            let c_id = app_data.next_c_id().unwrap();
-                                            let _res = app_data.append(content);
-                                            let _ = to_app_mgr_send.send(ToAppMgr::ContentAdded(
-                                                swarm_id, c_id, data_type,
-                                            ));
+                                        for (data_type, hash) in hashes {
+                                            let tree = ContentTree::empty(hash);
+                                            let content = Content::Data(data_type, tree);
+                                            if curr_cid < c_id {
+                                                eprintln!(
+                                                    "Updating Datastore CID: {}, hash: {}",
+                                                    curr_cid, hash
+                                                );
+                                                let _r = app_data.update(curr_cid, content);
+                                                eprintln!(
+                                                    "Result: {:?}, {}",
+                                                    _r,
+                                                    app_data.content_root_hash(curr_cid).unwrap().1
+                                                );
+                                            } else {
+                                                let c_id = app_data.next_c_id().unwrap();
+                                                eprintln!(
+                                                    "Appending Datastore CID: {}, hash: {}",
+                                                    c_id, hash
+                                                );
+                                                let _res = app_data.append(content);
+                                                let _ =
+                                                    to_app_mgr_send.send(ToAppMgr::ContentAdded(
+                                                        swarm_id, c_id, data_type,
+                                                    ));
+                                            }
+                                            curr_cid = curr_cid + 1;
                                         }
                                         eprintln!(
                                             "SyncResponse::Datastore [{}/{}] ",
                                             part_no, total,
                                         );
-                                        curr_cid = curr_cid + 1;
+                                    } else {
+                                        eprintln!("Datastore is synced, why sent this?");
                                     }
                                 }
                                 SyncResponse::Hashes(c_id, part_no, total, hashes) => {
-                                    //TODO: not yet implemented
                                     eprintln!(
                                         "Received hashes [{}/{}] of {} (len: {})!",
                                         part_no,
@@ -1778,10 +1869,49 @@ async fn serve_app_data(
                                         c_id,
                                         hashes.len()
                                     );
-                                    let upd_res = app_data.update_transformative_link(
-                                        true, c_id, part_no, total, hashes,
-                                    );
-                                    eprintln!("Update res: {:?}", upd_res);
+                                    if let Ok((d_type, _len)) = app_data.get_type_and_len(c_id) {
+                                        if matches!(d_type, DataType::Link) {
+                                            let upd_res = app_data.update_transformative_link(
+                                                true, c_id, part_no, total, hashes,
+                                            );
+                                            // eprintln!("Update res: {:?}", upd_res);
+                                        } else {
+                                            //TODO: not yet implemented
+                                            if part_no == 0 && part_no == total {
+                                                let mut data_vec =
+                                                    Vec::with_capacity(hashes.len() >> 3);
+                                                let bytes = hashes.bytes();
+                                                for chunk in bytes.chunks_exact(8) {
+                                                    let hash = u64::from_be_bytes(
+                                                        chunk.try_into().unwrap(),
+                                                    );
+                                                    eprintln!("Hash from Neighbor: {}", hash);
+                                                    data_vec.push(Data::empty(hash));
+                                                }
+
+                                                let ct = ContentTree::from(data_vec);
+                                                let c = Content::Data(d_type, ct);
+                                                eprintln!(
+                                                    "New bottom hashes: {:?}",
+                                                    c.data_hashes()
+                                                );
+                                                let new_hash = c.hash();
+                                                let (_type, old_hash) =
+                                                    app_data.content_root_hash(c_id).unwrap();
+                                                if old_hash == new_hash {
+                                                    let _old_c = app_data.update(c_id, c).unwrap();
+                                                    eprintln!(
+                                                        "Updated Content {} with hashes",
+                                                        c_id
+                                                    );
+                                                } else {
+                                                    eprintln!("Can not update CID {} since old {} != {} new",c_id,old_hash,new_hash);
+                                                }
+                                            } else {
+                                                todo!("implement me!");
+                                            }
+                                        }
+                                    }
                                 }
                                 SyncResponse::Page(c_id, data_type, page_no, total, data) => {
                                     //TODO: make it proper
@@ -1805,17 +1935,10 @@ async fn serve_app_data(
                                                     // eprintln!("Update result: {:?}", res);
                                                 }
                                             } else {
-                                                // let (_type, orig_hash) =
-                                                //     app_data.content_root_hash(c_id).unwrap();
+                                                eprintln!("Inserting page 0 of non-Link content");
 
                                                 let _res =
-                                                    app_data.insert_data(c_id, page_no, data);
-                                                // let (_type, updt_hash) =
-                                                //     app_data.content_root_hash(c_id).unwrap();
-                                                // eprintln!(
-                                                //     "Update existing Data: {:?}\nfrom:{}\nto{}",
-                                                //     _res, orig_hash, updt_hash
-                                                // );
+                                                    app_data.update_data(c_id, page_no, data);
                                             }
                                         } else if data_type < DataType::Link {
                                             // eprintln!("Create new Data");
@@ -1839,9 +1962,10 @@ async fn serve_app_data(
                                         app_data.get_type_and_len(c_id)
                                     {
                                         if d_type == data_type {
-                                            let res = app_data.append_data(c_id, data);
+                                            // let res = app_data.append_data(c_id, data);
+                                            let res = app_data.update_data(c_id, page_no, data);
                                             eprintln!(
-                                                "C-{} Page #{} add result: {:?}",
+                                                "C-{} Page #{} update result: {:?}",
                                                 c_id, page_no, res
                                             );
                                         } else if d_type == DataType::Link {
@@ -1868,9 +1992,28 @@ async fn serve_app_data(
                 }
             }
             ToAppData::ReadData(c_id) => {
+                // eprintln!(
+                //     "ToAppData::ReadData({}) when DStore synced: {}",
+                //     c_id,
+                //     datastore_sync.is_none()
+                // );
                 //TODO: find a way to decide if we are completely synced with swarm, or not
                 //      if not request to sync from any Neighbor
-                let (t, len) = app_data.get_type_and_len(c_id).unwrap();
+                if datastore_sync.is_some() {
+                    let _ = to_app_mgr_send.send(ToAppMgr::ReadError(
+                        swarm_id,
+                        c_id,
+                        AppError::AppDataNotSynced,
+                    ));
+                    continue;
+                }
+                let type_and_len_result = app_data.get_type_and_len(c_id);
+                if type_and_len_result.is_err() {
+                    let error = type_and_len_result.err().unwrap();
+                    let _ = to_app_mgr_send.send(ToAppMgr::ReadError(swarm_id, c_id, error));
+                    continue;
+                }
+                let (_t, len) = type_and_len_result.unwrap();
                 let (t, root_hash) = app_data.content_root_hash(c_id).unwrap();
                 eprintln!("Read {}, data len: {}", c_id, len);
                 let all_data_result = app_data.get_all_data(c_id);
@@ -1916,7 +2059,7 @@ async fn serve_app_data(
                             //TODO: there can be multiple SyncRequests
                             eprintln!("Missing hashes: {:?}", missing_hashes);
                             let sync_request =
-                                SyncRequest::Hashes(a_msg.content_id, d_type, missing_hashes);
+                                SyncRequest::Hashes(a_msg.content_id, missing_hashes);
                             to_gnome_sender
                                 .send(ToGnome::AskData(
                                     GnomeId::any(),
@@ -2488,7 +2631,7 @@ impl ApplicationData {
     }
     pub fn get_all_page_hashes(&self, c_id: ContentID) -> Result<Vec<Data>, AppError> {
         let hashes_vec = self.contents.content_bottom_hashes(c_id)?;
-        eprintln!("Got hashes vec");
+        // eprintln!("Got hashes vec");
         let mut results = vec![];
         let mut hash_iter = hashes_vec.into_iter();
         let mut i = 0;
@@ -2511,9 +2654,9 @@ impl ApplicationData {
     pub fn get_all_transform_info_hashes(
         &self,
         c_id: ContentID,
-        d_type: DataType,
+        // d_type: DataType,
     ) -> Result<Vec<Data>, AppError> {
-        self.contents.link_transform_info_hashes(c_id, d_type)
+        self.contents.link_transform_info_hashes(c_id)
         // let hashes_vec = self.contents.link_transform_info_hashes(c_id,d_type)?;
         // println!("Got hashes vec");
         // let mut results = vec![];
