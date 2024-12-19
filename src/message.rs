@@ -288,12 +288,17 @@ impl SyncMessage {
             partials.push(data);
             // partials.push(PartialMessage { m_type, part_no: 0, total_parts:0, data })
         } else {
-            // eprintln!("netto_size >= 893 ");
+            // eprintln!("netto_size ({}) >= 893 ", netto_size);
             let mut non_header_parts = 1;
             let mut done = false;
             while !done {
                 let non_header_bytes_consumed = non_header_parts * 1021;
-                if netto_size - non_header_bytes_consumed <= 893 - (8 * non_header_parts) {
+                // eprintln!("netto_size: {}", netto_size);
+                // eprintln!("non_header_bytes_consumed : {}", non_header_bytes_consumed);
+                // eprintln!("(893-) non_header_parts*8: {}", non_header_parts * 8);
+                if netto_size < non_header_bytes_consumed
+                    || netto_size - non_header_bytes_consumed <= 893 - (8 * non_header_parts)
+                {
                     done = true;
                 } else {
                     non_header_parts += 1;

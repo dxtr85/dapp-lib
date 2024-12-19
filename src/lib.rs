@@ -112,7 +112,7 @@ pub enum ToAppData {
     EndBroadcast,
     UnsubscribeBroadcast,
     ListNeighbors,
-    AppDataSynced(bool),
+    SwarmReady,
     BCastData(CastID, CastData),
     BCastOrigin(CastID, Sender<CastData>),
     ChangeContent(ContentID, DataType, Vec<Data>),
@@ -161,7 +161,7 @@ pub fn initialize(
     to_app_mgr_recv: Receiver<ToAppMgr>,
     config: Configuration,
 ) -> GnomeId {
-    let (gmgr_send, gmgr_recv, my_id) = init(config.work_dir.clone(), config.app_data_root_hash);
+    let (gmgr_send, gmgr_recv, my_id) = init(config.work_dir.clone(), config.neighbors);
     spawn(serve_gnome_manager(
         gmgr_send,
         gmgr_recv,
@@ -400,37 +400,38 @@ async fn serve_app_data(
     let sleep_time = Duration::from_millis(32);
     while let Ok(resp) = app_data_recv.recv().await {
         match resp {
-            ToAppData::AppDataSynced(is_synced) => {
-                if !is_synced {
-                    eprintln!("App not synced!");
-                    let sync_requests: Vec<SyncRequest> = vec![
-                        SyncRequest::Datastore,
-                        SyncRequest::AllFirstPages(Some(vec![0])),
-                        SyncRequest::Hashes(0, vec![]),
-                        SyncRequest::Hashes(1, vec![]),
-                        SyncRequest::Hashes(2, vec![]),
-                        SyncRequest::Hashes(3, vec![]),
-                        // SyncRequest::Hashes(2, vec![]),
-                        // SyncRequest::Hashes(3, vec![]),
-                        SyncRequest::AllPages(vec![0, 1, 2, 3]),
-                    ];
-                    // let sync_requests: Vec<u8> = vec![
-                    //     0, // We want all root hashes from Datastore
-                    //     1, // We want all first pages of every Content in Datastore
-                    //     2, 0, 0, // We want all pages of specified ContentID (here CID(0))
-                    // ];
-                    let _ = to_gnome_sender.send(ToGnome::AskData(
-                        GnomeId::any(),
-                        NeighborRequest::Custom(
-                            0,
-                            CastData::new(serialize_requests(sync_requests)).unwrap(),
-                        ),
-                    ));
-                } else {
-                    eprintln!("App synced");
-                    // eprintln!("Set DStore to None");
-                    datastore_sync = None;
-                }
+            // TODO: We should always assume to be out of sync
+            ToAppData::SwarmReady => {
+                // if !is_synced {
+                //     eprintln!("App not synced!");
+                let sync_requests: Vec<SyncRequest> = vec![
+                    SyncRequest::Datastore,
+                    SyncRequest::AllFirstPages(Some(vec![0])),
+                    SyncRequest::Hashes(0, vec![]),
+                    SyncRequest::Hashes(1, vec![]),
+                    SyncRequest::Hashes(2, vec![]),
+                    SyncRequest::Hashes(3, vec![]),
+                    // SyncRequest::Hashes(2, vec![]),
+                    // SyncRequest::Hashes(3, vec![]),
+                    SyncRequest::AllPages(vec![0, 1, 2, 3]),
+                ];
+                // let sync_requests: Vec<u8> = vec![
+                //     0, // We want all root hashes from Datastore
+                //     1, // We want all first pages of every Content in Datastore
+                //     2, 0, 0, // We want all pages of specified ContentID (here CID(0))
+                // ];
+                let _ = to_gnome_sender.send(ToGnome::AskData(
+                    GnomeId::any(),
+                    NeighborRequest::Custom(
+                        0,
+                        CastData::new(serialize_requests(sync_requests)).unwrap(),
+                    ),
+                ));
+                // } else {
+                //     eprintln!("App synced");
+                //     // eprintln!("Set DStore to None");
+                //     datastore_sync = None;
+                // }
             }
             ToAppData::StartUnicast => {
                 let res =
@@ -1186,7 +1187,7 @@ async fn serve_app_data(
                                 // eprintln!("Content added: {:?}", res);
                                 let hash = app_data.root_hash();
                                 eprintln!("Sending updated hash: {}", hash);
-                                let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
+                                // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
                                 // eprintln!("Send res: {:?}", res);
                                 let _to_mgr_res = to_app_mgr_send
                                     .send(ToAppMgr::ContentAdded(swarm_id, recv_id, d_type));
@@ -1264,7 +1265,7 @@ async fn serve_app_data(
                                 let _to_mgr_res =
                                     to_app_mgr_send.send(ToAppMgr::ContentChanged(swarm_id, c_id));
                                 let hash = app_data.root_hash();
-                                let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
+                                // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
                                 eprintln!("ChangeContent completed successfully ({})", hash);
                             }
                         } else {
@@ -1311,7 +1312,7 @@ async fn serve_app_data(
                             } else {
                                 let hash = app_data.root_hash();
                                 eprintln!("Sending updated hash: {}", hash);
-                                let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
+                                // let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
                                 // eprintln!("Send res: {:?}", res);
                                 eprintln!(
                                     "Data shells appended successfully ({}, added: {})",
@@ -1347,7 +1348,7 @@ async fn serve_app_data(
                             } else {
                                 let hash = app_data.root_hash();
                                 eprintln!("Sending updated hash: {}", hash);
-                                let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
+                                // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
                                 // eprintln!("Send res: {:?}", res);
                                 eprintln!("Data appended successfully ({})", hash);
                             }
@@ -1404,7 +1405,7 @@ async fn serve_app_data(
                             } else {
                                 let hash = app_data.root_hash();
                                 // eprintln!("Sending updated hash: {}", hash);
-                                let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
+                                // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
                                 // eprintln!("Send res: {:?}", res);
                                 eprintln!("Data updated successfully ({})", hash);
                                 let _to_mgr_res =
@@ -2116,11 +2117,9 @@ async fn serve_swarm(
         while let Ok(resp) = user_res.try_recv() {
             // println!("SUR: {:?}", resp);
             match resp {
-                GnomeToApp::AppDataSynced(synced) => {
+                GnomeToApp::SwarmReady => {
                     // eprintln!("Gnome says if synced: {}", synced);
-                    let _ = to_app_data_send
-                        .send(ToAppData::AppDataSynced(synced))
-                        .await;
+                    let _ = to_app_data_send.send(ToAppData::SwarmReady).await;
                 }
                 GnomeToApp::Broadcast(_s_id, c_id, recv_d) => {
                     spawn(serve_broadcast(
