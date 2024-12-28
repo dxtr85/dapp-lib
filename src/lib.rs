@@ -94,6 +94,7 @@ pub enum ToAppMgr {
     ChangeContent(SwarmID, ContentID, DataType, Vec<Data>),
     AppendContent(SwarmID, DataType, Data),
     AppendData(SwarmID, ContentID, Data),
+    RemoveData(SwarmID, ContentID, u16),
     UpdateData(SwarmID, ContentID, u16, Data),
     ContentAdded(SwarmID, ContentID, DataType),
     ContentChanged(SwarmID, ContentID),
@@ -119,6 +120,7 @@ pub enum ToAppData {
     UpdateData(ContentID, u16, Data),
     AppendContent(DataType, Data),
     AppendData(ContentID, Data),
+    RemoveData(ContentID, u16),
     AppendShelledDatas(ContentID, Data, Vec<Data>),
     CustomRequest(u8, GnomeId, CastData),
     CustomResponse(u8, GnomeId, CastData),
@@ -344,6 +346,11 @@ async fn serve_gnome_manager(
                 ToAppMgr::AppendData(s_id, c_id, data) => {
                     if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
                         let _ = sender.send(ToAppData::AppendData(c_id, data)).await;
+                    }
+                }
+                ToAppMgr::RemoveData(s_id, c_id, data_id) => {
+                    if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
+                        let _ = sender.send(ToAppData::RemoveData(c_id, data_id)).await;
                     }
                 }
                 ToAppMgr::UpdateData(s_id, c_id, d_id, data) => {
@@ -583,6 +590,43 @@ async fn serve_app_data(
                 let _res = app_data.update_data(c_id, d_id, prev_data);
                 let reqs = SyncRequirements { pre, post };
                 let msg = SyncMessage::new(SyncMessageType::UpdateData(c_id, d_id), reqs, data);
+                let parts = msg.into_parts();
+                for part in parts {
+                    let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                }
+            }
+            ToAppData::RemoveData(c_id, d_id) => {
+                //TODO:serve this
+                // eprintln!("Got ToAppData::RemoveData({}, {})", c_id, d_id,);
+                let mut shell = app_data.shell(c_id).unwrap();
+                // eprintln!("Bottom hashes before remove: {:?}", shell.data_hashes());
+                let pre_hash = shell.hash();
+                // let pre_hash = app_data.content_root_hash(c_id).unwrap();
+                let pre: Vec<(ContentID, u64)> = vec![(c_id, pre_hash)];
+                let _prev_data = shell.remove_data(d_id).unwrap();
+                // eprintln!("Bottom hashes after remove: {:?}", shell.data_hashes());
+                let post_hash = shell.hash();
+                let b_hashes = shell.data_hashes();
+                let mut a_tree = ContentTree::empty(0);
+                for hash in b_hashes {
+                    a_tree.append(Data::empty(hash));
+                }
+                let a_hash = a_tree.hash();
+                if a_hash != post_hash {
+                    panic!(
+                        "ERR: hash after remove_data: {} != {} (append hash)",
+                        post_hash, a_hash
+                    );
+                }
+                // let post_hash = app_data.content_root_hash(c_id).unwrap();
+                let post: Vec<(ContentID, u64)> = vec![(c_id, post_hash)];
+                // let _res = app_data.insert_data(c_id, d_id, prev_data);
+                let reqs = SyncRequirements { pre, post };
+                let msg = SyncMessage::new(
+                    SyncMessageType::RemoveData(c_id, d_id),
+                    reqs,
+                    Data::empty(0),
+                );
                 let parts = msg.into_parts();
                 for part in parts {
                     let _ = to_gnome_sender.send(ToGnome::AddData(part));
@@ -1251,6 +1295,7 @@ async fn serve_app_data(
                                 let mut old_data =
                                     HashMap::with_capacity(old_content.len() as usize);
                                 while let Ok(data) = old_content.pop_data() {
+                                    // eprintln!("old hash after pop: {}", old_content.hash());
                                     old_data.insert(data.get_hash(), data);
                                 }
                                 for (d_id, hash) in new_hashes.iter().enumerate() {
@@ -1362,15 +1407,27 @@ async fn serve_app_data(
                             continue;
                         }
                         // TODO
+                        // eprintln!(
+                        //     "CID-{} root hash befor remove: {}",
+                        //     c_id,
+                        //     app_data.content_root_hash(c_id).unwrap().1
+                        // );
                         let res = app_data.remove_data(c_id, d_id);
                         if let Ok(removed_data) = res {
                             if !requirements.post_validate(c_id, &app_data) {
                                 eprintln!("POST validation failed for RemoveData");
                                 // TODO: restore previous order
+                                // TODO: make sure hash after insert_data is equal to
+                                //       that before removal!!!
                                 let res = app_data.insert_data(c_id, d_id, removed_data);
+                                // eprintln!(
+                                //     "CID-{} root hash after restoration: {}",
+                                //     c_id,
+                                //     app_data.content_root_hash(c_id).unwrap().1
+                                // );
                                 eprintln!("Restore result: {:?}", res);
                             } else {
-                                eprintln!("Data appended successfully ({})", app_data.root_hash());
+                                eprintln!("Data removed successfully ({})", app_data.root_hash());
                             }
                         }
                     }
@@ -1938,8 +1995,11 @@ async fn serve_app_data(
                                             } else {
                                                 eprintln!("Inserting page 0 of non-Link content");
 
-                                                let _res =
-                                                    app_data.update_data(c_id, page_no, data);
+                                                let res = app_data.update_data(c_id, page_no, data);
+                                                eprintln!(
+                                                    "C-{} Page #{} update result: {:?}",
+                                                    c_id, page_no, res
+                                                );
                                             }
                                         } else if data_type < DataType::Link {
                                             // eprintln!("Create new Data");

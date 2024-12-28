@@ -7,8 +7,6 @@ use crate::content::double_hash;
 use crate::content::DataType;
 use crate::prelude::TransformInfo;
 use crate::Data;
-use gnome::prelude::SwarmName;
-// use std::collections::HashSet;
 
 // A Datastore is an append-only data structure built as a binary tree,
 // that should never be actively balanced.
@@ -52,7 +50,9 @@ impl Datastore {
         }
         let mut content = take_result.unwrap();
         // eprintln!("Inserting to {} data:\n{:?}", d_id, data);
+        // eprintln!("Hash before insert: {}", content.hash());
         let insert_result = content.insert(d_id, data);
+        // eprintln!("Hash after insert: {}", content.hash());
         // eprintln!(
         //     "Insert result: {:?}, {}",
         //     insert_result,
@@ -87,6 +87,7 @@ impl Datastore {
         }
         let mut content = take_result.unwrap();
         let pop_result = content.pop_data();
+        // eprintln!("hash after pop: {}, len: {}", content.hash(), content.len());
         let _ = self.update(c_id, content);
         pop_result
     }

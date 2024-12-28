@@ -5,6 +5,7 @@ use std::hash::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
 
+use crate::error::SubtreeError;
 use crate::prelude::AppError;
 use crate::prelude::Data;
 pub type ContentID = u16;
@@ -575,7 +576,7 @@ impl Content {
                 if tree.is_empty() {
                     Err(AppError::ContentEmpty)
                 } else {
-                    Ok(tree.pop())
+                    tree.pop()
                 }
             }
         }
@@ -1104,11 +1105,6 @@ impl ContentTree {
             Self::Filled(old_data) => {
                 // eprintln!("Insert Filled {}", old_data.get_hash());
                 if idx == 0 {
-                    // if overwrite {
-                    //     let hash = data.hash();
-                    //     *self = Self::Filled(data);
-                    //     Ok(hash)
-                    // } else {
                     let left_hash = data.get_hash();
                     let right_hash = old_data.hash();
                     let hash = double_hash(left_hash, right_hash);
@@ -1119,7 +1115,6 @@ impl ContentTree {
                         right: ContentTree::Filled(old_data.clone()),
                     }));
                     Ok(hash)
-                    // }
                 } else {
                     // This should not happen, but anyway...
                     // eprintln!("filled idx is not 0");
@@ -1135,39 +1130,12 @@ impl ContentTree {
             let _ = self.pop();
         }
         result
-        // self.balance_tree()
     }
 
     pub fn remove_data(&mut self, idx: u16) -> Result<Data, AppError> {
         let myself = std::mem::replace(self, Self::empty(0));
         match myself {
             Self::Empty(_hash) => Err(AppError::ContentEmpty),
-            Self::Hashed(mut subtree) => {
-                let rem_result = subtree.remove_data(idx);
-                let s_len = subtree.len();
-                *self = if s_len == 0 {
-                    Self::Empty(0)
-                } else if s_len == 1 {
-                    Self::Filled(subtree.pop())
-                } else {
-                    Self::Hashed(subtree)
-                };
-                rem_result
-                // match rem_result {
-                //     Ok(data) => Ok(data),
-                //     Err(Some(data)) => {
-                //         if data.len() == 0 {
-                //             *self = ContentTree::empty(0);
-                //             Ok(0)
-                //         } else {
-                //             let hash = data.hash();
-                //             *self = Self::Filled(data);
-                //             Ok(hash)
-                //         }
-                //     }
-                //     Err(None) => Err(()),
-                // }
-            }
             Self::Filled(d) => {
                 if idx == 0 {
                     Ok(d)
@@ -1176,36 +1144,103 @@ impl ContentTree {
                     Err(AppError::IndexingError)
                 }
             }
+            Self::Hashed(mut subtree) => {
+                let chunks_count = subtree.len();
+                // eprintln!("remove_data({}), count: {}", idx, chunks_count);
+                if idx >= chunks_count {
+                    *self = Self::Hashed(subtree);
+                    return Err(AppError::IndexingError);
+                }
+                let shifted_data = subtree.pop();
+                match shifted_data {
+                    Ok(mut data) => {
+                        for i in (idx..chunks_count - 1).rev() {
+                            data = subtree.replace(i, data).unwrap();
+                        }
+                        *self = Self::Hashed(subtree);
+                        Ok(data)
+                    }
+                    Err(st_err) => match st_err {
+                        SubtreeError::Empty => {
+                            *self = Self::Hashed(subtree);
+                            Err(AppError::ContentEmpty)
+                        }
+                        SubtreeError::DatatypeMismatch => {
+                            *self = Self::Hashed(subtree);
+                            Err(AppError::DatatypeMismatch)
+                        }
+                        SubtreeError::BothLeavesEmpty(data) => {
+                            *self = ContentTree::empty(0);
+                            Ok(data)
+                        }
+                        SubtreeError::RightLeafEmpty(mut data) => {
+                            *self = match subtree.left {
+                                ContentTree::Empty(hash) => ContentTree::Empty(hash),
+                                ContentTree::Filled(e_data) => ContentTree::Filled(e_data),
+                                ContentTree::Hashed(mut boxed_st) => {
+                                    boxed_st.hash();
+                                    ContentTree::Hashed(boxed_st)
+                                }
+                            };
+                            for i in (idx..chunks_count - 1).rev() {
+                                data = self.replace(i, data).unwrap();
+                            }
+                            Ok(data)
+                        }
+                    },
+                }
+            }
         }
     }
 
-    fn pop(&mut self) -> Data {
+    fn pop(&mut self) -> Result<Data, AppError> {
         let myself = std::mem::replace(self, Self::Empty(0));
         match myself {
-            Self::Empty(_hash) => Data::empty(0),
+            Self::Empty(_hash) => Err(AppError::ContentEmpty),
             Self::Filled(data) => {
                 // eprintln!("t pop 0 self: {:?}", self);
-                data
+                Ok(data)
             }
             Self::Hashed(mut subtree) => {
                 // eprintln!("t pop 1 stlen before: {}", subtree.len());
-                let taken = subtree.pop();
-                subtree.hash();
-                if subtree.len() == 0 {
-                } else if subtree.len() == 1 {
-                    if let Ok(data) = subtree.replace(0, Data::empty(0)) {
-                        *self = Self::Filled(data);
-                    } else {
-                        panic!("Something went wrong in pop")
+                let pop_result = subtree.pop();
+                match pop_result {
+                    Ok(data) => {
+                        // eprintln!("ok {}", subtree.data_count);
+                        *self = Self::Hashed(subtree);
+                        Ok(data)
                     }
-                } else if subtree.len().count_ones() == 1 {
-                    // eprintln!("Shrinking, right size: {}", subtree.right.len());
-                    *self = subtree.left;
-                } else {
-                    *self = Self::Hashed(subtree);
+                    Err(st_err) => {
+                        // eprintln!("err: {} ,dcount:{}", st_err, subtree.data_count);
+                        match st_err {
+                            SubtreeError::Empty => Err(AppError::ContentEmpty),
+                            SubtreeError::DatatypeMismatch => {
+                                *self = Self::Hashed(subtree);
+                                // eprintln!("dt mismatch");
+                                Err(AppError::DatatypeMismatch)
+                            }
+                            SubtreeError::BothLeavesEmpty(data) => {
+                                *self = Self::Empty(0);
+                                // eprintln!("both empty");
+                                Ok(data)
+                            }
+                            SubtreeError::RightLeafEmpty(data) => {
+                                // eprintln!("RLE2 {:?}", subtree.left);
+                                *self = match subtree.left {
+                                    ContentTree::Empty(hash) => ContentTree::Empty(hash),
+                                    ContentTree::Filled(data) => ContentTree::Filled(data),
+                                    ContentTree::Hashed(mut boxed_st) => {
+                                        boxed_st.hash();
+                                        // eprintln!("New st hash: {}", boxed_st.hash);
+                                        ContentTree::Hashed(boxed_st)
+                                    }
+                                };
+                                // eprintln!("right empty {:?}", self);
+                                Ok(data)
+                            }
+                        }
+                    }
                 }
-                // eprintln!("t pop 1 len after: {}", self.len());
-                taken
             }
         }
     }
@@ -1298,20 +1333,59 @@ impl Subtree {
         }
     }
 
-    pub fn pop(&mut self) -> Data {
+    pub fn pop(&mut self) -> Result<Data, SubtreeError> {
         if self.data_count == 0 {
             // eprintln!("st pop 0");
-            Data::empty(0)
+            Err(SubtreeError::Empty)
         } else if !self.right.is_empty() {
-            // eprintln!("st pop 1");
             self.data_count -= 1;
-            self.right.pop()
+            // eprintln!("st pop 1, new data count: {}", self.data_count);
+            let pop_result = self.right.pop();
+            // eprintln!("right dcount: {}", self.right.len());
+            match pop_result {
+                Ok(data) => {
+                    if self.right.is_empty() {
+                        Err(SubtreeError::RightLeafEmpty(data))
+                    } else {
+                        // eprintln!("nhash: {}", self.hash);
+                        self.hash();
+                        // eprintln!("nhash: {}", self.hash);
+                        Ok(data)
+                    }
+                }
+                Err(app_error) => match app_error {
+                    AppError::ContentEmpty => Err(SubtreeError::Empty),
+                    AppError::DatatypeMismatch => Err(SubtreeError::DatatypeMismatch),
+                    other => {
+                        panic!("This should not happen!: {}", other);
+                    }
+                },
+            }
         } else {
-            // eprintln!("st pop 2");
+            // right is empty
+            //
             // TODO: we need to make sure that after pop this Subtree
             // is converted into ContentTree, since it's right side is empty
             self.data_count -= 1;
-            self.left.pop()
+            // eprintln!("st pop 2, new data count: {}", self.data_count);
+            let pop_result = self.left.pop();
+            // eprintln!("right dcount: {}", self.right.len());
+            match pop_result {
+                Ok(data) => {
+                    if self.left.is_empty() {
+                        Err(SubtreeError::BothLeavesEmpty(data))
+                    } else {
+                        Err(SubtreeError::RightLeafEmpty(data))
+                    }
+                }
+                Err(app_error) => match app_error {
+                    AppError::ContentEmpty => Err(SubtreeError::Empty),
+                    AppError::DatatypeMismatch => Err(SubtreeError::DatatypeMismatch),
+                    other => {
+                        panic!("This should not happen: {:?}!", other);
+                    }
+                },
+            }
         }
     }
 
@@ -1334,31 +1408,9 @@ impl Subtree {
                 data = self.replace(i, data).unwrap();
             }
         }
-        self.append(data)
-    }
-
-    /// We remove element from a Subtree
-    /// Every time we remove an element from subtree, the tree is being rebuilt.
-    /// This process is required in order to keep Data in sync and all
-    /// hash dependent functions to work properly.
-    /// If possible it is recommended to use update(d_id, Data::empty()) instead.
-    // How to make this work
-    // We call pop_data to remove last element.
-    // Then we call update_data starting from last but one until idx argument
-    // This way we replace data under index n with what was under n+1
-    // When we reach index idx we return result of this update_data call as
-    // result of remove function
-    pub fn remove_data(&mut self, idx: u16) -> Result<Data, AppError> {
-        let chunks_count = self.len();
-        eprintln!("remove_data({}), count: {}", idx, chunks_count);
-        if idx >= chunks_count {
-            return Err(AppError::IndexingError);
-        }
-        let mut shifted_data = self.pop();
-        for i in (idx..chunks_count - 1).rev() {
-            shifted_data = self.replace(i, shifted_data).unwrap();
-        }
-        Ok(shifted_data)
+        let result = self.append(data);
+        self.hash();
+        result
     }
 }
 
