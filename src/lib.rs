@@ -201,6 +201,7 @@ async fn serve_gnome_manager(
             match message {
                 FromGnomeManager::MyID(m_id) => my_id = m_id,
                 FromGnomeManager::SwarmFounderDetermined(swarm_id, f_id) => {
+                    eprintln!("SwarmFounderDetermined (is it me?: {})", f_id == my_id);
                     app_mgr.update_app_data_founder(swarm_id, f_id);
                     //TODO: distinguish between founder and my_id, if not equal
                     // request gnome manager to join another swarm where f_id == my_id
@@ -211,6 +212,9 @@ async fn serve_gnome_manager(
                             let _ = to_gnome_mgr.send(ToGnomeManager::JoinSwarm(
                                 SwarmName::new(my_id, "/".to_string()).unwrap(),
                             ));
+                        } else {
+                            eprintln!("TODO: Need to notify neighbor about my swarm");
+                            app_mgr.set_active(&my_id);
                         }
                     } else {
                         own_swarm_started = true;
@@ -1852,9 +1856,17 @@ async fn serve_app_data(
                                 SyncResponse::Datastore(part_no, total, mut hashes) => {
                                     let prev_dstore_sync =
                                         std::mem::replace(&mut datastore_sync, None);
+                                    eprintln!(
+                                        "SID-{} PrevDSync: {:?}",
+                                        swarm_id.0, prev_dstore_sync
+                                    );
                                     if let Some((next_awaited_part_no, mut missing_hashes)) =
                                         prev_dstore_sync
                                     {
+                                        eprintln!(
+                                            "next_awaited_part_no: {}, part_no : {}, total: {}",
+                                            next_awaited_part_no, part_no, total
+                                        );
                                         if next_awaited_part_no != part_no {
                                             missing_hashes.insert(part_no, hashes);
                                             datastore_sync =
@@ -2015,9 +2027,16 @@ async fn serve_app_data(
                                             let _ = to_app_mgr_send.send(ToAppMgr::ContentAdded(
                                                 swarm_id, c_id, data_type,
                                             ));
-                                            let res =
-                                                app_data.update(c_id, data_to_link(data).unwrap());
+                                            let link_result = data_to_link(data);
+                                            if let Ok(link) = link_result {
+                                                let _res = app_data.update(c_id, link);
                                             // eprintln!("Update result: {:?}", res);
+                                            } else {
+                                                eprintln!(
+                                                    "Failed to create a link: {:?}",
+                                                    link_result.err().unwrap()
+                                                );
+                                            }
                                         }
                                     } else if let Ok((d_type, len)) =
                                         app_data.get_type_and_len(c_id)
