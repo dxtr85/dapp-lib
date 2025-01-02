@@ -201,7 +201,7 @@ async fn serve_gnome_manager(
             match message {
                 FromGnomeManager::MyID(m_id) => my_id = m_id,
                 FromGnomeManager::SwarmFounderDetermined(swarm_id, f_id) => {
-                    eprintln!("SwarmFounderDetermined (is it me?: {})", f_id == my_id);
+                    // eprintln!("SwarmFounderDetermined (is it me?: {})", f_id == my_id);
                     app_mgr.update_app_data_founder(swarm_id, f_id);
                     //TODO: distinguish between founder and my_id, if not equal
                     // request gnome manager to join another swarm where f_id == my_id
@@ -213,7 +213,7 @@ async fn serve_gnome_manager(
                                 SwarmName::new(my_id, "/".to_string()).unwrap(),
                             ));
                         } else {
-                            eprintln!("TODO: Need to notify neighbor about my swarm");
+                            // eprintln!("TODO: Need to notify neighbor about my swarm");
                             app_mgr.set_active(&my_id);
                         }
                     } else {
@@ -471,7 +471,7 @@ async fn serve_app_data(
                 }
             }
             ToAppData::AppendShelledDatas(c_id, hash_data, data_vec) => {
-                eprintln!("evaluating AppendShelledDatas");
+                // eprintln!("evaluating AppendShelledDatas");
                 if let Ok((_d_type, pre_hash)) = app_data.content_root_hash(c_id) {
                     //TODO: here we need to calculate root hash
                     let mut c = app_data.shell(c_id).unwrap();
@@ -516,12 +516,12 @@ async fn serve_app_data(
                             data,
                         );
                         next_data_idx += 1;
-                        eprintln!("pre_req: {:?}", reqs.pre);
-                        eprintln!("post_req: {:?}", reqs.post);
+                        // eprintln!("pre_req: {:?}", reqs.pre);
+                        // eprintln!("post_req: {:?}", reqs.post);
                         let parts = msg.into_parts();
-                        eprintln!("Parts count: {}", parts.len());
+                        // eprintln!("Parts count: {}", parts.len());
                         for part in parts {
-                            eprintln!("SyncData len: {}", part.len());
+                            // eprintln!("SyncData len: {}", part.len());
                             let _ = to_gnome_sender.send(ToGnome::AddData(part));
                         }
                     }
@@ -578,12 +578,12 @@ async fn serve_app_data(
             // A local request from application to synchronize with swarm
             ToAppData::UpdateData(c_id, d_id, data) => {
                 //TODO:serve this
-                eprintln!(
-                    "Got ToAppData::UpdateData({}, {}, Dlen: {})",
-                    c_id,
-                    d_id,
-                    data.len()
-                );
+                // eprintln!(
+                //     "Got ToAppData::UpdateData({}, {}, Dlen: {})",
+                //     c_id,
+                //     d_id,
+                //     data.len()
+                // );
                 let pre_hash = app_data.content_root_hash(c_id).unwrap();
                 let pre: Vec<(ContentID, u64)> = vec![(c_id, pre_hash.1)];
                 let prev_data = app_data
@@ -1233,8 +1233,8 @@ async fn serve_app_data(
                                 let d_type = content.data_type();
                                 let _res = app_data.append(content);
                                 // eprintln!("Content added: {:?}", res);
-                                let hash = app_data.root_hash();
-                                eprintln!("Sending updated hash: {}", hash);
+                                // let hash = app_data.root_hash();
+                                // eprintln!("Sending updated hash: {}", hash);
                                 // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
                                 // eprintln!("Send res: {:?}", res);
                                 let _to_mgr_res = to_app_mgr_send
@@ -1360,7 +1360,7 @@ async fn serve_app_data(
                                 }
                             } else {
                                 let hash = app_data.root_hash();
-                                eprintln!("Sending updated hash: {}", hash);
+                                // eprintln!("Sending updated hash: {}", hash);
                                 // let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
                                 // eprintln!("Send res: {:?}", res);
                                 eprintln!(
@@ -1396,7 +1396,7 @@ async fn serve_app_data(
                                 eprintln!("Restore result: {:?}", res);
                             } else {
                                 let hash = app_data.root_hash();
-                                eprintln!("Sending updated hash: {}", hash);
+                                // eprintln!("Sending updated hash: {}", hash);
                                 // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
                                 // eprintln!("Send res: {:?}", res);
                                 eprintln!("Data appended successfully ({})", hash);
@@ -1904,11 +1904,11 @@ async fn serve_app_data(
                                                     curr_cid, hash
                                                 );
                                                 let _r = app_data.update(curr_cid, content);
-                                                eprintln!(
-                                                    "Result: {:?}, {}",
-                                                    _r,
-                                                    app_data.content_root_hash(curr_cid).unwrap().1
-                                                );
+                                                // eprintln!(
+                                                //     "Result: {:?}, {}",
+                                                //     _r,
+                                                //     app_data.content_root_hash(curr_cid).unwrap().1
+                                                // );
                                             } else {
                                                 let c_id = app_data.next_c_id().unwrap();
                                                 eprintln!(
@@ -1932,13 +1932,13 @@ async fn serve_app_data(
                                     }
                                 }
                                 SyncResponse::Hashes(c_id, part_no, total, hashes) => {
-                                    eprintln!(
-                                        "Received hashes [{}/{}] of {} (len: {})!",
-                                        part_no,
-                                        total,
-                                        c_id,
-                                        hashes.len()
-                                    );
+                                    // eprintln!(
+                                    //     "Received hashes [{}/{}] of {} (len: {})!",
+                                    //     part_no,
+                                    //     total,
+                                    //     c_id,
+                                    //     hashes.len()
+                                    // );
                                     if let Ok((d_type, _len)) = app_data.get_type_and_len(c_id) {
                                         if matches!(d_type, DataType::Link) {
                                             let upd_res = app_data.update_transformative_link(
@@ -1955,30 +1955,30 @@ async fn serve_app_data(
                                                     let hash = u64::from_be_bytes(
                                                         chunk.try_into().unwrap(),
                                                     );
-                                                    eprintln!("Hash from Neighbor: {}", hash);
+                                                    // eprintln!("Hash from Neighbor: {}", hash);
                                                     data_vec.push(Data::empty(hash));
                                                 }
 
                                                 let ct = ContentTree::from(data_vec);
                                                 let c = Content::Data(d_type, ct);
-                                                eprintln!(
-                                                    "New bottom hashes: {:?}",
-                                                    c.data_hashes()
-                                                );
+                                                // eprintln!(
+                                                //     "New bottom hashes: {:?}",
+                                                //     c.data_hashes()
+                                                // );
                                                 let new_hash = c.hash();
                                                 let (_type, old_hash) =
                                                     app_data.content_root_hash(c_id).unwrap();
                                                 if old_hash == new_hash {
                                                     let _old_c = app_data.update(c_id, c).unwrap();
-                                                    eprintln!(
-                                                        "Updated Content {} with hashes",
-                                                        c_id
-                                                    );
+                                                    // eprintln!(
+                                                    //     "Updated Content {} with hashes",
+                                                    //     c_id
+                                                    // );
                                                 } else {
                                                     eprintln!("Can not update CID {} since old {} != {} new",c_id,old_hash,new_hash);
                                                 }
                                             } else {
-                                                todo!("implement me!");
+                                                todo!("dapp-lib/lib.rs:1981 implement me!");
                                             }
                                         }
                                     }
@@ -2005,13 +2005,22 @@ async fn serve_app_data(
                                                     // eprintln!("Update result: {:?}", res);
                                                 }
                                             } else {
-                                                eprintln!("Inserting page 0 of non-Link content");
+                                                // eprintln!("Inserting page 0 of non-Link content");
 
                                                 let res = app_data.update_data(c_id, page_no, data);
-                                                eprintln!(
-                                                    "C-{} Page #{} update result: {:?}",
-                                                    c_id, page_no, res
-                                                );
+                                                if res.is_ok() {
+                                                    eprintln!(
+                                                        "C-{} Page #{} update result: ok",
+                                                        c_id, page_no,
+                                                    );
+                                                } else {
+                                                    eprintln!(
+                                                        "C-{} Page #{} update failed: {:?}",
+                                                        c_id,
+                                                        page_no,
+                                                        res.err().unwrap()
+                                                    );
+                                                }
                                             }
                                         } else if data_type < DataType::Link {
                                             // eprintln!("Create new Data");
@@ -2044,10 +2053,19 @@ async fn serve_app_data(
                                         if d_type == data_type {
                                             // let res = app_data.append_data(c_id, data);
                                             let res = app_data.update_data(c_id, page_no, data);
-                                            eprintln!(
-                                                "C-{} Page #{} update result: {:?}",
-                                                c_id, page_no, res
-                                            );
+                                            if res.is_ok() {
+                                                eprintln!(
+                                                    "C-{} Page #{} update result: ok",
+                                                    c_id, page_no,
+                                                );
+                                            } else {
+                                                eprintln!(
+                                                    "C-{} Page #{} update error: {:?}",
+                                                    c_id,
+                                                    page_no,
+                                                    res.err().unwrap()
+                                                );
+                                            }
                                         } else if d_type == DataType::Link {
                                             let res = app_data.update_transformative_link(
                                                 false, c_id, page_no, total, data,
@@ -2067,7 +2085,7 @@ async fn serve_app_data(
                         }
                     }
                     other => {
-                        eprintln!("Response {}", other);
+                        eprintln!("Unhandled response {}", other);
                     }
                 }
             }
@@ -2095,13 +2113,13 @@ async fn serve_app_data(
                 }
                 let (_t, len) = type_and_len_result.unwrap();
                 let (t, root_hash) = app_data.content_root_hash(c_id).unwrap();
-                eprintln!("Read {}, data len: {}", c_id, len);
+                // eprintln!("Read {}, data len: {}", c_id, len);
                 let all_data_result = app_data.get_all_data(c_id);
                 if let Ok(data_vec) = all_data_result {
                     // let calculated_hash =
-                    if c_id == 0 {
-                        eprintln!("Sending read result with {} data blocks", data_vec.len());
-                    }
+                    // if c_id == 0 {
+                    //     eprintln!("Sending read result with {} data blocks", data_vec.len());
+                    // }
                     let _ =
                         to_app_mgr_send.send(ToAppMgr::ReadSuccess(swarm_id, c_id, t, data_vec));
                 } else {
@@ -2253,7 +2271,7 @@ async fn serve_swarm(
                             .await;
                     }
                     other => {
-                        eprintln!("Unserved Reconfig from Gnome: {}", id);
+                        eprintln!("Unserved Reconfig from {}: {:?}", id, other);
                     }
                 },
                 _ => {
@@ -2486,7 +2504,7 @@ impl ApplicationData {
                     *item = bytes.drain(0..1).next().unwrap();
                 }
                 let hash = u64::from_be_bytes(hash);
-                eprintln!("Expecting hash: {}", hash);
+                // eprintln!("Expecting hash: {}", hash);
                 all_hashes.push(hash);
                 self.hash_to_temp_idx.insert(hash, next_idx);
             }
@@ -2500,7 +2518,7 @@ impl ApplicationData {
             if let Some(temp_idx) = self.hash_to_temp_idx.get(&hash) {
                 // println!("Oh yeah");
                 if let Some((vec, mut hm)) = self.partial_data.remove(temp_idx) {
-                    eprintln!("Inserting data len: {}", data.len());
+                    // eprintln!("Inserting data len: {}", data.len());
                     hm.insert(hash, data);
                     // println!("{} ==? {}", vec.len(), hm.len());
                     if vec.len() == hm.len() {
@@ -2577,7 +2595,7 @@ impl ApplicationData {
             if let Some(temp_idx) = self.hash_to_temp_idx.get(&hash) {
                 // println!("Oh yeah");
                 if let Some((vec, mut hm)) = self.partial_data.remove(temp_idx) {
-                    eprintln!("Inserting data len: {}", data.len());
+                    // eprintln!("Inserting data len: {}", data.len());
                     hm.insert(hash, data);
                     // println!("{} ==? {}", vec.len(), hm.len());
                     if vec.len() == hm.len() {
