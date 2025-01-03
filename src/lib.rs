@@ -2,6 +2,7 @@ use crate::content::data_to_link;
 use crate::prelude::SyncRequirements;
 use crate::prelude::TransformInfo;
 use crate::sync_message::serialize_requests;
+use std::path::PathBuf;
 use std::time::Duration;
 mod app_type;
 mod config;
@@ -161,9 +162,10 @@ pub fn initialize(
     to_user_send: Sender<ToApp>,
     to_app_mgr_send: Sender<ToAppMgr>,
     to_app_mgr_recv: Receiver<ToAppMgr>,
-    config: Configuration,
+    config_dir: PathBuf,
 ) -> GnomeId {
-    let (gmgr_send, gmgr_recv, my_id) = init(config.work_dir.clone(), config.neighbors);
+    let config = Configuration::new(config_dir.clone());
+    let (gmgr_send, gmgr_recv, my_id) = init(config_dir, config.neighbors);
     spawn(serve_gnome_manager(
         gmgr_send,
         gmgr_recv,
