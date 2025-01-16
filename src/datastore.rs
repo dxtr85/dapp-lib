@@ -470,7 +470,18 @@ impl Datastore {
         match self {
             Self::Empty => 0, // This is unexpected to happen
             Self::Filled(content) => content.hash(),
-            Self::Hashed(s_store) => s_store.hash,
+            // Self::Hashed(s_store) => s_store.hash,
+            Self::Hashed(s_store) => {
+                // let dh = double_hash(s_store.left.hash(), s_store.right.hash());
+                // eprintln!(
+                //     "DH from:  &  = {} ",
+                //     // s_store.left.hash(),
+                //     // s_store.right.hash(),
+                //     // dh,
+                //     s_store.hash
+                // );
+                s_store.hash
+            }
         }
     }
     pub fn get_root_content_typed_hash(
@@ -643,11 +654,13 @@ impl Substore {
             return Err(AppError::IndexingError);
         }
         let left_len = self.left.len();
-        if c_id >= left_len {
+        let result = if c_id >= left_len {
             self.right.update_data((c_id - left_len, data_id), data)
         } else {
             self.left.update_data((c_id, data_id), data)
-        }
+        };
+        self.hash();
+        result
     }
 
     pub fn hash(&mut self) -> u64 {

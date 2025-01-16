@@ -2,6 +2,7 @@ use crate::content::data_to_link;
 use crate::prelude::SyncRequirements;
 use crate::prelude::TransformInfo;
 use crate::sync_message::serialize_requests;
+use std::arch::x86_64::_MM_FROUND_TO_NEAREST_INT;
 use std::path::PathBuf;
 use std::time::Duration;
 mod app_type;
@@ -13,11 +14,16 @@ mod error;
 mod manager;
 mod message;
 mod registry;
+mod storage;
 mod sync_message;
 use app_type::AppType;
+use async_std::fs::create_dir_all;
 use async_std::net::ToSocketAddrs;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use storage::load_content_from_disk;
+use storage::store_data_on_disk;
+// use storage::write_datastore_to_disk;
 use sync_message::deserialize_requests;
 use sync_message::SyncRequest;
 use sync_message::SyncResponse;
@@ -36,6 +42,7 @@ use gnome::prelude::*;
 pub use manager::ApplicationManager;
 use message::{SyncMessage, SyncMessageType};
 use registry::ChangeRegistry;
+use storage::read_datastore_from_disk;
 // TODO: probably better to use async channels for this lib where possible
 use std::sync::mpsc::channel;
 use std::sync::mpsc::Receiver;
@@ -81,6 +88,7 @@ pub enum ToApp {
 pub enum ToAppMgr {
     GetCIDsForTags(SwarmID, GnomeId, Vec<u8>, Vec<(ContentID, Data)>),
     CIDsForTag(SwarmID, GnomeId, u8, ContentID, Data),
+    ContentLoadedFromDisk(SwarmID, ContentID, DataType),
     ReadData(SwarmID, ContentID),
     ReadSuccess(SwarmID, ContentID, DataType, Vec<Data>),
     ReadError(SwarmID, ContentID, AppError),
@@ -114,7 +122,7 @@ pub enum ToAppData {
     EndBroadcast,
     UnsubscribeBroadcast,
     ListNeighbors,
-    SwarmReady,
+    SwarmReady(SwarmName),
     BCastData(CastID, CastData),
     BCastOrigin(CastID, Sender<CastData>),
     ChangeContent(ContentID, DataType, Vec<Data>),
@@ -165,8 +173,10 @@ pub fn initialize(
     config_dir: PathBuf,
 ) -> GnomeId {
     let config = Configuration::new(config_dir.clone());
+    eprintln!("Storage root: {:?}", config.storage);
     let (gmgr_send, gmgr_recv, my_id) = init(config_dir, config.neighbors);
     spawn(serve_gnome_manager(
+        config.storage.clone(),
         gmgr_send,
         gmgr_recv,
         to_user_send,
@@ -177,6 +187,7 @@ pub fn initialize(
 }
 
 async fn serve_gnome_manager(
+    storage: PathBuf,
     to_gnome_mgr: Sender<ToGnomeManager>,
     from_gnome_mgr: Receiver<FromGnomeManager>,
     to_user: Sender<ToApp>,
@@ -184,6 +195,7 @@ async fn serve_gnome_manager(
     to_app_mgr_recv: Receiver<ToAppMgr>,
 ) {
     // TODO: AppMgr should hold state
+    eprintln!("Storage root, gmgr: {:?}", storage);
     let message = from_gnome_mgr
         .recv()
         .expect("First message sent from gnome mgr has to be MyID");
@@ -240,9 +252,13 @@ async fn serve_gnome_manager(
                     // TODO: we need a bi-directional comm between AppMgr and user App
                     let (to_app_data_send, to_app_data_recv) = achannel::bounded(32);
                     app_mgr.add_app_data(s_name, s_id, to_app_data_send.clone());
-                    let app_data = ApplicationData::new(AppType::Catalog);
+                    // TODO: build an algorithm that decides how many pages should be provisioned
+                    let max_pages_in_memory = 32768;
                     // eprintln!("spawning new serve_app_data");
+                    let app_data = ApplicationData::new(AppType::Catalog);
                     spawn(serve_app_data(
+                        storage.clone(),
+                        max_pages_in_memory,
                         s_id,
                         app_data,
                         to_app_data_send.clone(),
@@ -380,6 +396,17 @@ async fn serve_gnome_manager(
                     // eprintln!("GENERATE ToApp::NewContent({:?},{:?})", c_id, d_type);
                     let _ = to_user.send(ToApp::NewContent(s_id, c_id, d_type));
                 }
+                ToAppMgr::ContentLoadedFromDisk(s_id, c_id, d_type) => {
+                    // eprintln!("GENERATE ToApp::NewContent({:?},{:?})", c_id, d_type);
+                    if c_id > 0 {
+                        let _ = to_user.send(ToApp::NewContent(s_id, c_id, d_type));
+                    } else {
+                        // eprintln!("Not informing user about Manifest in {:?}", s_id);
+                        if let Some(to_app_data) = app_mgr.app_data_store.get(&s_id) {
+                            let _ = to_app_data.send(ToAppData::ReadData(c_id)).await;
+                        }
+                    }
+                }
                 ToAppMgr::ContentChanged(s_id, c_id) => {
                     eprintln!("ToApp::ContentChanged({:?})", c_id,);
                     let _ = to_user.send(ToApp::ContentChanged(s_id, c_id));
@@ -387,7 +414,10 @@ async fn serve_gnome_manager(
                 ToAppMgr::Quit => {
                     // eprintln!("AppMgr received Quit");
                     let _ = to_gnome_mgr.send(ToGnomeManager::Disconnect);
-                    let _ = app_mgr.active_app_data.send(ToAppData::Terminate).await;
+                    for app_data in app_mgr.app_data_store.values() {
+                        // let _ = app_mgr.active_app_data.send(ToAppData::Terminate).await;
+                        let _ = app_data.send(ToAppData::Terminate).await;
+                    }
                     break;
                 }
             }
@@ -397,6 +427,8 @@ async fn serve_gnome_manager(
 }
 
 async fn serve_app_data(
+    storage: PathBuf,
+    max_pages_in_memory: usize,
     swarm_id: SwarmID,
     mut app_data: ApplicationData,
     app_data_send: ASender<ToAppData>,
@@ -404,29 +436,72 @@ async fn serve_app_data(
     to_gnome_sender: Sender<ToGnome>,
     to_app_mgr_send: Sender<ToAppMgr>,
 ) {
+    let mut s_storage = PathBuf::new();
+    // TODO: use this variable to track how many pages are being stored in memory
+    let mut used_memory_pages = 0;
+    // TODO: build logic to decide whether or not we should store this Swarm's data on disk
+    //       and if so, which parts of it (maybe all?)
+    //       This should be merged with application logic
+    let mut store_on_disk = false;
+    eprintln!("Storage root app data: {:?}", storage);
+    eprintln!(
+        "{:?} Memory: {}/{} Pages (not implemented)",
+        swarm_id, used_memory_pages, max_pages_in_memory
+    );
     let mut b_cast_origin: Option<(CastID, Sender<CastData>)> = None;
     let mut link_with_transform_info: Option<ContentID> = None;
     let mut b_req_sent = false;
-    let mut next_val = 0;
+    // let mut next_val = 0;
     let mut datastore_sync: Option<(u16, HashMap<u16, Vec<(DataType, u64)>>)> =
         Some((0, HashMap::new()));
     let sleep_time = Duration::from_millis(32);
     while let Ok(resp) = app_data_recv.recv().await {
         match resp {
             // TODO: We should always assume to be out of sync
-            ToAppData::SwarmReady => {
-                // if !is_synced {
-                //     eprintln!("App not synced!");
+            ToAppData::SwarmReady(s_name) => {
+                s_storage = storage.join(s_name.to_path());
+                let dsync_store = s_storage.join("datastore.sync");
+                if dsync_store.exists() {
+                    app_data = read_datastore_from_disk(
+                        dsync_store.clone(),
+                        // app_data_send.clone(),
+                    )
+                    .await
+                } else {
+                    eprintln!("{:?} does not exist", dsync_store);
+                    //     ApplicationData::new(AppType::Catalog)
+                };
+                // TODO: spawn a task to load datastore from disk into memory for
+                //       comparison with Swarm's datastore
+                if s_storage.exists() {
+                    store_on_disk = true;
+                    eprintln!("Swarm storage at: {:?}", s_storage);
+                    // TODO: now we need to compare what we have on disk with Swarm
+                } else {
+                    // TODO: decide if we should create a dir (possibly after syncing)
+                    eprintln!("Creating Swarm storage at: {:?}", s_storage);
+                    let _ = create_dir_all(s_storage.clone()).await;
+                }
+                //TODO: implement logic for disk storage verification against swarm
+                //
+                // If we have some data on disk we send only Datastore request
+                // once we receive it, we compare received value against what we store
+                // on disk.
+                // if they match, we read data from disk,
+                // if they differ, we find out what is the difference and send
+                // requests to neighbors for missing data,
+                // all other data that matches is being read from disk
+                //
+                // And if we do not have data on disk we follow the same route as if
+                // we had some data on disk, but it was all invalid, so maximum difference.
                 let sync_requests: Vec<SyncRequest> = vec![
                     SyncRequest::Datastore,
-                    SyncRequest::AllFirstPages(Some(vec![0])),
-                    SyncRequest::Hashes(0, vec![]),
-                    SyncRequest::Hashes(1, vec![]),
-                    SyncRequest::Hashes(2, vec![]),
-                    SyncRequest::Hashes(3, vec![]),
+                    // SyncRequest::AllFirstPages(Some(vec![0])),
+                    // SyncRequest::Hashes(0, vec![]),
+                    // SyncRequest::Hashes(1, vec![]),
                     // SyncRequest::Hashes(2, vec![]),
                     // SyncRequest::Hashes(3, vec![]),
-                    SyncRequest::AllPages(vec![0, 1, 2, 3]),
+                    // SyncRequest::AllPages(vec![0, 1, 2, 3]),
                 ];
                 // let sync_requests: Vec<u8> = vec![
                 //     0, // We want all root hashes from Datastore
@@ -546,7 +621,7 @@ async fn serve_app_data(
                     for part in parts {
                         let _ = to_gnome_sender.send(ToGnome::AddData(part));
                     }
-                    next_val += 1;
+                    // next_val += 1;
                 }
             }
             ToAppData::AppendData(c_id, data) => {
@@ -1086,7 +1161,7 @@ async fn serve_app_data(
                         }
                         //TODO: we need to set this upon receiving Gnome's confirmation
                         link_with_transform_info = Some(content_id);
-                        next_val += 1;
+                        // next_val += 1;
                         eprintln!("// 8. For each Link Send computed Hashes via broadcast");
                         let (done_send, done_recv) = channel();
                         let mut hash_bytes = vec![];
@@ -1856,21 +1931,23 @@ async fn serve_app_data(
                                     app_data.update_partial(is_hash_data, data);
                                 }
                                 SyncResponse::Datastore(part_no, total, mut hashes) => {
+                                    eprintln!("Got SyncResponse::Datastore");
                                     let prev_dstore_sync =
                                         std::mem::replace(&mut datastore_sync, None);
-                                    eprintln!(
-                                        "SID-{} PrevDSync: {:?}",
-                                        swarm_id.0, prev_dstore_sync
-                                    );
+                                    // eprintln!(
+                                    //     "SID-{} PrevDSync: {:?}",
+                                    //     swarm_id.0, prev_dstore_sync
+                                    // );
                                     if let Some((next_awaited_part_no, mut missing_hashes)) =
                                         prev_dstore_sync
                                     {
-                                        eprintln!(
-                                            "next_awaited_part_no: {}, part_no : {}, total: {}",
-                                            next_awaited_part_no, part_no, total
-                                        );
+                                        // eprintln!(
+                                        //     "next_awaited_part_no: {}, part_no : {}, total: {}",
+                                        //     next_awaited_part_no, part_no, total
+                                        // );
                                         if next_awaited_part_no != part_no {
                                             missing_hashes.insert(part_no, hashes);
+                                            eprintln!("datastore_sync is Some again");
                                             datastore_sync =
                                                 Some((next_awaited_part_no, missing_hashes));
                                             continue;
@@ -1891,44 +1968,135 @@ async fn serve_app_data(
                                         }
                                         if last_processed != total {
                                             datastore_sync =
-                                                Some((last_processed + 1, missing_hashes))
+                                                Some((last_processed + 1, missing_hashes));
+                                            eprintln!(
+                                                "Waiting for SyncResponse::Datastore [{}/{}]…",
+                                                last_processed + 1,
+                                                total,
+                                            );
+                                            continue;
                                         }
 
-                                        let c_id = app_data.next_c_id().unwrap();
+                                        // TODO: from now on, we have a complete snapshot
+                                        // of Swarm's datastore, we need to compare it against
+                                        // our own, and request missing data from neighbors
+                                        // and load valid data from disk
+                                        // let c_id = app_data.next_c_id().unwrap();
                                         let mut curr_cid = 0;
 
                                         for (data_type, hash) in hashes {
-                                            let tree = ContentTree::empty(hash);
-                                            let content = Content::Data(data_type, tree);
-                                            if curr_cid < c_id {
-                                                eprintln!(
-                                                    "Updating Datastore CID: {}, hash: {}",
-                                                    curr_cid, hash
-                                                );
-                                                let _r = app_data.update(curr_cid, content);
-                                                // eprintln!(
-                                                //     "Result: {:?}, {}",
-                                                //     _r,
-                                                //     app_data.content_root_hash(curr_cid).unwrap().1
-                                                // );
+                                            if let Ok((dtype, dhash)) =
+                                                app_data.content_root_hash(curr_cid)
+                                            {
+                                                if data_type == dtype {
+                                                    if hash == dhash {
+                                                        if let Some(content) =
+                                                            load_content_from_disk(
+                                                                s_storage.clone(),
+                                                                curr_cid,
+                                                                dtype,
+                                                                dhash,
+                                                            )
+                                                            .await
+                                                        {
+                                                            let _res =
+                                                                app_data.update(curr_cid, content);
+                                                            eprintln!(
+                                                                "Load {:?} CID-{} from disk ok: {}",
+                                                                swarm_id,
+                                                                curr_cid,
+                                                                _res.is_ok()
+                                                            );
+                                                            // if curr_cid > 0 {
+                                                            let _ = to_app_mgr_send.send(
+                                                                ToAppMgr::ContentLoadedFromDisk(
+                                                                    swarm_id, curr_cid, dtype,
+                                                                ),
+                                                            );
+                                                            // } else {
+                                                            //     let datas = app_data
+                                                            //         .get_all_data(curr_cid)
+                                                            //         .unwrap();
+                                                            //     let _ = to_app_mgr_send.send(
+                                                            //         ToAppMgr::ReadSuccess(
+                                                            //             swarm_id, curr_cid, dtype,
+                                                            //             datas,
+                                                            //         ),
+                                                            //     );
+                                                            // }
+                                                        } else {
+                                                            eprintln!(
+                                                                "Load CID-{} from disk failed",
+                                                                curr_cid,
+                                                            );
+                                                            request_content_from_any_neighbor(
+                                                                curr_cid,
+                                                                true,
+                                                                true,
+                                                                to_gnome_sender.clone(),
+                                                            );
+                                                        }
+                                                    } else {
+                                                        //TODO: hashes differ
+                                                        request_content_from_any_neighbor(
+                                                            curr_cid,
+                                                            true,
+                                                            true,
+                                                            to_gnome_sender.clone(),
+                                                        );
+                                                        eprintln!("CID-{} Hash mismatch(disk: {} != {} swarm)", curr_cid,dhash,hash);
+                                                    }
+                                                } else {
+                                                    //TODO: mismatching data types
+                                                    // only valid scenario is when
+                                                    // Link got transposed into Data
+                                                    request_content_from_any_neighbor(
+                                                        curr_cid,
+                                                        true,
+                                                        true,
+                                                        to_gnome_sender.clone(),
+                                                    );
+                                                    eprintln!("CID-{} DType mismatch", curr_cid);
+                                                }
                                             } else {
-                                                let c_id = app_data.next_c_id().unwrap();
-                                                eprintln!(
-                                                    "Appending Datastore CID: {}, hash: {}",
-                                                    c_id, hash
+                                                //TODO: we do not have this on disk
+                                                request_content_from_any_neighbor(
+                                                    curr_cid,
+                                                    true,
+                                                    true,
+                                                    to_gnome_sender.clone(),
                                                 );
-                                                let _res = app_data.append(content);
-                                                let _ =
-                                                    to_app_mgr_send.send(ToAppMgr::ContentAdded(
-                                                        swarm_id, c_id, data_type,
-                                                    ));
+                                                eprintln!("CID-{} not found on disk", curr_cid);
                                             }
-                                            curr_cid = curr_cid + 1;
+                                            curr_cid += 1;
                                         }
-                                        eprintln!(
-                                            "SyncResponse::Datastore [{}/{}] ",
-                                            part_no, total,
-                                        );
+                                        // for (data_type, hash) in hashes {
+                                        //     let tree = ContentTree::empty(hash);
+                                        //     let content = Content::Data(data_type, tree);
+                                        //     if curr_cid < c_id {
+                                        //         eprintln!(
+                                        //             "Updating Datastore CID: {}, hash: {}",
+                                        //             curr_cid, hash
+                                        //         );
+                                        //         let _r = app_data.update(curr_cid, content);
+                                        //     } else {
+                                        //         let c_id = app_data.next_c_id().unwrap();
+                                        //         eprintln!(
+                                        //             "Appending Datastore CID: {}, hash: {}",
+                                        //             c_id, hash
+                                        //         );
+                                        //         let _res = app_data.append(content);
+                                        //         let _ =
+                                        //             to_app_mgr_send.send(ToAppMgr::ContentAdded(
+                                        //                 swarm_id, c_id, data_type,
+                                        //             ));
+                                        //     }
+                                        //     curr_cid = curr_cid + 1;
+                                        // }
+                                        // eprintln!(
+                                        //     "SyncResponse::Datastore [{}/{}] ",
+                                        //     part_no, total,
+                                        // );
                                     } else {
                                         eprintln!("Datastore is synced, why sent this?");
                                     }
@@ -2196,6 +2364,12 @@ async fn serve_app_data(
                 }
             }
             ToAppData::Terminate => {
+                // TODO: determine whether or not we want to store this Swarm on disk
+                if store_on_disk {
+                    // TODO: pass parameters indicating what data to store
+                    store_data_on_disk(s_storage, app_data).await;
+                }
+
                 eprintln!("Done serving AppData");
                 break;
             }
@@ -2216,9 +2390,9 @@ async fn serve_swarm(
         while let Ok(resp) = user_res.try_recv() {
             // println!("SUR: {:?}", resp);
             match resp {
-                GnomeToApp::SwarmReady => {
+                GnomeToApp::SwarmReady(s_name) => {
                     // eprintln!("Gnome says if synced: {}", synced);
-                    let _ = to_app_data_send.send(ToAppData::SwarmReady).await;
+                    let _ = to_app_data_send.send(ToAppData::SwarmReady(s_name)).await;
                 }
                 GnomeToApp::Broadcast(_s_id, c_id, recv_d) => {
                     spawn(serve_broadcast(
@@ -2285,6 +2459,32 @@ async fn serve_swarm(
     }
 }
 
+fn request_content_from_any_neighbor(
+    cid: u16,
+    hashes: bool,
+    // first_page: bool,
+    all_pages: bool,
+    to_gnome_sender: Sender<ToGnome>,
+) {
+    eprintln!(
+        "Sending a request for CID-{} (hashes: {}, all_pages: {})",
+        cid, hashes, all_pages
+    );
+    let mut sync_requests: Vec<SyncRequest> = vec![];
+    if hashes {
+        sync_requests.push(SyncRequest::Hashes(cid, vec![]));
+    }
+    // if first_page {
+    //     sync_requests.push(SyncRequest::AllFirstPages(Some(vec![cid])));
+    // }
+    if all_pages {
+        sync_requests.push(SyncRequest::AllPages(vec![cid]));
+    }
+    let _ = to_gnome_sender.send(ToGnome::AskData(
+        GnomeId::any(),
+        NeighborRequest::Custom(0, CastData::new(serialize_requests(sync_requests)).unwrap()),
+    ));
+}
 async fn serve_unicast(c_id: CastID, sleep_time: Duration, user_res: Receiver<CastData>) {
     eprintln!("Serving unicast {:?}", c_id);
     loop {

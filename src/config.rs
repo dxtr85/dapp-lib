@@ -7,7 +7,8 @@ use std::str::FromStr;
 use gnome::prelude::{Nat, NetworkSettings, PortAllocationRule};
 
 pub struct Configuration {
-    pub work_dir: String,
+    pub work_dir: PathBuf,
+    pub storage: PathBuf,
     pub neighbors: Option<Vec<NetworkSettings>>,
 }
 
@@ -20,11 +21,8 @@ impl Configuration {
             None
         };
         Configuration {
-            work_dir: PathBuf::new()
-                .join(dir)
-                .into_os_string()
-                .into_string()
-                .unwrap(),
+            work_dir: dir.clone(),
+            storage: dir.join("storage"),
             neighbors,
         }
     }
