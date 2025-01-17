@@ -38,6 +38,9 @@ async fn parse_datastore_file(
     temp_store: &mut HashMap<u16, (DataType, u64)>,
     root_hash: &mut u64,
 ) -> u16 {
+    if !file_path.exists() {
+        let _ = File::create(file_path.clone()).await;
+    }
     let mut file = BufReader::new(File::open(file_path).await.unwrap());
     let mut highest_inserted_id = 0;
 

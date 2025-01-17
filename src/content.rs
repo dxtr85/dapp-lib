@@ -12,8 +12,8 @@ pub type ContentID = u16;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DataType {
-    Link,
     Data(u8),
+    Link,
 }
 impl DataType {
     pub fn from(val: u8) -> Self {

@@ -89,6 +89,7 @@ pub enum ToAppMgr {
     GetCIDsForTags(SwarmID, GnomeId, Vec<u8>, Vec<(ContentID, Data)>),
     CIDsForTag(SwarmID, GnomeId, u8, ContentID, Data),
     ContentLoadedFromDisk(SwarmID, ContentID, DataType),
+    ContentRequestedFromNeighbor(SwarmID, ContentID, DataType),
     ReadData(SwarmID, ContentID),
     ReadSuccess(SwarmID, ContentID, DataType, Vec<Data>),
     ReadError(SwarmID, ContentID, AppError),
@@ -407,6 +408,16 @@ async fn serve_gnome_manager(
                         }
                     }
                 }
+                ToAppMgr::ContentRequestedFromNeighbor(s_id, c_id, d_type) => {
+                    if c_id > 0 {
+                        let _ = to_user.send(ToApp::NewContent(s_id, c_id, d_type));
+                    } else {
+                        // eprintln!("Not informing user about Manifest in {:?}", s_id);
+                        // if let Some(to_app_data) = app_mgr.app_data_store.get(&s_id) {
+                        //     let _ = to_app_data.send(ToAppData::ReadData(c_id)).await;
+                        // }
+                    }
+                }
                 ToAppMgr::ContentChanged(s_id, c_id) => {
                     eprintln!("ToApp::ContentChanged({:?})", c_id,);
                     let _ = to_user.send(ToApp::ContentChanged(s_id, c_id));
@@ -478,6 +489,7 @@ async fn serve_app_data(
                     eprintln!("Swarm storage at: {:?}", s_storage);
                     // TODO: now we need to compare what we have on disk with Swarm
                 } else {
+                    store_on_disk = true;
                     // TODO: decide if we should create a dir (possibly after syncing)
                     eprintln!("Creating Swarm storage at: {:?}", s_storage);
                     let _ = create_dir_all(s_storage.clone()).await;
@@ -2007,23 +2019,11 @@ async fn serve_app_data(
                                                                 curr_cid,
                                                                 _res.is_ok()
                                                             );
-                                                            // if curr_cid > 0 {
                                                             let _ = to_app_mgr_send.send(
                                                                 ToAppMgr::ContentLoadedFromDisk(
                                                                     swarm_id, curr_cid, dtype,
                                                                 ),
                                                             );
-                                                            // } else {
-                                                            //     let datas = app_data
-                                                            //         .get_all_data(curr_cid)
-                                                            //         .unwrap();
-                                                            //     let _ = to_app_mgr_send.send(
-                                                            //         ToAppMgr::ReadSuccess(
-                                                            //             swarm_id, curr_cid, dtype,
-                                                            //             datas,
-                                                            //         ),
-                                                            //     );
-                                                            // }
                                                         } else {
                                                             eprintln!(
                                                                 "Load CID-{} from disk failed",
@@ -2035,14 +2035,31 @@ async fn serve_app_data(
                                                                 true,
                                                                 to_gnome_sender.clone(),
                                                             );
+                                                            let _ = to_app_mgr_send.send(
+                                                                ToAppMgr::ContentRequestedFromNeighbor(
+                                                                    swarm_id, curr_cid, data_type,
+                                                                ),
+                                                            );
                                                         }
                                                     } else {
                                                         //TODO: hashes differ
+                                                        let _ = app_data.update(
+                                                            curr_cid,
+                                                            Content::Data(
+                                                                data_type,
+                                                                ContentTree::Empty(hash),
+                                                            ),
+                                                        );
                                                         request_content_from_any_neighbor(
                                                             curr_cid,
                                                             true,
                                                             true,
                                                             to_gnome_sender.clone(),
+                                                        );
+                                                        let _ = to_app_mgr_send.send(
+                                                            ToAppMgr::ContentRequestedFromNeighbor(
+                                                                swarm_id, curr_cid, data_type,
+                                                            ),
                                                         );
                                                         eprintln!("CID-{} Hash mismatch(disk: {} != {} swarm)", curr_cid,dhash,hash);
                                                     }
@@ -2050,15 +2067,31 @@ async fn serve_app_data(
                                                     //TODO: mismatching data types
                                                     // only valid scenario is when
                                                     // Link got transposed into Data
+                                                    let _ = app_data.update(
+                                                        curr_cid,
+                                                        Content::Data(
+                                                            data_type,
+                                                            ContentTree::Empty(hash),
+                                                        ),
+                                                    );
                                                     request_content_from_any_neighbor(
                                                         curr_cid,
                                                         true,
                                                         true,
                                                         to_gnome_sender.clone(),
                                                     );
+                                                    let _ = to_app_mgr_send.send(
+                                                        ToAppMgr::ContentRequestedFromNeighbor(
+                                                            swarm_id, curr_cid, data_type,
+                                                        ),
+                                                    );
                                                     eprintln!("CID-{} DType mismatch", curr_cid);
                                                 }
                                             } else {
+                                                let _ = app_data.append(Content::Data(
+                                                    data_type,
+                                                    ContentTree::Empty(hash),
+                                                ));
                                                 //TODO: we do not have this on disk
                                                 request_content_from_any_neighbor(
                                                     curr_cid,
@@ -2066,37 +2099,15 @@ async fn serve_app_data(
                                                     true,
                                                     to_gnome_sender.clone(),
                                                 );
+                                                let _ = to_app_mgr_send.send(
+                                                    ToAppMgr::ContentRequestedFromNeighbor(
+                                                        swarm_id, curr_cid, data_type,
+                                                    ),
+                                                );
                                                 eprintln!("CID-{} not found on disk", curr_cid);
                                             }
                                             curr_cid += 1;
                                         }
-                                        // for (data_type, hash) in hashes {
-                                        //     let tree = ContentTree::empty(hash);
-                                        //     let content = Content::Data(data_type, tree);
-                                        //     if curr_cid < c_id {
-                                        //         eprintln!(
-                                        //             "Updating Datastore CID: {}, hash: {}",
-                                        //             curr_cid, hash
-                                        //         );
-                                        //         let _r = app_data.update(curr_cid, content);
-                                        //     } else {
-                                        //         let c_id = app_data.next_c_id().unwrap();
-                                        //         eprintln!(
-                                        //             "Appending Datastore CID: {}, hash: {}",
-                                        //             c_id, hash
-                                        //         );
-                                        //         let _res = app_data.append(content);
-                                        //         let _ =
-                                        //             to_app_mgr_send.send(ToAppMgr::ContentAdded(
-                                        //                 swarm_id, c_id, data_type,
-                                        //             ));
-                                        //     }
-                                        //     curr_cid = curr_cid + 1;
-                                        // }
-                                        // eprintln!(
-                                        //     "SyncResponse::Datastore [{}/{}] ",
-                                        //     part_no, total,
-                                        // );
                                     } else {
                                         eprintln!("Datastore is synced, why sent this?");
                                     }
