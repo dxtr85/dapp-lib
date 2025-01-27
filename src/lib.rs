@@ -2,7 +2,8 @@ use crate::content::data_to_link;
 use crate::prelude::SyncRequirements;
 use crate::prelude::TransformInfo;
 use crate::sync_message::serialize_requests;
-use std::arch::x86_64::_MM_FROUND_TO_NEAREST_INT;
+use std::net::IpAddr;
+// use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 mod app_type;
@@ -18,7 +19,7 @@ mod storage;
 mod sync_message;
 use app_type::AppType;
 use async_std::fs::create_dir_all;
-use async_std::net::ToSocketAddrs;
+// use async_std::net::ToSocketAddrs;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use storage::load_content_from_disk;
@@ -63,12 +64,17 @@ pub mod prelude {
     pub use crate::message::SyncMessage;
     pub use crate::message::SyncMessageType;
     pub use crate::message::SyncRequirements;
+    pub use crate::storage::load_content_from_disk;
+    pub use crate::storage::read_datastore_from_disk;
     pub use crate::ApplicationData;
     pub use crate::ApplicationManager;
     pub use crate::Configuration;
     pub use crate::ToApp;
     pub use gnome::prelude::CastData;
     pub use gnome::prelude::GnomeId;
+    pub use gnome::prelude::Nat;
+    pub use gnome::prelude::NetworkSettings;
+    pub use gnome::prelude::PortAllocationRule;
     pub use gnome::prelude::SwarmID;
     pub use gnome::prelude::SyncData;
     pub use gnome::prelude::ToGnome;
@@ -82,6 +88,7 @@ pub enum ToApp {
     ReadSuccess(SwarmID, ContentID, DataType, Vec<Data>),
     ReadError(SwarmID, ContentID, AppError),
     GetCIDsForTags(SwarmID, GnomeId, Vec<u8>, Vec<(ContentID, Data)>),
+    MyPublicIPs(Vec<(IpAddr, u16, Nat, (PortAllocationRule, i8))>),
     Disconnected,
 }
 
@@ -172,10 +179,25 @@ pub fn initialize(
     to_app_mgr_send: Sender<ToAppMgr>,
     to_app_mgr_recv: Receiver<ToAppMgr>,
     config_dir: PathBuf,
+    mut neighbors: Vec<(GnomeId, NetworkSettings)>,
 ) -> GnomeId {
+    // TODO: neighbors contain also our own public IP, get rid of it!
+    eprintln!("Storage neighbors: {:?}", neighbors);
     let config = Configuration::new(config_dir.clone());
+    if let Some(ns) = config.neighbors {
+        for n in ns {
+            // if !neighbors.contains(&n) {
+            eprintln!("Pushing config.neighbor");
+            neighbors.push((GnomeId::any(), n));
+            // }
+        }
+    }
     eprintln!("Storage root: {:?}", config.storage);
-    let (gmgr_send, gmgr_recv, my_id) = init(config_dir, config.neighbors);
+    // TODO: here we need to load neighbors from storage and provide it to
+    // init function
+    // let neighbors =
+    // let (gmgr_send, gmgr_recv, my_id) = init(config_dir, config.neighbors);
+    let (gmgr_send, gmgr_recv, my_id) = init(config_dir, Some(neighbors));
     spawn(serve_gnome_manager(
         config.storage.clone(),
         gmgr_send,
@@ -234,6 +256,16 @@ async fn serve_gnome_manager(
                     } else {
                         own_swarm_started = true;
                     }
+                }
+                FromGnomeManager::MyPublicIPs(ip_list) => {
+                    // eprintln!("dapp_lib got list of my public IP");
+                    // for (ip, port, nat, (rule, val)) in &ip_list {
+                    //     eprintln!(
+                    //         "dapp_lib Pub IP: {}:{} ({:?}, {:?}:{})",
+                    //         ip, port, nat, rule, val
+                    //     );
+                    // }
+                    let _ = to_user.send(ToApp::MyPublicIPs(ip_list));
                 }
                 FromGnomeManager::NewSwarmAvailable(swarm_name) => {
                     eprintln!("NewSwarm available, joining: {}", swarm_name);
