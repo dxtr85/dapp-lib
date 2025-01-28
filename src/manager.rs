@@ -63,4 +63,7 @@ impl ApplicationManager {
         self.gnome_to_swarm.insert(s_name.founder, s_id);
         self.app_data_store.insert(s_id, sender);
     }
+    pub fn get_mapping(&self) -> HashMap<GnomeId, SwarmID> {
+        self.gnome_to_swarm.clone()
+    }
 }

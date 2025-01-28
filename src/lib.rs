@@ -89,6 +89,7 @@ pub enum ToApp {
     ReadError(SwarmID, ContentID, AppError),
     GetCIDsForTags(SwarmID, GnomeId, Vec<u8>, Vec<(ContentID, Data)>),
     MyPublicIPs(Vec<(IpAddr, u16, Nat, (PortAllocationRule, i8))>),
+    GnomeToSwarmMapping(HashMap<GnomeId, SwarmID>),
     Disconnected,
 }
 
@@ -116,6 +117,7 @@ pub enum ToAppMgr {
     ContentAdded(SwarmID, ContentID, DataType),
     ContentChanged(SwarmID, ContentID),
     TransformLinkRequest(Box<SyncData>),
+    ProvideGnomeToSwarmMapping,
     Quit,
 }
 
@@ -453,6 +455,9 @@ async fn serve_gnome_manager(
                 ToAppMgr::ContentChanged(s_id, c_id) => {
                     eprintln!("ToApp::ContentChanged({:?})", c_id,);
                     let _ = to_user.send(ToApp::ContentChanged(s_id, c_id));
+                }
+                ToAppMgr::ProvideGnomeToSwarmMapping => {
+                    let _ = to_user.send(ToApp::GnomeToSwarmMapping(app_mgr.get_mapping()));
                 }
                 ToAppMgr::Quit => {
                     // eprintln!("AppMgr received Quit");
