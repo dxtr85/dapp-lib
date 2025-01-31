@@ -83,8 +83,8 @@ pub mod prelude {
 pub enum ToApp {
     ActiveSwarm(GnomeId, SwarmID), //TODO: also send Vec<Data> from CID=0(Manifest)
     Neighbors(SwarmID, Vec<GnomeId>),
-    NewContent(SwarmID, ContentID, DataType),
-    ContentChanged(SwarmID, ContentID),
+    NewContent(SwarmID, ContentID, DataType, Data),
+    ContentChanged(SwarmID, ContentID, DataType, Option<Data>),
     ReadSuccess(SwarmID, ContentID, DataType, Vec<Data>),
     ReadError(SwarmID, ContentID, AppError),
     GetCIDsForTags(SwarmID, GnomeId, Vec<u8>, Vec<(ContentID, Data)>),
@@ -96,7 +96,7 @@ pub enum ToApp {
 pub enum ToAppMgr {
     GetCIDsForTags(SwarmID, GnomeId, Vec<u8>, Vec<(ContentID, Data)>),
     CIDsForTag(SwarmID, GnomeId, u8, ContentID, Data),
-    ContentLoadedFromDisk(SwarmID, ContentID, DataType),
+    ContentLoadedFromDisk(SwarmID, ContentID, DataType, Data),
     ContentRequestedFromNeighbor(SwarmID, ContentID, DataType),
     ReadData(SwarmID, ContentID),
     ReadSuccess(SwarmID, ContentID, DataType, Vec<Data>),
@@ -114,8 +114,8 @@ pub enum ToAppMgr {
     AppendData(SwarmID, ContentID, Data),
     RemoveData(SwarmID, ContentID, u16),
     UpdateData(SwarmID, ContentID, u16, Data),
-    ContentAdded(SwarmID, ContentID, DataType),
-    ContentChanged(SwarmID, ContentID),
+    ContentAdded(SwarmID, ContentID, DataType, Data),
+    ContentChanged(SwarmID, ContentID, DataType, Option<Data>),
     TransformLinkRequest(Box<SyncData>),
     ProvideGnomeToSwarmMapping,
     Quit,
@@ -427,14 +427,14 @@ async fn serve_gnome_manager(
                 //         .send(ToAppData::AppendShelledDatas(c_id, hash_data, data))
                 //         .await;
                 // }
-                ToAppMgr::ContentAdded(s_id, c_id, d_type) => {
+                ToAppMgr::ContentAdded(s_id, c_id, d_type, main_page) => {
                     // eprintln!("GENERATE ToApp::NewContent({:?},{:?})", c_id, d_type);
-                    let _ = to_user.send(ToApp::NewContent(s_id, c_id, d_type));
+                    let _ = to_user.send(ToApp::NewContent(s_id, c_id, d_type, main_page));
                 }
-                ToAppMgr::ContentLoadedFromDisk(s_id, c_id, d_type) => {
+                ToAppMgr::ContentLoadedFromDisk(s_id, c_id, d_type, main_page) => {
                     // eprintln!("GENERATE ToApp::NewContent({:?},{:?})", c_id, d_type);
                     if c_id > 0 {
-                        let _ = to_user.send(ToApp::NewContent(s_id, c_id, d_type));
+                        let _ = to_user.send(ToApp::NewContent(s_id, c_id, d_type, main_page));
                     } else {
                         // eprintln!("Not informing user about Manifest in {:?}", s_id);
                         if let Some(to_app_data) = app_mgr.app_data_store.get(&s_id) {
@@ -444,7 +444,7 @@ async fn serve_gnome_manager(
                 }
                 ToAppMgr::ContentRequestedFromNeighbor(s_id, c_id, d_type) => {
                     if c_id > 0 {
-                        let _ = to_user.send(ToApp::NewContent(s_id, c_id, d_type));
+                        let _ = to_user.send(ToApp::NewContent(s_id, c_id, d_type, Data::empty(0)));
                     } else {
                         // eprintln!("Not informing user about Manifest in {:?}", s_id);
                         // if let Some(to_app_data) = app_mgr.app_data_store.get(&s_id) {
@@ -452,9 +452,9 @@ async fn serve_gnome_manager(
                         // }
                     }
                 }
-                ToAppMgr::ContentChanged(s_id, c_id) => {
+                ToAppMgr::ContentChanged(s_id, c_id, d_type, mpo) => {
                     eprintln!("ToApp::ContentChanged({:?})", c_id,);
-                    let _ = to_user.send(ToApp::ContentChanged(s_id, c_id));
+                    let _ = to_user.send(ToApp::ContentChanged(s_id, c_id, d_type, mpo));
                 }
                 ToAppMgr::ProvideGnomeToSwarmMapping => {
                     let _ = to_user.send(ToApp::GnomeToSwarmMapping(app_mgr.get_mapping()));
@@ -1357,14 +1357,20 @@ async fn serve_app_data(
                             let (recv_id, recv_hash) = requirements.post[0];
                             if recv_id == next_id && recv_hash == content.hash() {
                                 let d_type = content.data_type();
+                                let main_page = if let Ok(d) = content.read_data(0) {
+                                    d
+                                } else {
+                                    Data::empty(0)
+                                };
                                 let _res = app_data.append(content);
                                 // eprintln!("Content added: {:?}", res);
                                 // let hash = app_data.root_hash();
                                 // eprintln!("Sending updated hash: {}", hash);
                                 // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
                                 // eprintln!("Send res: {:?}", res);
-                                let _to_mgr_res = to_app_mgr_send
-                                    .send(ToAppMgr::ContentAdded(swarm_id, recv_id, d_type));
+                                let _to_mgr_res = to_app_mgr_send.send(ToAppMgr::ContentAdded(
+                                    swarm_id, recv_id, d_type, main_page,
+                                ));
                             } else {
                                 eprintln!("Recv id: {}, next id: {}", recv_id, next_id);
                                 eprintln!(
@@ -1424,9 +1430,11 @@ async fn serve_app_data(
                                 //TODO: insert any old Data with same hash into new content
                                 let mut old_data =
                                     HashMap::with_capacity(old_content.len() as usize);
+                                let mut first_hash_old = 0;
                                 while let Ok(data) = old_content.pop_data() {
+                                    first_hash_old = data.get_hash();
                                     // eprintln!("old hash after pop: {}", old_content.hash());
-                                    old_data.insert(data.get_hash(), data);
+                                    old_data.insert(first_hash_old, data);
                                 }
                                 for (d_id, hash) in new_hashes.iter().enumerate() {
                                     if let Some(data) = old_data.remove(&hash) {
@@ -1437,8 +1445,17 @@ async fn serve_app_data(
                                         let _ = app_data.update_data(c_id, d_id as u16, data);
                                     }
                                 }
-                                let _to_mgr_res =
-                                    to_app_mgr_send.send(ToAppMgr::ContentChanged(swarm_id, c_id));
+                                let main_page_option = if first_hash_old == first_hash {
+                                    None
+                                } else {
+                                    Some(Data::empty(first_hash))
+                                };
+                                let _to_mgr_res = to_app_mgr_send.send(ToAppMgr::ContentChanged(
+                                    swarm_id,
+                                    c_id,
+                                    d_type,
+                                    main_page_option,
+                                ));
                                 let hash = app_data.root_hash();
                                 // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
                                 eprintln!("ChangeContent completed successfully ({})", hash);
@@ -1564,7 +1581,7 @@ async fn serve_app_data(
                     SyncMessageType::UpdateData(c_id, d_id) => {
                         //TODO
                         eprintln!("SyncMessageType::UpdateData {}-{}", c_id, d_id);
-                        let (_t, len) = app_data.get_type_and_len(c_id).unwrap();
+                        let (d_type, len) = app_data.get_type_and_len(c_id).unwrap();
                         // eprintln!("Len: {}", len);
                         // let bot_hashes = app_data.content_bottom_hashes(c_id).unwrap();
                         // for bot in bot_hashes {
@@ -1582,6 +1599,7 @@ async fn serve_app_data(
                         // for bot in bottoms {
                         //     eprintln!("hash2: {}", bot);
                         // }
+                        let main_page_option = if d_id == 0 { Some(data.clone()) } else { None };
                         let res = app_data.update_data(c_id, d_id, data);
                         if let Ok(updated_data) = res {
                             if !requirements.post_validate(c_id, &app_data) {
@@ -1595,8 +1613,12 @@ async fn serve_app_data(
                                 // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
                                 // eprintln!("Send res: {:?}", res);
                                 eprintln!("Data updated successfully ({})", hash);
-                                let _to_mgr_res =
-                                    to_app_mgr_send.send(ToAppMgr::ContentChanged(swarm_id, c_id));
+                                let _to_mgr_res = to_app_mgr_send.send(ToAppMgr::ContentChanged(
+                                    swarm_id,
+                                    c_id,
+                                    d_type,
+                                    main_page_option,
+                                ));
                             }
                         } else {
                             eprintln!("UpdateData failed: {}", res.err().unwrap());
@@ -2048,6 +2070,13 @@ async fn serve_app_data(
                                                             )
                                                             .await
                                                         {
+                                                            let main_page = if let Ok(d) =
+                                                                content.read_data(0)
+                                                            {
+                                                                d
+                                                            } else {
+                                                                Data::empty(0)
+                                                            };
                                                             let _res =
                                                                 app_data.update(curr_cid, content);
                                                             eprintln!(
@@ -2059,6 +2088,7 @@ async fn serve_app_data(
                                                             let _ = to_app_mgr_send.send(
                                                                 ToAppMgr::ContentLoadedFromDisk(
                                                                     swarm_id, curr_cid, dtype,
+                                                                    main_page,
                                                                 ),
                                                             );
                                                         } else {
@@ -2225,8 +2255,22 @@ async fn serve_app_data(
                                             } else {
                                                 // eprintln!("Inserting page 0 of non-Link content");
 
-                                                let res = app_data.update_data(c_id, page_no, data);
+                                                let res = app_data.update_data(
+                                                    c_id,
+                                                    page_no,
+                                                    data.clone(),
+                                                );
                                                 if res.is_ok() {
+                                                    // We send an update to print content
+                                                    // on screen
+                                                    let _ = to_app_mgr_send.send(
+                                                        ToAppMgr::ContentChanged(
+                                                            swarm_id,
+                                                            c_id,
+                                                            d_type,
+                                                            Some(data),
+                                                        ),
+                                                    );
                                                     eprintln!(
                                                         "C-{} Page #{} update result: ok",
                                                         c_id, page_no,
@@ -2243,7 +2287,10 @@ async fn serve_app_data(
                                         } else if data_type < DataType::Link {
                                             // eprintln!("Create new Data");
                                             let _ = to_app_mgr_send.send(ToAppMgr::ContentAdded(
-                                                swarm_id, c_id, data_type,
+                                                swarm_id,
+                                                c_id,
+                                                data_type,
+                                                data.clone(),
                                             ));
                                             let _res = app_data.update(
                                                 c_id,
@@ -2252,7 +2299,10 @@ async fn serve_app_data(
                                         } else {
                                             // eprintln!("Create new Link 2");
                                             let _ = to_app_mgr_send.send(ToAppMgr::ContentAdded(
-                                                swarm_id, c_id, data_type,
+                                                swarm_id,
+                                                c_id,
+                                                data_type,
+                                                data.clone(),
                                             ));
                                             let link_result = data_to_link(data);
                                             if let Ok(link) = link_result {
