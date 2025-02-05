@@ -88,6 +88,7 @@ pub enum ToApp {
     ReadSuccess(SwarmID, ContentID, DataType, Vec<Data>),
     ReadError(SwarmID, ContentID, AppError),
     GetCIDsForTags(SwarmID, GnomeId, Vec<u8>, Vec<(ContentID, Data)>),
+    FirstPages(SwarmID, Vec<(ContentID, DataType, Data)>),
     MyPublicIPs(Vec<(IpAddr, u16, Nat, (PortAllocationRule, i8))>),
     GnomeToSwarmMapping(HashMap<GnomeId, SwarmID>),
     Disconnected,
@@ -101,6 +102,8 @@ pub enum ToAppMgr {
     ReadData(SwarmID, ContentID),
     ReadSuccess(SwarmID, ContentID, DataType, Vec<Data>),
     ReadError(SwarmID, ContentID, AppError),
+    ReadAllFirstPages(SwarmID),
+    FirstPages(SwarmID, Vec<(ContentID, DataType, Data)>),
     UploadData,
     SetActiveApp(GnomeId),
     StartUnicast,
@@ -126,6 +129,7 @@ pub enum ToAppData {
     Response(GnomeToApp),
     ReadData(ContentID),
     SendFirstPage(GnomeId, ContentID, Data),
+    ReadAllFirstPages,
     UploadData,
     StartUnicast,
     StartBroadcast,
@@ -324,6 +328,15 @@ async fn serve_gnome_manager(
                         let _ = to_app_data.send(ToAppData::ReadData(c_id)).await;
                     }
                 }
+                ToAppMgr::ReadAllFirstPages(s_id) => {
+                    //TODO
+                    if let Some(to_app_data) = app_mgr.app_data_store.get(&s_id) {
+                        let _ = to_app_data.send(ToAppData::ReadAllFirstPages).await;
+                    }
+                }
+                ToAppMgr::FirstPages(s_id, first_pages) => {
+                    let _ = to_user.send(ToApp::FirstPages(s_id, first_pages));
+                }
                 ToAppMgr::GetCIDsForTags(swarm_id, n_id, tags, all_first_pages) => {
                     eprintln!("We are requesting tags {:?} for {:?} swarm", tags, swarm_id);
                     let _ =
@@ -477,7 +490,7 @@ async fn serve_gnome_manager(
 async fn serve_app_data(
     storage: PathBuf,
     max_pages_in_memory: usize,
-    swarm_id: SwarmID,
+    swarm_id: SwarmID, //TODO: in future swarm_id should be mutable!
     mut app_data: ApplicationData,
     app_data_send: ASender<ToAppData>,
     app_data_recv: AReceiver<ToAppData>,
@@ -1287,6 +1300,24 @@ async fn serve_app_data(
                 if res.is_ok() {
                     eprintln!("SFP Main page of {} sent successfully.", c_id,);
                 }
+            }
+            ToAppData::ReadAllFirstPages => {
+                let mut first_pages_vec = vec![];
+                let last_idx = if let Some(idx) = app_data.next_c_id() {
+                    idx
+                } else {
+                    u16::MAX + 1
+                };
+                for c_id in 1..last_idx {
+                    if let Ok((d_type, _len)) = app_data.get_type_and_len(c_id) {
+                        if let Ok(first_page) = app_data.read_data(c_id, 0) {
+                            first_pages_vec.push((c_id, d_type, first_page));
+                            // } else {
+                            //     first_pages_vec.push((c_id, Data::empty(0)));
+                        }
+                    }
+                }
+                let _ = to_app_mgr_send.send(ToAppMgr::FirstPages(swarm_id, first_pages_vec));
             }
             ToAppData::Response(GnomeToApp::Block(_id, data)) => {
                 // println!("Processing data...");
