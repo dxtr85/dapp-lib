@@ -2496,7 +2496,8 @@ async fn serve_app_data(
                 // TODO: determine whether or not we want to store this Swarm on disk
                 if store_on_disk {
                     // TODO: pass parameters indicating what data to store
-                    store_data_on_disk(s_storage, app_data).await;
+                    store_data_on_disk(s_storage, app_data, storage::StoragePolicy::Everything)
+                        .await;
                 }
 
                 eprintln!("Done serving AppData");
