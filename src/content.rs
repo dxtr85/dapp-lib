@@ -56,7 +56,7 @@ pub enum Content {
         Data,
         Option<TransformInfo>,
     ),
-    Data(DataType, ContentTree),
+    Data(DataType, u16, ContentTree),
 }
 
 //TODO: We need to implement a mechanism that will allow for synchronization
@@ -476,19 +476,26 @@ impl Content {
             // TODO: once we have all root data hashes we can start
             // replacing them one-by-one
             DataType::Data(other) => {
-                let tree = if data_empty {
-                    ContentTree::empty(d_hash)
+                if data_empty {
+                    Ok(Content::Data(
+                        DataType::from(other),
+                        0,
+                        ContentTree::empty(d_hash),
+                    ))
                 } else {
-                    ContentTree::new(Data::new(bytes_iter.collect()).unwrap())
-                };
-                Ok(Content::Data(DataType::from(other), tree))
+                    Ok(Content::Data(
+                        DataType::from(other),
+                        1,
+                        ContentTree::new(Data::new(bytes_iter.collect()).unwrap()),
+                    ))
+                }
             }
         }
     }
     pub fn data_type(&self) -> DataType {
         match self {
             Self::Link(_sn, _c, _descr, _tags, _ti) => DataType::Link,
-            Self::Data(d_type, _ct) => *d_type,
+            Self::Data(d_type, _mem, _ct) => *d_type,
         }
     }
     pub fn len(&self) -> u16 {
@@ -500,7 +507,7 @@ impl Content {
                     0
                 }
             }
-            Self::Data(_d_type, content_tree) => content_tree.len(),
+            Self::Data(_d_type, _mem, content_tree) => content_tree.len(),
         }
     }
     pub fn to_data(self) -> Result<Data, Self> {
@@ -537,7 +544,7 @@ impl Content {
                 }
                 // }
             }
-            Self::Data(_type, c_tree) => c_tree.read(data_id),
+            Self::Data(_type, _mem, c_tree) => c_tree.read(data_id),
         }
     }
     pub fn read_link_data(&self, d_type: DataType, data_id: u16) -> Result<(Data, u16), AppError> {
@@ -566,13 +573,13 @@ impl Content {
     pub fn push_data(&mut self, data: Data) -> Result<u64, AppError> {
         match self {
             Self::Link(_s, _c, _descr, _data, _ti) => Err(AppError::DatatypeMismatch),
-            Self::Data(_dt, tree) => tree.append(data),
+            Self::Data(_dt, _mem, tree) => tree.append(data),
         }
     }
     pub fn pop_data(&mut self) -> Result<Data, AppError> {
         match self {
             Self::Link(_s, _c, _descr, _data, _ti) => Err(AppError::DatatypeMismatch),
-            Self::Data(_dt, tree) => {
+            Self::Data(_dt, _mem, tree) => {
                 if tree.is_empty() {
                     Err(AppError::ContentEmpty)
                 } else {
@@ -585,14 +592,15 @@ impl Content {
     pub fn insert(&mut self, d_id: u16, data: Data) -> Result<u64, AppError> {
         match self {
             Self::Link(_s, _c, _descr, _data, _ti) => Err(AppError::DatatypeMismatch),
-            Self::Data(_dt, tree) => tree.insert(d_id, data),
+            Self::Data(_dt, _mem, tree) => tree.insert(d_id, data),
         }
     }
     pub fn update_data(&mut self, data_id: u16, data: Data) -> Result<Data, AppError> {
         let myself = std::mem::replace(
             self,
-            Content::Data(DataType::Data(0), ContentTree::Empty(0)),
+            Content::Data(DataType::Data(0), 0, ContentTree::Empty(0)),
         );
+        let new_data_empty = data.is_empty();
         match myself {
             Self::Link(s_name, c_id, descr, t_data, ti) => {
                 if data_id == 0 {
@@ -613,22 +621,35 @@ impl Content {
                     Err(AppError::IndexingError)
                 }
             }
-            Self::Data(d_type, mut c_tree) => {
+            Self::Data(d_type, mem, mut c_tree) => {
                 let result = c_tree.replace(data_id, data);
-                *self = Self::Data(d_type, c_tree);
-                // if let Ok(old_data) = result {
-                //     Ok(old_data)
-                // } else {
-                //     Err(result.err().unwrap())
-                // }
-                result
+                if let Ok(old_data) = result {
+                    if old_data.is_empty() {
+                        if new_data_empty {
+                            *self = Self::Data(d_type, mem, c_tree);
+                        } else {
+                            *self = Self::Data(d_type, mem + 1, c_tree);
+                        }
+                    } else {
+                        if new_data_empty {
+                            *self = Self::Data(d_type, mem - 1, c_tree);
+                        } else {
+                            *self = Self::Data(d_type, mem, c_tree);
+                        }
+                    }
+                    Ok(old_data)
+                } else {
+                    *self = Self::Data(d_type, mem, c_tree);
+                    Err(result.err().unwrap())
+                }
+                // result
             }
         }
     }
     pub fn remove_data(&mut self, d_id: u16) -> Result<Data, AppError> {
         match self {
             Self::Link(_s, _c, _descr, _data, _ti) => Err(AppError::DatatypeMismatch),
-            Self::Data(_dt, tree) => tree.remove_data(d_id),
+            Self::Data(_dt, _mem, tree) => tree.remove_data(d_id),
         }
     }
 
@@ -641,7 +662,7 @@ impl Content {
                 data.clone(),
                 ti.clone(),
             ),
-            Self::Data(d_type, c_tree) => Self::Data(*d_type, c_tree.shell()),
+            Self::Data(d_type, mem, c_tree) => Self::Data(*d_type, *mem, c_tree.shell()),
         }
     }
     pub fn hash(&self) -> u64 {
@@ -661,7 +682,7 @@ impl Content {
                 b_vec.hash(&mut hasher);
                 hasher.finish()
             }
-            Self::Data(_type, tree) => tree.hash(),
+            Self::Data(_type, _mem, tree) => tree.hash(),
         }
     }
     pub fn link_ti_hashes(&self) -> Result<Vec<Data>, AppError> {
@@ -710,6 +731,18 @@ impl Content {
         }
         v
     }
+    pub fn used_memory_slots(&self) -> usize {
+        match self {
+            Self::Link(_s, _c, _descr, _data, ti_opt) => {
+                if let Some(ti) = ti_opt {
+                    ti.data.len()
+                } else {
+                    1
+                }
+            }
+            Self::Data(_type, mem, _tree) => *mem as usize,
+        }
+    }
     fn get_data_hash(&self, d_id: u16) -> Result<u64, AppError> {
         match self {
             Self::Link(_s, _c, _descr, _data, _ti) => {
@@ -720,7 +753,7 @@ impl Content {
                     Err(AppError::IndexingError)
                 }
             }
-            Self::Data(_type, c_tree) => c_tree.get_data_hash(d_id),
+            Self::Data(_type, _mem, c_tree) => c_tree.get_data_hash(d_id),
         }
     }
 }

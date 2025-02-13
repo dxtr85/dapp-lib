@@ -22,7 +22,7 @@ impl Datastore {
     pub fn new(app_type: AppType) -> Datastore {
         let mut content_tree = ContentTree::empty(0);
         let _ = content_tree.append(Data::new(vec![app_type.byte()]).unwrap());
-        let content = Content::Data(DataType::Data(0), content_tree);
+        let content = Content::Data(DataType::Data(0), 1, content_tree);
         Datastore::Filled(content)
     }
 
@@ -120,8 +120,16 @@ impl Datastore {
             Self::Filled(prev_content) => {
                 // println!("Append to Filled");
                 let hash = double_hash(prev_content.hash(), content.hash());
+                // TODO: calculate how many memory slots are used as a sum of left & right
+                // contents + space taken by their bottom hashes.
+
+                let used_memory_slots = prev_content.used_memory_slots()
+                    + content.used_memory_slots()
+                    + 1
+                    + ((prev_content.len() + content.len()) as usize >> 7);
                 let substore = Substore {
                     content_count: 2,
+                    used_memory_slots,
                     hash,
                     left: Datastore::Filled(prev_content),
                     right: Datastore::Filled(content),
@@ -431,11 +439,11 @@ impl Datastore {
 
     // TODO: this fn should return a Vec<u64> of all of Datastore's
     // non-bottom layer hashes from top to almost bottom, left to right.
-    pub fn hashes(&self) {}
+    // pub fn hashes(&self) {}
 
     // TODO: this fn should return a Vec<u64> of all of given CID's hashes
     // So only non-bottom layer hashes.
-    pub fn content_hashes(&self, _c_id: ContentID) {}
+    // pub fn content_hashes(&self, _c_id: ContentID) {}
 
     // This fn should return a Vec<u64> of all of given CID's data hashes
     // So only bottom layer hashes (Data hashes).
@@ -508,11 +516,19 @@ impl Datastore {
             Self::Hashed(s_store) => s_store.content_count,
         }
     }
+    pub fn used_memory_pages(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Filled(c) => c.used_memory_slots() + 1 + (c.len() as usize >> 7),
+            Self::Hashed(s_store) => s_store.used_memory_slots(),
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct Substore {
     content_count: u16,
+    used_memory_slots: usize,
     hash: u64,
     left: Datastore,
     right: Datastore,
@@ -521,10 +537,16 @@ pub struct Substore {
 impl Substore {
     pub fn append(&mut self, content: Content) -> Result<u64, AppError> {
         // println!("Substore count: {}", self.data_count);
+        let mem_used = 1 + content.used_memory_slots() + (content.len() as usize >> 7);
+        eprintln!(
+            "Substore append content with {} pages into memory",
+            mem_used
+        );
         if self.content_count < u16::MAX {
             let result = self.right.append(content);
             if let Ok(_h) = result {
                 self.content_count += 1;
+                self.used_memory_slots += mem_used;
                 Ok(self.hash())
             } else {
                 result
@@ -636,11 +658,20 @@ impl Substore {
             return Err(AppError::IndexingError);
         }
         let left_len = self.left.len();
+        let new_size = 1 + (content.len() as usize >> 7) + content.used_memory_slots();
         let result = if c_id >= left_len {
             self.right.update(c_id - left_len, content)
         } else {
             self.left.update(c_id, content)
         };
+        if let Ok(old_content) = &result {
+            let old_size = 1 + (old_content.len() as usize >> 7) + old_content.used_memory_slots();
+            if old_size < new_size {
+                self.used_memory_slots += new_size - old_size;
+            } else {
+                self.used_memory_slots -= old_size - new_size;
+            }
+        }
         self.hash();
         result
     }
@@ -653,12 +684,29 @@ impl Substore {
         if c_id >= self.content_count {
             return Err(AppError::IndexingError);
         }
+        let new_empty = data.is_empty();
         let left_len = self.left.len();
         let result = if c_id >= left_len {
             self.right.update_data((c_id - left_len, data_id), data)
         } else {
             self.left.update_data((c_id, data_id), data)
         };
+        if let Ok(old_data) = &result {
+            let old_empty = old_data.is_empty();
+            if old_empty {
+                if new_empty {
+                    // Nothing to change
+                } else {
+                    self.used_memory_slots += 1;
+                }
+            } else {
+                if new_empty {
+                    self.used_memory_slots -= 1;
+                } else {
+                    // Nothing to change
+                }
+            }
+        }
         self.hash();
         result
     }
@@ -690,6 +738,10 @@ impl Substore {
             self.left.content_bottom_hashes(c_id)
         }
     }
+    pub fn used_memory_slots(&self) -> usize {
+        self.used_memory_slots
+    }
+
     fn get_root_content_hash(&self, c_id: ContentID) -> Result<(DataType, u64), AppError> {
         if c_id >= self.content_count {
             return Err(AppError::IndexingError);

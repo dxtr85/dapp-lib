@@ -92,7 +92,7 @@ pub async fn read_datastore_from_disk(
                 )
             } else {
                 let ctree = ContentTree::empty(hash);
-                Content::Data(dtype, ctree)
+                Content::Data(dtype, 0, ctree)
             };
             // eprintln!("RH: {}", app_data.root_hash());
             if let Some(next_cid) = app_data.next_c_id() {
@@ -396,6 +396,7 @@ pub async fn load_content_from_disk(
         let dhash = content_on_disk.hash();
         if dhash == hash {
             let mut c_tree = ContentTree::empty(0);
+            let mut mem_size = 0;
             let mut buffer: [u8; 1024] = [0; 1024];
             let mut file = BufReader::new(File::open(data_file).await.unwrap());
             for i in 0..=u16::MAX {
@@ -414,6 +415,7 @@ pub async fn load_content_from_disk(
                             let data = Data::new(v).unwrap();
                             if data.get_hash() == hash {
                                 let _ar = c_tree.append(data);
+                                mem_size += 1;
                                 // eprintln!("Append result: {:?}", _ar);
                             } else {
                                 eprintln!("CID-{} Page hash mismatch", cid);
@@ -429,7 +431,7 @@ pub async fn load_content_from_disk(
                 }
             }
             // eprintln!("Loaded content from disk: {:?} {}", s_storage, cid);
-            Some(Content::Data(dtype, c_tree))
+            Some(Content::Data(dtype, mem_size, c_tree))
         } else {
             eprintln!("Content from hdr file hash {} mismatch {}", dhash, hash,);
             None

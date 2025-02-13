@@ -224,6 +224,13 @@ async fn serve_gnome_manager(
     to_app_mgr_recv: Receiver<ToAppMgr>,
 ) {
     // TODO: AppMgr should hold state
+    // We need to define a total number of Pages that can be stored in memory.
+    // We assume every Page takes 1024 bytes, even if it does not, for ease of calculation.
+    // We need to define maximum number of swarms we are subscribed to.
+    // To define how many pages can be assignet to each swarm we divide total pages
+    // by max swarms. Later this can be upgraded, but we need to have any mechanism in place.
+    // We provide that number to every instance of app_data_service we spawn.
+    // app_data_service can not exceed memory usage above provided threshold.
     eprintln!("Storage root, gmgr: {:?}", storage);
     let message = from_gnome_mgr
         .recv()
@@ -498,16 +505,65 @@ async fn serve_app_data(
     to_app_mgr_send: Sender<ToAppMgr>,
 ) {
     let mut s_storage = PathBuf::new();
-    // TODO: use this variable to track how many pages are being stored in memory
-    let mut used_memory_pages = 0;
+    // TODO: Understand & implement Tiny Pointers for efficient data storage in RAM
+    // TODO: RAM management
+    // We will receive a maximum number of page slots available to us.
+    // used_memory_slots should always track how many pages we have loaded into memory,
+    // and it can never exceed maximum number of page slots.
+    //
+    // There can be multiple states our ApplicationData can be in:
+    // - Datastore - we store all root hashes of every Content
+    // - MainPages - we store MainPage of each Content in a Swarm (and all its bottom hashes)
+    // - AllPages - we store all Pages in memory
+    // Those are base states that we can expand on. For example MainPages can also have
+    // some Contents fully loaded into memory, even Datastore state can have some Contents
+    // fully loaded in memory.
+    // Datastore level is not counted in used_memory_pages.
+    // If we have loaded a Content into memory, for every Page we increase used_memory_pages.
+    // We also increase it by one for every 128-element-chunk of its size
+    //  to account for bottom hashes using memory. (128 elements * 8 bytes hash = 1024 bytes)
+    //
+    // This service monitors how many memory page slots we have remaining and decide how to
+    // store data. If it needs to unload some pages from memory, then selected pages are
+    // being sent for on-disk storage, if given swarm has storage policy defined to do so.
+    // If we do not need to store it on-disk we can simply discard this data and only keep
+    // root hash or root hash and main page.
+    //
+    // We need to add memory_pages_used attribute to Substore and to Content.
+    // We also need to define a Datastore function that provides total amount
+    // of used memory pages.
+    // It is Datastore's responsibility to count in how many page slots Contents use
+    // for storing bottom hashes, Content does not take these into account when
+    // providing it's memory usage.
+    //
+    // TODO: update used memory pages when adding/removing pages!
+    //
+    // TODO: We need a mechanism to load/unload Contents pages between disk and memory,
+    // when needed.
+    // Initial idea is to only load up to Datastore level.
+    // For an active Swarm we might load all bottom hashes. If a swarm becomes active
+    // it can have increased value of max_pages_in_memory. When it is deactivated
+    // that number falls back to previous value and if needed Contents are being unloaded
+    // from memory until used_memory_slots <= max_pages_in_memory.
+    //
+    // When user selects a Content, we need to present some data.
+    // But we only need to load a handful of pages, so we load only pages that can fit onto
+    // screens Selector view. If a user flips Selector to display a different set of
+    // Pages we send another request to load those pages into memory.
+    // When used_memory_pages has crossed max_pages_in_memory we immediately start
+    // cleanup process in order to free some memory slots.
+    // Contents that are unloaded from memory are being stored to disk if necessary.
+    //
     // TODO: build logic to decide whether or not we should store this Swarm's data on disk
     //       and if so, which parts of it (maybe all?)
     //       This should be merged with application logic
     let mut store_on_disk = false;
     eprintln!("Storage root app data: {:?}", storage);
     eprintln!(
-        "{:?} Memory: {}/{} Pages (not implemented)",
-        swarm_id, used_memory_pages, max_pages_in_memory
+        "{:?} Memory: {}/{} Pages (not fully implemented)",
+        swarm_id,
+        app_data.contents.used_memory_pages(),
+        max_pages_in_memory
     );
     let mut b_cast_origin: Option<(CastID, Sender<CastData>)> = None;
     let mut link_with_transform_info: Option<ContentID> = None;
@@ -2145,6 +2201,7 @@ async fn serve_app_data(
                                                             curr_cid,
                                                             Content::Data(
                                                                 data_type,
+                                                                0,
                                                                 ContentTree::Empty(hash),
                                                             ),
                                                         );
@@ -2169,6 +2226,7 @@ async fn serve_app_data(
                                                         curr_cid,
                                                         Content::Data(
                                                             data_type,
+                                                            0,
                                                             ContentTree::Empty(hash),
                                                         ),
                                                     );
@@ -2188,6 +2246,7 @@ async fn serve_app_data(
                                             } else {
                                                 let _ = app_data.append(Content::Data(
                                                     data_type,
+                                                    0,
                                                     ContentTree::Empty(hash),
                                                 ));
                                                 //TODO: we do not have this on disk
@@ -2238,8 +2297,9 @@ async fn serve_app_data(
                                                     data_vec.push(Data::empty(hash));
                                                 }
 
+                                                let mem_size = data_vec.len() as u16;
                                                 let ct = ContentTree::from(data_vec);
-                                                let c = Content::Data(d_type, ct);
+                                                let c = Content::Data(d_type, mem_size, ct);
                                                 // eprintln!(
                                                 //     "New bottom hashes: {:?}",
                                                 //     c.data_hashes()
@@ -2325,7 +2385,11 @@ async fn serve_app_data(
                                             ));
                                             let _res = app_data.update(
                                                 c_id,
-                                                Content::Data(data_type, ContentTree::Filled(data)),
+                                                Content::Data(
+                                                    data_type,
+                                                    1,
+                                                    ContentTree::Filled(data),
+                                                ),
                                             );
                                         } else {
                                             // eprintln!("Create new Link 2");
@@ -2806,6 +2870,7 @@ impl ApplicationData {
             contents: Datastore::new(app_type),
             hash_to_temp_idx: HashMap::new(),
             partial_data: HashMap::new(),
+            // used_memory_slots: 0,
         }
     }
 
@@ -2975,8 +3040,9 @@ impl ApplicationData {
         //TODO
         let ti = self.contents.take_transform_info(content_id)?;
         let d_type = ti.d_type;
+        let mem_size = ti.data.len() as u16;
         let c_tree = ti.into_tree();
-        let new_content = Content::Data(d_type, c_tree);
+        let new_content = Content::Data(d_type, mem_size, c_tree);
         self.contents.update(content_id, new_content)
     }
     pub fn update_transformative_link(
