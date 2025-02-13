@@ -244,7 +244,15 @@ async fn store_content_on_disk(
                             // hdr file format:
                             // PID(2B)    PageHash(8B)    Offset(4B)    Size(2B)
                             let [d0, d1] = (i as u16).to_be_bytes();
-                            let data = app_data.read_data(c_id, i as u16).unwrap();
+                            let read_result = app_data.read_data(c_id, i as u16);
+                            if read_result.is_err() {
+                                eprintln!(
+                                    "Failed to read data for CID-{}/{}:\n{:?}",
+                                    c_id, i, read_result
+                                );
+                                continue;
+                            }
+                            let data = read_result.unwrap();
                             buff_header[0] = d0;
                             buff_header[1] = d1;
                             let mut i = 2;

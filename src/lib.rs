@@ -136,7 +136,7 @@ pub enum ToAppData {
     EndBroadcast,
     UnsubscribeBroadcast,
     ListNeighbors,
-    SwarmReady(SwarmName),
+    SwarmReady(SwarmName, bool), //bool indicates whether or not we are founder
     BCastData(CastID, CastData),
     BCastOrigin(CastID, Sender<CastData>),
     ChangeContent(ContentID, DataType, Vec<Data>),
@@ -568,6 +568,7 @@ async fn serve_app_data(
     let mut b_cast_origin: Option<(CastID, Sender<CastData>)> = None;
     let mut link_with_transform_info: Option<ContentID> = None;
     let mut b_req_sent = false;
+    let mut i_am_founder = false;
     // let mut next_val = 0;
     let mut datastore_sync: Option<(u16, HashMap<u16, Vec<(DataType, u64)>>)> =
         Some((0, HashMap::new()));
@@ -575,7 +576,8 @@ async fn serve_app_data(
     while let Ok(resp) = app_data_recv.recv().await {
         match resp {
             // TODO: We should always assume to be out of sync
-            ToAppData::SwarmReady(s_name) => {
+            ToAppData::SwarmReady(s_name, am_i_founder) => {
+                i_am_founder = am_i_founder;
                 s_storage = storage.join(s_name.to_path());
                 let dsync_store = s_storage.join("datastore.sync");
                 if dsync_store.exists() {
@@ -2180,8 +2182,8 @@ async fn serve_app_data(
                                                             );
                                                         } else {
                                                             eprintln!(
-                                                                "Load CID-{} from disk failed",
-                                                                curr_cid,
+                                                                "Load {:?} CID-{} from disk failed",
+                                                                swarm_id, curr_cid,
                                                             );
                                                             request_content_from_any_neighbor(
                                                                 curr_cid,
@@ -2196,8 +2198,19 @@ async fn serve_app_data(
                                                             );
                                                         }
                                                     } else {
+                                                        if i_am_founder {
+                                                            // We have to assume someone has
+                                                            // priority over others, in case
+                                                            // everyone else disagrees with
+                                                            // founder,
+                                                            // he can just delete conflicting
+                                                            // file
+                                                            // we continue, because our
+                                                            // neighbor will go the other way
+                                                            continue;
+                                                        }
                                                         //TODO: hashes differ
-                                                        let _ = app_data.update(
+                                                        let _res = app_data.update(
                                                             curr_cid,
                                                             Content::Data(
                                                                 data_type,
@@ -2205,6 +2218,10 @@ async fn serve_app_data(
                                                                 ContentTree::Empty(hash),
                                                             ),
                                                         );
+                                                        // eprintln!(
+                                                        //     "Update hash for CID-{}: {:?}",
+                                                        //     curr_cid, _res
+                                                        // );
                                                         request_content_from_any_neighbor(
                                                             curr_cid,
                                                             true,
@@ -2216,7 +2233,7 @@ async fn serve_app_data(
                                                                 swarm_id, curr_cid, data_type,
                                                             ),
                                                         );
-                                                        eprintln!("CID-{} Hash mismatch(disk: {} != {} swarm)", curr_cid,dhash,hash);
+                                                        eprintln!("{:?} CID-{} Hash mismatch(disk: {} != {} swarm)",swarm_id, curr_cid,dhash,hash);
                                                     }
                                                 } else {
                                                     //TODO: mismatching data types
@@ -2584,9 +2601,11 @@ async fn serve_swarm(
         while let Ok(resp) = user_res.try_recv() {
             // println!("SUR: {:?}", resp);
             match resp {
-                GnomeToApp::SwarmReady(s_name) => {
+                GnomeToApp::SwarmReady(s_name, i_am_founder) => {
                     // eprintln!("Gnome says if synced: {}", synced);
-                    let _ = to_app_data_send.send(ToAppData::SwarmReady(s_name)).await;
+                    let _ = to_app_data_send
+                        .send(ToAppData::SwarmReady(s_name, i_am_founder))
+                        .await;
                 }
                 GnomeToApp::Broadcast(_s_id, c_id, recv_d) => {
                     spawn(serve_broadcast(
