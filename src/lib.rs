@@ -559,12 +559,6 @@ async fn serve_app_data(
     //       This should be merged with application logic
     let mut store_on_disk = false;
     eprintln!("Storage root app data: {:?}", storage);
-    eprintln!(
-        "{:?} Memory: {}/{} Pages (not fully implemented)",
-        swarm_id,
-        app_data.contents.used_memory_pages(),
-        max_pages_in_memory
-    );
     let mut b_cast_origin: Option<(CastID, Sender<CastData>)> = None;
     let mut link_with_transform_info: Option<ContentID> = None;
     let mut b_req_sent = false;
@@ -2080,6 +2074,8 @@ async fn serve_app_data(
                     }
                 }
             }
+            //TODO: CustomResponse & CustomRequest should be handled externally by App
+            // or they should not be called Custom
             ToAppData::CustomResponse(m_type, _neighbor_id, cast_data) => {
                 match m_type {
                     0 => {
@@ -2091,7 +2087,7 @@ async fn serve_app_data(
                                     app_data.update_partial(is_hash_data, data);
                                 }
                                 SyncResponse::Datastore(part_no, total, mut hashes) => {
-                                    eprintln!("Got SyncResponse::Datastore");
+                                    eprintln!("{:?} Got SyncResponse::Datastore", swarm_id);
                                     let prev_dstore_sync =
                                         std::mem::replace(&mut datastore_sync, None);
                                     // eprintln!(
@@ -2198,7 +2194,14 @@ async fn serve_app_data(
                                                             );
                                                         }
                                                     } else {
-                                                        if i_am_founder {
+                                                        if i_am_founder && curr_cid > 0 {
+                                                            //TODO: we need to distinguish
+                                                            // between joining a running swarm
+                                                            // and two neighbors starting it
+                                                            eprintln!(
+                                                                "{:?} CID-{} Hashes mismatch(my: {}, his: {}), but I am founder",swarm_id,curr_cid,dhash,hash
+                                                            );
+                                                            curr_cid += 1;
                                                             // We have to assume someone has
                                                             // priority over others, in case
                                                             // everyone else disagrees with
@@ -2261,6 +2264,10 @@ async fn serve_app_data(
                                                     eprintln!("CID-{} DType mismatch", curr_cid);
                                                 }
                                             } else {
+                                                eprintln!(
+                                                    "Add CID-{} with hash: {}",
+                                                    curr_cid, hash
+                                                );
                                                 let _ = app_data.append(Content::Data(
                                                     data_type,
                                                     0,
@@ -2282,6 +2289,12 @@ async fn serve_app_data(
                                             }
                                             curr_cid += 1;
                                         }
+                                        eprintln!(
+                                            "{:?} Memory: {}/{} Pages (not fully implemented)",
+                                            swarm_id,
+                                            app_data.contents.used_memory_pages(),
+                                            max_pages_in_memory
+                                        );
                                     } else {
                                         eprintln!("Datastore is synced, why sent this?");
                                     }
@@ -2347,7 +2360,7 @@ async fn serve_app_data(
                                         //     c_id, data_type
                                         // );
                                         if let Ok((d_type, len)) = app_data.get_type_and_len(c_id) {
-                                            // eprintln!("CID {} already exists", c_id);
+                                            eprintln!("CID {} already exists, len: {}", c_id, len);
                                             if d_type == DataType::Link {
                                                 if len > 0 {
                                                     // eprintln!("Update existing Link");
@@ -2363,6 +2376,7 @@ async fn serve_app_data(
                                             } else {
                                                 // eprintln!("Inserting page 0 of non-Link content");
 
+                                                eprintln!("New page #0 hash: {}", data.get_hash());
                                                 let res = app_data.update_data(
                                                     c_id,
                                                     page_no,
@@ -2385,7 +2399,13 @@ async fn serve_app_data(
                                                     );
                                                 } else {
                                                     eprintln!(
-                                                        "C-{} Page #{} update failed: {:?}",
+                                                        "CID-{} hashes: {:?}",
+                                                        c_id,
+                                                        app_data.content_bottom_hashes(c_id)
+                                                    );
+                                                    eprintln!(
+                                                        "{:?} C-{} Page #{} update failed: {:?}",
+                                                        swarm_id,
                                                         c_id,
                                                         page_no,
                                                         res.err().unwrap()
@@ -2440,7 +2460,8 @@ async fn serve_app_data(
                                                 );
                                             } else {
                                                 eprintln!(
-                                                    "C-{} Page #{} update error: {:?}",
+                                                    "{:?} C-{} Page #{} update error: {:?}",
+                                                    swarm_id,
                                                     c_id,
                                                     page_no,
                                                     res.err().unwrap()
@@ -2586,6 +2607,24 @@ async fn serve_app_data(
             }
             _ => {
                 eprintln!("Unserved by app: {:?}", resp);
+            }
+        }
+        let used_pages = app_data.contents.used_memory_pages();
+        // if used  > max_pages_in_memory{
+        if used_pages > 30 {
+            if store_on_disk {
+                // eprintln!(
+                //     "{:?} We need to clean up {} pages from memory onto disk!",
+                //     // used_pages - max_pages_in_memory
+                //     swarm_id,
+                //     used_pages - 30
+                // );
+            } else {
+                eprintln!(
+                    "We need to purge {} pages from memory!",
+                    // used_pages - max_pages_in_memory
+                    used_pages - 30
+                );
             }
         }
     }

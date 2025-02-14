@@ -56,6 +56,7 @@ async fn parse_datastore_file(
             buffer[11], buffer[12], buffer[13], buffer[14], buffer[15], buffer[16], buffer[17],
             buffer[18],
         ]);
+        // eprintln!("temp insert CID-{} hash: {}", id, hash);
         temp_store.insert(id, (DataType::from(dtype), hash));
         if id > highest_inserted_id {
             highest_inserted_id = id;
@@ -79,6 +80,7 @@ pub async fn read_datastore_from_disk(
     let mut app_data = ApplicationData::new(crate::prelude::AppType::Catalog);
     for i in 0..=highest_inserted_id {
         if let Some((dtype, hash)) = temp_store.remove(&i) {
+            eprintln!("Disk read CID-{} with hash: {}", i, hash);
             let content = if dtype == DataType::Link {
                 Content::Link(
                     SwarmName {
