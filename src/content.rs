@@ -10,6 +10,11 @@ use crate::prelude::AppError;
 use crate::prelude::Data;
 pub type ContentID = u16;
 
+// impl fmt::Display for ContentID {
+//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+//         write!(f, "C={}", self)
+//     }
+// }
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DataType {
     Data(u8),

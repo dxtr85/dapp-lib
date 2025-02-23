@@ -500,6 +500,8 @@ async fn load_content_from_header_file(
 }
 
 pub async fn write_datastore_to_disk(file_path: PathBuf, app_data: &ApplicationData) {
+    //TODO: first read file contents and only update those records that have changed
+    // or are not present
     let mut temp_store = HashMap::new();
     let mut root_hash = 0;
     let _ = parse_datastore_file(file_path.clone(), &mut temp_store, &mut root_hash).await;
