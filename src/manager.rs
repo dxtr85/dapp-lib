@@ -81,6 +81,14 @@ impl ApplicationManager {
         }
         mapping
     }
+    pub fn get_swarm_founder(&self, swarm_id: &SwarmID) -> Option<GnomeId> {
+        for (f_id, (s_id, _synced)) in self.gnome_to_swarm.iter() {
+            if swarm_id == s_id {
+                return Some(*f_id);
+            }
+        }
+        None
+    }
     pub fn remove_gnome_mapping(&mut self, g_id: &GnomeId) -> Option<(SwarmID, bool)> {
         self.gnome_to_swarm.remove(g_id)
     }

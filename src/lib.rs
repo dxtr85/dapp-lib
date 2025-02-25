@@ -92,6 +92,7 @@ pub enum ToApp {
     FirstPages(SwarmID, Vec<(ContentID, DataType, Data)>),
     MyPublicIPs(Vec<(IpAddr, u16, Nat, (PortAllocationRule, i8))>),
     GnomeToSwarmMapping(HashMap<GnomeId, SwarmID>),
+    // FromPresentation(FromPresentation),
     Disconnected(bool, SwarmID, SwarmName), //bool indicates if we try to reconnect
     Quit,
 }
@@ -124,6 +125,7 @@ pub enum ToAppMgr {
     TransformLinkRequest(Box<SyncData>),
     ProvideGnomeToSwarmMapping,
     SwarmSynced(SwarmID),
+    FromGMgr(FromGnomeManager),
     Quit,
 }
 
@@ -183,10 +185,10 @@ impl BigChunk {
 
 // fn parse_sync(sync_data: SyncData) -> AppMessage {}
 
-pub fn initialize(
+pub async fn initialize(
     to_user_send: Sender<ToApp>,
-    to_app_mgr_send: Sender<ToAppMgr>,
-    to_app_mgr_recv: Receiver<ToAppMgr>,
+    to_app_mgr_send: ASender<ToAppMgr>,
+    to_app_mgr_recv: AReceiver<ToAppMgr>,
     config_dir: PathBuf,
     mut neighbors: Vec<(GnomeId, NetworkSettings)>,
 ) -> GnomeId {
@@ -206,8 +208,8 @@ pub fn initialize(
     // init function
     // let neighbors =
     // let (gmgr_send, gmgr_recv, my_id) = init(config_dir, config.neighbors);
-    let (gmgr_send, gmgr_recv, my_id) = init(config_dir, Some(neighbors));
-    spawn(serve_gnome_manager(
+    let (gmgr_send, gmgr_recv, my_id) = init(config_dir, Some(neighbors)).await;
+    spawn(serve_app_manager(
         config.storage.clone(),
         gmgr_send,
         gmgr_recv,
@@ -218,13 +220,13 @@ pub fn initialize(
     my_id
 }
 
-async fn serve_gnome_manager(
+async fn serve_app_manager(
     storage: PathBuf,
-    to_gnome_mgr: Sender<ToGnomeManager>,
-    from_gnome_mgr: Receiver<FromGnomeManager>,
+    to_gnome_mgr: ASender<ToGnomeManager>,
+    from_gnome_mgr: AReceiver<FromGnomeManager>,
     to_user: Sender<ToApp>,
-    to_app_mgr: Sender<ToAppMgr>,
-    to_app_mgr_recv: Receiver<ToAppMgr>,
+    to_app_mgr: ASender<ToAppMgr>,
+    to_app_mgr_recv: AReceiver<ToAppMgr>,
 ) {
     // TODO: AppMgr should hold state
     // We need to define a total number of Pages that can be stored in memory.
@@ -235,138 +237,28 @@ async fn serve_gnome_manager(
     // We provide that number to every instance of app_data_service we spawn.
     // app_data_service can not exceed memory usage above provided threshold.
     eprintln!("Storage root, gmgr: {:?}", storage);
-    let message = from_gnome_mgr
-        .recv()
-        .expect("First message sent from gnome mgr has to be MyID");
-    let mut my_id = if let FromGnomeManager::MyID(gnome_id) = message {
-        gnome_id
-    } else {
-        GnomeId(u64::MAX)
-    };
+    // let message = from_gnome_mgr
+    //     .recv()
+    //     .await
+    //     .expect("First message sent from gnome mgr has to be MyID");
+    let mut my_id =
+    //     if let FromGnomeManager::MyID(gnome_id) = message {
+    //     gnome_id
+    // } else {
+    //     eprintln!("Received unexpected message: {:?}", message);
+        GnomeId(u64::MAX);
+    // };
     // eprintln!("My-ID: {}", my_id);
     let mut app_mgr = ApplicationManager::new(my_id);
 
-    let sleep_time = Duration::from_millis(128);
+    // let sleep_time = Duration::from_millis(16);
     let mut own_swarm_started = false;
     let mut quit_application = false;
+    spawn(serve_gnome_mgr_requests(from_gnome_mgr, to_app_mgr.clone()));
     'outer: loop {
-        sleep(sleep_time).await;
-        while let Ok(message) = from_gnome_mgr.try_recv() {
-            match message {
-                FromGnomeManager::MyID(m_id) => my_id = m_id,
-                FromGnomeManager::SwarmFounderDetermined(swarm_id, f_id) => {
-                    // eprintln!("SwarmFounderDetermined (is it me?: {})", f_id == my_id);
-                    app_mgr.update_app_data_founder(swarm_id, f_id);
-                    //TODO: distinguish between founder and my_id, if not equal
-                    // request gnome manager to join another swarm where f_id == my_id
-                    if f_id != my_id {
-                        if !own_swarm_started {
-                            own_swarm_started = true;
-                            eprintln!("Starting a new swarm, where I am Founder…");
-                            let _ = to_gnome_mgr.send(ToGnomeManager::JoinSwarm(
-                                SwarmName::new(my_id, "/".to_string()).unwrap(),
-                            ));
-                        } else {
-                            // eprintln!("TODO: Need to notify neighbor about my swarm");
-                            app_mgr.set_active(&my_id);
-                        }
-                    } else {
-                        own_swarm_started = true;
-                    }
-                }
-                FromGnomeManager::MyPublicIPs(ip_list) => {
-                    // eprintln!("dapp_lib got list of my public IP");
-                    // for (ip, port, nat, (rule, val)) in &ip_list {
-                    //     eprintln!(
-                    //         "dapp_lib Pub IP: {}:{} ({:?}, {:?}:{})",
-                    //         ip, port, nat, rule, val
-                    //     );
-                    // }
-                    let _ = to_user.send(ToApp::MyPublicIPs(ip_list));
-                }
-                FromGnomeManager::NewSwarmAvailable(swarm_name, gnome_id, swarm_exists) => {
-                    // We have to go through dapp-lib and can not directly join/extend
-                    // from gnome manager since dapp-lib can decide it has no resources
-                    // for starting a new swarm.
-                    // Right now there is no such logic, but when time comes...
-                    if !own_swarm_started && swarm_name.founder == my_id {
-                        eprintln!("Oh, seems like my swarm is already there, I'll just join it");
-                        own_swarm_started = true;
-                    }
-                    if swarm_exists {
-                        eprintln!("Extending {}", swarm_name);
-                        let _res =
-                            to_gnome_mgr.send(ToGnomeManager::ExtendSwarm(swarm_name, gnome_id));
-                    } else {
-                        eprintln!("NewSwarm available, joining: {}", swarm_name);
-                        let _res = to_gnome_mgr.send(ToGnomeManager::JoinSwarm(swarm_name));
-                    }
-                    // eprintln!("Join sent: {:?}", _res);
-                }
-                FromGnomeManager::SwarmJoined(s_id, s_name, to_swarm, from_swarm) => {
-                    eprintln!("{} joined {}", s_id, s_name);
-                    // TODO: we need to identify to which application should we assign
-                    //       given swarm
-                    // TODO: we need a bi-directional communication between
-                    // AppMgr and each AppData
-                    // TODO: we need a bi-directional comm between AppMgr and user App
-                    let (to_app_data_send, to_app_data_recv) = achannel::bounded(32);
-                    app_mgr.add_app_data(s_name, s_id, to_app_data_send.clone());
-                    // TODO: build an algorithm that decides how many pages should be provisioned
-                    let max_pages_in_memory = 32768;
-                    // eprintln!("spawning new serve_app_data");
-                    let app_data = ApplicationData::new(AppType::Catalog);
-                    spawn(serve_app_data(
-                        storage.clone(),
-                        max_pages_in_memory,
-                        s_id,
-                        app_data,
-                        to_app_data_send.clone(),
-                        to_app_data_recv,
-                        to_swarm,
-                        to_app_mgr.clone(),
-                    ));
-                    spawn(serve_swarm(
-                        Duration::from_millis(64),
-                        from_swarm,
-                        to_app_data_send.clone(),
-                    ));
-                }
-                // FromGnomeManager::SwarmTerminated(swarm_id, s_name) => {
-                //     eprintln!("dapp-lib got info about {} {} terminated", swarm_id, s_name);
-                //     to_app_mgr.send(ToAppMgr::SwarmTerminated(swarm_id, s_name));
-                // }
-                FromGnomeManager::Disconnected(s_ids) => {
-                    // eprintln!("AppMgr received Disconnected");
-                    if quit_application {
-                        let _ = to_user.send(ToApp::Quit);
-                        break 'outer;
-                    } else {
-                        let (active_id, _sender) = app_mgr.active_app_data.clone();
-                        for (s_id, s_name) in &s_ids {
-                            app_mgr.remove_gnome_mapping(&s_name.founder);
-                            eprintln!("{} {} terminated", s_id, s_name);
-                            if active_id == *s_id || s_name.founder == app_mgr.gnome_id {
-                                //TODO: we need to reconnect
-                                eprintln!("Reconnecting with swarm {}", s_name);
-                                to_gnome_mgr.send(ToGnomeManager::JoinSwarm(s_name.clone()));
-                                //TODO: we need to inform user about loosing active swarm
-                                // temporary we send Disconnected
-                                let _ =
-                                    to_user.send(ToApp::Disconnected(true, *s_id, s_name.clone()));
-                            } else {
-                                let _ =
-                                    to_user.send(ToApp::Disconnected(false, *s_id, s_name.clone()));
-                            }
-                            if let Some(app_data) = app_mgr.app_data_store.get(&s_id) {
-                                let _ = app_data.send(ToAppData::Terminate).await;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        while let Ok(message) = to_app_mgr_recv.try_recv() {
+        // sleep(sleep_time).await;
+
+        while let Ok(message) = to_app_mgr_recv.recv().await {
             match message {
                 ToAppMgr::UploadData => {
                     let _ = app_mgr.active_app_data.1.send(ToAppData::UploadData).await;
@@ -539,10 +431,167 @@ async fn serve_gnome_manager(
                 }
                 ToAppMgr::SwarmSynced(s_id) => {
                     app_mgr.set_synced(s_id);
+                    if !own_swarm_started {
+                        if let Some(founder) = app_mgr.get_swarm_founder(&s_id) {
+                            if !founder.is_any() && founder != my_id {
+                                eprintln!("Starting a new swarm, where I {} am Founder…", my_id);
+                                let _ = to_gnome_mgr
+                                    .send(ToGnomeManager::JoinSwarm(
+                                        SwarmName::new(my_id, "/".to_string()).unwrap(),
+                                    ))
+                                    .await;
+                                own_swarm_started = true;
+                            }
+                        }
+                    }
+                }
+                ToAppMgr::FromGMgr(message) => {
+                    //TODO: serve this
+                    // while let Ok(message) = from_gnome_mgr.recv().await {
+                    match message {
+                        FromGnomeManager::MyID(m_id) => {
+                            eprintln!("I know my id: {}", m_id);
+                            app_mgr.gnome_id = m_id;
+                            my_id = m_id
+                        }
+                        FromGnomeManager::SwarmFounderDetermined(swarm_id, f_id) => {
+                            // eprintln!("SwarmFounderDetermined (is it me?: {})", f_id == my_id);
+                            app_mgr.update_app_data_founder(swarm_id, f_id);
+                            //TODO: distinguish between founder and my_id, if not equal
+                            // request gnome manager to join another swarm where f_id == my_id
+                            // if f_id != my_id {
+                            //     if !own_swarm_started {
+                            //         own_swarm_started = true;
+                            //         eprintln!(
+                            //             "Starting a new swarm, where I {} am Founder…",
+                            //             my_id
+                            //         );
+                            //         let _ = to_gnome_mgr
+                            //             .send(ToGnomeManager::JoinSwarm(
+                            //                 SwarmName::new(my_id, "/".to_string()).unwrap(),
+                            //             ))
+                            //             .await;
+                            //     } else {
+                            //         // eprintln!("TODO: Need to notify neighbor about my swarm");
+                            //         let _ = app_mgr.set_active(&my_id);
+                            //     }
+                            // } else {
+                            if f_id == my_id {
+                                own_swarm_started = true;
+                            }
+                        }
+                        FromGnomeManager::MyPublicIPs(ip_list) => {
+                            // eprintln!("dapp_lib got list of my public IP");
+                            // for (ip, port, nat, (rule, val)) in &ip_list {
+                            //     eprintln!(
+                            //         "dapp_lib Pub IP: {}:{} ({:?}, {:?}:{})",
+                            //         ip, port, nat, rule, val
+                            //     );
+                            // }
+                            let _ = to_user.send(ToApp::MyPublicIPs(ip_list));
+                        }
+                        FromGnomeManager::NewSwarmAvailable(swarm_name, gnome_id, swarm_exists) => {
+                            // We have to go through dapp-lib and can not directly join/extend
+                            // from gnome manager since dapp-lib can decide it has no resources
+                            // for starting a new swarm.
+                            // Right now there is no such logic, but when time comes...
+                            if !own_swarm_started && swarm_name.founder == my_id {
+                                eprintln!(
+                                    "Oh, seems like my swarm is already there, I'll just join it"
+                                );
+                                own_swarm_started = true;
+                            }
+                            if swarm_exists {
+                                eprintln!("Extending {}", swarm_name);
+                                let _res = to_gnome_mgr
+                                    .send(ToGnomeManager::ExtendSwarm(swarm_name, gnome_id))
+                                    .await;
+                            } else {
+                                eprintln!("NewSwarm available, joining: {}", swarm_name);
+                                let _res = to_gnome_mgr
+                                    .send(ToGnomeManager::JoinSwarm(swarm_name))
+                                    .await;
+                            }
+                            // eprintln!("Join sent: {:?}", _res);
+                        }
+                        FromGnomeManager::SwarmJoined(s_id, s_name, to_swarm, from_swarm) => {
+                            eprintln!("{} joined {}", s_id, s_name);
+                            // TODO: we need to identify to which application should we assign
+                            //       given swarm
+                            // TODO: we need a bi-directional communication between
+                            // AppMgr and each AppData
+                            // TODO: we need a bi-directional comm between AppMgr and user App
+                            let (to_app_data_send, to_app_data_recv) = achannel::bounded(32);
+                            app_mgr.add_app_data(s_name, s_id, to_app_data_send.clone());
+                            // TODO: build an algorithm that decides how many pages should be provisioned
+                            let max_pages_in_memory = 32768;
+                            // eprintln!("spawning new serve_app_data");
+                            let app_data = ApplicationData::new(AppType::Catalog);
+                            spawn(serve_app_data(
+                                storage.clone(),
+                                max_pages_in_memory,
+                                s_id,
+                                app_data,
+                                to_app_data_send.clone(),
+                                to_app_data_recv,
+                                to_swarm,
+                                to_app_mgr.clone(),
+                            ));
+                            spawn(serve_swarm(
+                                Duration::from_millis(64),
+                                from_swarm,
+                                to_app_data_send.clone(),
+                            ));
+                        }
+                        // FromGnomeManager::SwarmTerminated(swarm_id, s_name) => {
+                        //     eprintln!("dapp-lib got info about {} {} terminated", swarm_id, s_name);
+                        //     to_app_mgr.send(ToAppMgr::SwarmTerminated(swarm_id, s_name));
+                        // }
+                        FromGnomeManager::Disconnected(s_ids) => {
+                            // eprintln!("AppMgr received Disconnected");
+                            if quit_application {
+                                let _ = to_user.send(ToApp::Quit);
+                                break 'outer;
+                            } else {
+                                let (active_id, _sender) = app_mgr.active_app_data.clone();
+                                for (s_id, s_name) in &s_ids {
+                                    app_mgr.remove_gnome_mapping(&s_name.founder);
+                                    eprintln!(
+                                        "{} {} terminated (my id: {})",
+                                        s_id, s_name, app_mgr.gnome_id
+                                    );
+                                    if active_id == *s_id || s_name.founder == app_mgr.gnome_id {
+                                        //TODO: we need to reconnect
+                                        eprintln!("Reconnecting with swarm {}", s_name);
+                                        let _ = to_gnome_mgr
+                                            .send(ToGnomeManager::JoinSwarm(s_name.clone()))
+                                            .await;
+                                        //TODO: we need to inform user about loosing active swarm
+                                        // temporary we send Disconnected
+                                        let _ = to_user.send(ToApp::Disconnected(
+                                            true,
+                                            *s_id,
+                                            s_name.clone(),
+                                        ));
+                                    } else {
+                                        let _ = to_user.send(ToApp::Disconnected(
+                                            false,
+                                            *s_id,
+                                            s_name.clone(),
+                                        ));
+                                    }
+                                    if let Some(app_data) = app_mgr.app_data_store.get(&s_id) {
+                                        let _ = app_data.send(ToAppData::Terminate).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // }                    //
                 }
                 ToAppMgr::Quit => {
                     quit_application = true;
-                    let _res = to_gnome_mgr.send(ToGnomeManager::Quit);
+                    let _res = to_gnome_mgr.send(ToGnomeManager::Quit).await;
                     eprintln!("AppMgr received Quit: {:?}", _res);
                     for app_data in app_mgr.app_data_store.values() {
                         // let _ = app_mgr.active_app_data.send(ToAppData::Terminate).await;
@@ -556,6 +605,15 @@ async fn serve_gnome_manager(
     eprintln!("Done serving AppMgr");
 }
 
+async fn serve_gnome_mgr_requests(
+    from_gnome_mgr: AReceiver<FromGnomeManager>,
+    to_app_mgr: ASender<ToAppMgr>,
+) {
+    //TODO: convert msgs from GMgr to ToAppMgr::FromGMgr
+    while let Ok(request) = from_gnome_mgr.recv().await {
+        to_app_mgr.send(ToAppMgr::FromGMgr(request)).await;
+    }
+}
 async fn serve_app_data(
     storage: PathBuf,
     max_pages_in_memory: usize,
@@ -564,7 +622,7 @@ async fn serve_app_data(
     app_data_send: ASender<ToAppData>,
     app_data_recv: AReceiver<ToAppData>,
     to_gnome_sender: Sender<ToGnome>,
-    to_app_mgr_send: Sender<ToAppMgr>,
+    to_app_mgr_send: ASender<ToAppMgr>,
 ) {
     let mut s_storage = PathBuf::new();
     // TODO: Understand & implement Tiny Pointers for efficient data storage in RAM
@@ -1397,7 +1455,9 @@ async fn serve_app_data(
                 }
             }
             ToAppData::Response(GnomeToApp::Neighbors(s_id, neighbors)) => {
-                let _ = to_app_mgr_send.send(ToAppMgr::NeighborsListing(s_id, neighbors));
+                let _ = to_app_mgr_send
+                    .send(ToAppMgr::NeighborsListing(s_id, neighbors))
+                    .await;
             }
             ToAppData::SendFirstPage(n_id, c_id, data) => {
                 let sync_type = 0;
@@ -1431,7 +1491,9 @@ async fn serve_app_data(
                         }
                     }
                 }
-                let _ = to_app_mgr_send.send(ToAppMgr::FirstPages(swarm_id, first_pages_vec));
+                let _ = to_app_mgr_send
+                    .send(ToAppMgr::FirstPages(swarm_id, first_pages_vec))
+                    .await;
             }
             ToAppData::Response(GnomeToApp::Block(_id, data)) => {
                 // println!("Processing data...");
@@ -1513,9 +1575,11 @@ async fn serve_app_data(
                                 // eprintln!("Sending updated hash: {}", hash);
                                 // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
                                 // eprintln!("Send res: {:?}", res);
-                                let _to_mgr_res = to_app_mgr_send.send(ToAppMgr::ContentAdded(
-                                    swarm_id, recv_id, d_type, main_page,
-                                ));
+                                let _to_mgr_res = to_app_mgr_send
+                                    .send(ToAppMgr::ContentAdded(
+                                        swarm_id, recv_id, d_type, main_page,
+                                    ))
+                                    .await;
                             } else {
                                 eprintln!("Recv id: {}, next id: {}", recv_id, next_id);
                                 eprintln!(
@@ -1595,12 +1659,14 @@ async fn serve_app_data(
                                 } else {
                                     Some(Data::empty(first_hash))
                                 };
-                                let _to_mgr_res = to_app_mgr_send.send(ToAppMgr::ContentChanged(
-                                    swarm_id,
-                                    c_id,
-                                    d_type,
-                                    main_page_option,
-                                ));
+                                let _to_mgr_res = to_app_mgr_send
+                                    .send(ToAppMgr::ContentChanged(
+                                        swarm_id,
+                                        c_id,
+                                        d_type,
+                                        main_page_option,
+                                    ))
+                                    .await;
                                 let hash = app_data.root_hash();
                                 // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
                                 eprintln!("ChangeContent completed successfully ({})", hash);
@@ -1758,12 +1824,14 @@ async fn serve_app_data(
                                 // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
                                 // eprintln!("Send res: {:?}", res);
                                 eprintln!("Data updated successfully ({})", hash);
-                                let _to_mgr_res = to_app_mgr_send.send(ToAppMgr::ContentChanged(
-                                    swarm_id,
-                                    c_id,
-                                    d_type,
-                                    main_page_option,
-                                ));
+                                let _to_mgr_res = to_app_mgr_send
+                                    .send(ToAppMgr::ContentChanged(
+                                        swarm_id,
+                                        c_id,
+                                        d_type,
+                                        main_page_option,
+                                    ))
+                                    .await;
                             }
                         } else {
                             eprintln!("UpdateData failed: {}", res.err().unwrap());
@@ -1882,12 +1950,14 @@ async fn serve_app_data(
                                                 // );
                                             }
                                         }
-                                        let _ = to_app_mgr_send.send(ToAppMgr::GetCIDsForTags(
-                                            swarm_id,
-                                            neighbor_id,
-                                            tags,
-                                            all_first_pages,
-                                        ));
+                                        let _ = to_app_mgr_send
+                                            .send(ToAppMgr::GetCIDsForTags(
+                                                swarm_id,
+                                                neighbor_id,
+                                                tags,
+                                                all_first_pages,
+                                            ))
+                                            .await;
                                     } else {
                                         let sync_type = 0;
                                         for c_id in 1..app_data.next_c_id().unwrap() {
@@ -2239,12 +2309,14 @@ async fn serve_app_data(
                                                                 curr_cid,
                                                                 _res.is_ok()
                                                             );
-                                                            let _ = to_app_mgr_send.send(
-                                                                ToAppMgr::ContentLoadedFromDisk(
-                                                                    swarm_id, curr_cid, dtype,
-                                                                    main_page,
-                                                                ),
-                                                            );
+                                                            let _ = to_app_mgr_send
+                                                                .send(
+                                                                    ToAppMgr::ContentLoadedFromDisk(
+                                                                        swarm_id, curr_cid, dtype,
+                                                                        main_page,
+                                                                    ),
+                                                                )
+                                                                .await;
                                                         } else {
                                                             eprintln!(
                                                                 "Load {:?} CID-{} from disk failed",
@@ -2260,7 +2332,7 @@ async fn serve_app_data(
                                                                 ToAppMgr::ContentRequestedFromNeighbor(
                                                                     swarm_id, curr_cid, data_type,
                                                                 ),
-                                                            );
+                                                            ).await;
                                                         }
                                                     } else {
                                                         if i_am_founder && curr_cid > 0 {
@@ -2304,7 +2376,7 @@ async fn serve_app_data(
                                                             ToAppMgr::ContentRequestedFromNeighbor(
                                                                 swarm_id, curr_cid, data_type,
                                                             ),
-                                                        );
+                                                        ).await;
                                                         eprintln!("{:?} CID-{} Hash mismatch(disk: {} != {} swarm)",swarm_id, curr_cid,dhash,hash);
                                                     }
                                                 } else {
@@ -2325,11 +2397,13 @@ async fn serve_app_data(
                                                         true,
                                                         to_gnome_sender.clone(),
                                                     );
-                                                    let _ = to_app_mgr_send.send(
-                                                        ToAppMgr::ContentRequestedFromNeighbor(
-                                                            swarm_id, curr_cid, data_type,
-                                                        ),
-                                                    );
+                                                    let _ = to_app_mgr_send
+                                                        .send(
+                                                            ToAppMgr::ContentRequestedFromNeighbor(
+                                                                swarm_id, curr_cid, data_type,
+                                                            ),
+                                                        )
+                                                        .await;
                                                     eprintln!("CID-{} DType mismatch", curr_cid);
                                                 }
                                             } else {
@@ -2349,11 +2423,11 @@ async fn serve_app_data(
                                                     true,
                                                     to_gnome_sender.clone(),
                                                 );
-                                                let _ = to_app_mgr_send.send(
-                                                    ToAppMgr::ContentRequestedFromNeighbor(
+                                                let _ = to_app_mgr_send
+                                                    .send(ToAppMgr::ContentRequestedFromNeighbor(
                                                         swarm_id, curr_cid, data_type,
-                                                    ),
-                                                );
+                                                    ))
+                                                    .await;
                                                 eprintln!("CID-{} not found on disk", curr_cid);
                                             }
                                             curr_cid += 1;
@@ -2364,7 +2438,9 @@ async fn serve_app_data(
                                             app_data.contents.used_memory_pages(),
                                             max_pages_in_memory
                                         );
-                                        to_app_mgr_send.send(ToAppMgr::SwarmSynced(swarm_id));
+                                        let _ = to_app_mgr_send
+                                            .send(ToAppMgr::SwarmSynced(swarm_id))
+                                            .await;
                                     } else {
                                         eprintln!("Datastore is synced, why sent this?");
                                     }
@@ -2456,14 +2532,14 @@ async fn serve_app_data(
                                                 if res.is_ok() {
                                                     // We send an update to print content
                                                     // on screen
-                                                    let _ = to_app_mgr_send.send(
-                                                        ToAppMgr::ContentChanged(
+                                                    let _ = to_app_mgr_send
+                                                        .send(ToAppMgr::ContentChanged(
                                                             swarm_id,
                                                             c_id,
                                                             d_type,
                                                             Some(data),
-                                                        ),
-                                                    );
+                                                        ))
+                                                        .await;
                                                     eprintln!(
                                                         "C-{} Page #{} update result: ok",
                                                         c_id, page_no,
@@ -2485,12 +2561,14 @@ async fn serve_app_data(
                                             }
                                         } else if data_type < DataType::Link {
                                             // eprintln!("Create new Data");
-                                            let _ = to_app_mgr_send.send(ToAppMgr::ContentAdded(
-                                                swarm_id,
-                                                c_id,
-                                                data_type,
-                                                data.clone(),
-                                            ));
+                                            let _ = to_app_mgr_send
+                                                .send(ToAppMgr::ContentAdded(
+                                                    swarm_id,
+                                                    c_id,
+                                                    data_type,
+                                                    data.clone(),
+                                                ))
+                                                .await;
                                             let _res = app_data.update(
                                                 c_id,
                                                 Content::Data(
@@ -2501,12 +2579,14 @@ async fn serve_app_data(
                                             );
                                         } else {
                                             // eprintln!("Create new Link 2");
-                                            let _ = to_app_mgr_send.send(ToAppMgr::ContentAdded(
-                                                swarm_id,
-                                                c_id,
-                                                data_type,
-                                                data.clone(),
-                                            ));
+                                            let _ = to_app_mgr_send
+                                                .send(ToAppMgr::ContentAdded(
+                                                    swarm_id,
+                                                    c_id,
+                                                    data_type,
+                                                    data.clone(),
+                                                ))
+                                                .await;
                                             let link_result = data_to_link(data);
                                             if let Ok(link) = link_result {
                                                 let _res = app_data.update(c_id, link);
@@ -2570,17 +2650,21 @@ async fn serve_app_data(
                 //TODO: find a way to decide if we are completely synced with swarm, or not
                 //      if not request to sync from any Neighbor
                 if datastore_sync.is_some() {
-                    let _ = to_app_mgr_send.send(ToAppMgr::ReadError(
-                        swarm_id,
-                        c_id,
-                        AppError::AppDataNotSynced,
-                    ));
+                    let _ = to_app_mgr_send
+                        .send(ToAppMgr::ReadError(
+                            swarm_id,
+                            c_id,
+                            AppError::AppDataNotSynced,
+                        ))
+                        .await;
                     continue;
                 }
                 let type_and_len_result = app_data.get_type_and_len(c_id);
                 if type_and_len_result.is_err() {
                     let error = type_and_len_result.err().unwrap();
-                    let _ = to_app_mgr_send.send(ToAppMgr::ReadError(swarm_id, c_id, error));
+                    let _ = to_app_mgr_send
+                        .send(ToAppMgr::ReadError(swarm_id, c_id, error))
+                        .await;
                     continue;
                 }
                 let (_t, len) = type_and_len_result.unwrap();
@@ -2592,8 +2676,9 @@ async fn serve_app_data(
                     // if c_id == 0 {
                     //     eprintln!("Sending read result with {} data blocks", data_vec.len());
                     // }
-                    let _ =
-                        to_app_mgr_send.send(ToAppMgr::ReadSuccess(swarm_id, c_id, t, data_vec));
+                    let _ = to_app_mgr_send
+                        .send(ToAppMgr::ReadSuccess(swarm_id, c_id, t, data_vec))
+                        .await;
                 } else {
                     let error = all_data_result.err().unwrap();
                     if matches!(error, AppError::ContentEmpty) {
@@ -2607,7 +2692,9 @@ async fn serve_app_data(
                             ),
                         ));
                     }
-                    let _ = to_app_mgr_send.send(ToAppMgr::ReadError(swarm_id, c_id, error));
+                    let _ = to_app_mgr_send
+                        .send(ToAppMgr::ReadError(swarm_id, c_id, error))
+                        .await;
                 }
             }
             ToAppData::BCastOrigin(c_id, send) => b_cast_origin = Some((c_id, send)),
@@ -2712,7 +2799,7 @@ async fn serve_swarm(
             // println!("SUR: {:?}", resp);
             match resp {
                 GnomeToApp::SwarmReady(s_name, i_am_founder) => {
-                    // eprintln!("Gnome says if synced: {}", synced);
+                    eprintln!("Gnome says {} synced: {}", s_name, i_am_founder);
                     let _ = to_app_data_send
                         .send(ToAppData::SwarmReady(s_name, i_am_founder))
                         .await;
