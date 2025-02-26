@@ -154,6 +154,7 @@ pub enum ToAppData {
     CustomResponse(u8, GnomeId, CastData),
     TransformLinkRequest(SyncData),
     TransformLink(SyncData),
+    TimeoutSyncCheck,
     Terminate,
 }
 // TODO: We need to define a way where we can update multiple Data of a given ContentID at once
@@ -585,8 +586,12 @@ async fn serve_app_manager(
                                             .send(ToApp::Disconnected(true, *s_id, s_name.clone()))
                                             .await;
                                     } else {
+                                        eprintln!("Reconnecting with swarm {}", s_name);
+                                        let _ = to_gnome_mgr
+                                            .send(ToGnomeManager::JoinSwarm(s_name.clone()))
+                                            .await;
                                         let _ = to_user
-                                            .send(ToApp::Disconnected(false, *s_id, s_name.clone()))
+                                            .send(ToApp::Disconnected(true, *s_id, s_name.clone()))
                                             .await;
                                     }
                                     if let Some(app_data) = app_mgr.app_data_store.get(&s_id) {
@@ -737,6 +742,7 @@ async fn serve_app_data(
                 //
                 // And if we do not have data on disk we follow the same route as if
                 // we had some data on disk, but it was all invalid, so maximum difference.
+                spawn(sync_timeout(app_data_send.clone()));
                 let sync_requests: Vec<SyncRequest> = vec![
                     SyncRequest::Datastore,
                     // SyncRequest::AllFirstPages(Some(vec![0])),
@@ -1913,6 +1919,7 @@ async fn serve_app_data(
                         while let Some(req) = sync_req_iter.next() {
                             match req {
                                 SyncRequest::Datastore => {
+                                    // eprintln!("{} Got SyncRequest::Datastore", swarm_id);
                                     // TODO: here we should trigger a separate task for sending
                                     // all root hashes to specified Neighbor
                                     // let sync_type = 0;
@@ -1932,7 +1939,7 @@ async fn serve_app_data(
                                             ),
                                         ));
                                     }
-                                    eprintln!("Sent Datastore response");
+                                    eprintln!("{} Sent Datastore response", swarm_id);
                                 }
                                 SyncRequest::AllFirstPages(tags_opt) => {
                                     // TODO: here we should trigger a separate task for sending
@@ -2761,6 +2768,20 @@ async fn serve_app_data(
                     eprintln!("App Data: {} ", data);
                 }
             }
+            ToAppData::TimeoutSyncCheck => {
+                if datastore_sync.is_some() {
+                    spawn(sync_timeout(app_data_send.clone()));
+                    eprintln!("{} Sending SyncRequest::Datastore again", swarm_id);
+                    let sync_requests: Vec<SyncRequest> = vec![SyncRequest::Datastore];
+                    let _ = to_gnome_sender.send(ToGnome::AskData(
+                        GnomeId::any(),
+                        NeighborRequest::Custom(
+                            0,
+                            CastData::new(serialize_requests(sync_requests)).unwrap(),
+                        ),
+                    ));
+                }
+            }
             ToAppData::Terminate => {
                 // TODO: determine whether or not we want to store this Swarm on disk
                 if store_on_disk {
@@ -3436,8 +3457,14 @@ fn get_root_hash(hashes: &Vec<u64>) -> u64 {
     } else {
         get_root_hash(&sub_hashes)
     }
-} // An entire application data consists of a structure called Datastore.
-  // There is also a helper change_reg useful for syncing.
+}
+async fn sync_timeout(sender: ASender<ToAppData>) {
+    let timeout = Duration::from_secs(5);
+    sleep(timeout).await;
+    let _ = sender.send(ToAppData::TimeoutSyncCheck).await;
+}
+// An entire application data consists of a structure called Datastore.
+// There is also a helper change_reg useful for syncing.
 
 // Datastore is a binary tree whose leafs store Content.
 // It is constructed in such a way that when we traverse it from top
