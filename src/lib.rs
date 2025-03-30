@@ -56,7 +56,8 @@ use async_std::channel::Sender as ASender;
 pub mod prelude {
     pub use crate::app_type::AppType;
     pub use crate::content::{
-        double_hash, Content, ContentID, ContentTree, DataType, TransformInfo,
+        data_to_link, double_hash, Content, ContentID, ContentTree, DataType, Description,
+        TransformInfo,
     };
     pub use crate::data::Data;
     pub use crate::error::AppError;
@@ -82,7 +83,7 @@ pub mod prelude {
 }
 
 pub enum ToApp {
-    ActiveSwarm(GnomeId, SwarmID), //TODO: also send Vec<Data> from CID=0(Manifest)
+    ActiveSwarm(SwarmName, SwarmID), //TODO: also send Vec<Data> from CID=0(Manifest)
     Neighbors(SwarmID, Vec<GnomeId>),
     NewContent(SwarmID, ContentID, DataType, Data),
     ContentChanged(SwarmID, ContentID, DataType, Option<Data>),
@@ -91,7 +92,7 @@ pub enum ToApp {
     GetCIDsForTags(SwarmID, GnomeId, Vec<u8>, Vec<(ContentID, Data)>),
     FirstPages(SwarmID, Vec<(ContentID, DataType, Data)>),
     MyPublicIPs(Vec<(IpAddr, u16, Nat, (PortAllocationRule, i8))>),
-    GnomeToSwarmMapping(HashMap<GnomeId, SwarmID>),
+    NameToIDMapping(HashMap<SwarmName, SwarmID>),
     // FromPresentation(FromPresentation),
     Disconnected(bool, SwarmID, SwarmName), //bool indicates if we try to reconnect
     Quit,
@@ -108,7 +109,7 @@ pub enum ToAppMgr {
     ReadAllFirstPages(SwarmID),
     FirstPages(SwarmID, Vec<(ContentID, DataType, Data)>),
     UploadData,
-    SetActiveApp(GnomeId),
+    SetActiveApp(SwarmName),
     StartUnicast,
     StartBroadcast,
     EndBroadcast,
@@ -192,7 +193,7 @@ pub async fn initialize(
     to_app_mgr_recv: AReceiver<ToAppMgr>,
     config_dir: PathBuf,
     mut neighbors: Vec<(GnomeId, NetworkSettings)>,
-) -> GnomeId {
+) -> SwarmName {
     // TODO: neighbors contain also our own public IP, get rid of it!
     eprintln!("Storage neighbors: {:?}", neighbors);
     let config = Configuration::new(config_dir.clone());
@@ -242,15 +243,15 @@ async fn serve_app_manager(
     //     .recv()
     //     .await
     //     .expect("First message sent from gnome mgr has to be MyID");
-    let mut my_id =
+    let mut my_name =
     //     if let FromGnomeManager::MyID(gnome_id) = message {
     //     gnome_id
     // } else {
     //     eprintln!("Received unexpected message: {:?}", message);
-        GnomeId(u64::MAX);
+        SwarmName{founder:GnomeId(u64::MAX),name:format!("/")};
     // };
     // eprintln!("My-ID: {}", my_id);
-    let mut app_mgr = ApplicationManager::new(my_id);
+    let mut app_mgr = ApplicationManager::new(my_name.founder);
 
     // let sleep_time = Duration::from_millis(16);
     let mut own_swarm_started = false;
@@ -308,11 +309,11 @@ async fn serve_app_manager(
                         .send(ToAppData::TransformLinkRequest(*boxed_s_data))
                         .await;
                 }
-                ToAppMgr::SetActiveApp(gnome_id) => {
-                    if let Ok(s_id) = app_mgr.set_active(&gnome_id) {
-                        let _ = to_user.send(ToApp::ActiveSwarm(gnome_id, s_id)).await;
+                ToAppMgr::SetActiveApp(swarm_name) => {
+                    if let Ok(s_id) = app_mgr.set_active(&swarm_name) {
+                        let _ = to_user.send(ToApp::ActiveSwarm(swarm_name, s_id)).await;
                     } else {
-                        eprintln!("Unable to find swarm for {}…", gnome_id);
+                        eprintln!("Unable to find swarm for {}…", swarm_name);
                     }
                 }
                 ToAppMgr::StartUnicast => {
@@ -440,19 +441,21 @@ async fn serve_app_manager(
                 }
                 ToAppMgr::ProvideGnomeToSwarmMapping => {
                     let _ = to_user
-                        .send(ToApp::GnomeToSwarmMapping(app_mgr.get_mapping()))
+                        .send(ToApp::NameToIDMapping(app_mgr.get_mapping()))
                         .await;
                 }
                 ToAppMgr::SwarmSynced(s_id) => {
+                    eprintln!("SwarmSynced {}", s_id);
                     app_mgr.set_synced(s_id);
                     if !own_swarm_started {
                         if let Some(founder) = app_mgr.get_swarm_founder(&s_id) {
-                            if !founder.is_any() && founder != my_id {
-                                eprintln!("Starting a new swarm, where I {} am Founder…", my_id);
+                            if founder.is_any() {
+                                eprintln!("Not starting my swarm - current founder is any");
+                            }
+                            if !founder.is_any() && founder != my_name.founder {
+                                eprintln!("Starting a new swarm, where I {} am Founder…", my_name);
                                 let _ = to_gnome_mgr
-                                    .send(ToGnomeManager::JoinSwarm(
-                                        SwarmName::new(my_id, "/".to_string()).unwrap(),
-                                    ))
+                                    .send(ToGnomeManager::JoinSwarm(my_name.clone()))
                                     .await;
                                 own_swarm_started = true;
                             }
@@ -463,14 +466,15 @@ async fn serve_app_manager(
                     //TODO: serve this
                     // while let Ok(message) = from_gnome_mgr.recv().await {
                     match message {
-                        FromGnomeManager::MyID(m_id) => {
-                            eprintln!("I know my id: {}", m_id);
-                            app_mgr.gnome_id = m_id;
-                            my_id = m_id
+                        FromGnomeManager::MyName(m_name) => {
+                            eprintln!("I know my id: {}", m_name);
+                            app_mgr.gnome_id = m_name.founder;
+                            my_name = m_name
                         }
-                        FromGnomeManager::SwarmFounderDetermined(swarm_id, f_id) => {
-                            // eprintln!("SwarmFounderDetermined (is it me?: {})", f_id == my_id);
-                            app_mgr.update_app_data_founder(swarm_id, f_id);
+                        FromGnomeManager::SwarmFounderDetermined(swarm_id, s_name) => {
+                            let founder = s_name.founder;
+                            eprintln!("SwarmFounderDetermined {}: {}", swarm_id, founder);
+                            app_mgr.update_app_data_founder(swarm_id, s_name);
                             //TODO: distinguish between founder and my_id, if not equal
                             // request gnome manager to join another swarm where f_id == my_id
                             // if f_id != my_id {
@@ -490,7 +494,7 @@ async fn serve_app_manager(
                             //         let _ = app_mgr.set_active(&my_id);
                             //     }
                             // } else {
-                            if f_id == my_id {
+                            if founder == my_name.founder {
                                 own_swarm_started = true;
                             }
                         }
@@ -509,7 +513,7 @@ async fn serve_app_manager(
                             // from gnome manager since dapp-lib can decide it has no resources
                             // for starting a new swarm.
                             // Right now there is no such logic, but when time comes...
-                            if !own_swarm_started && swarm_name.founder == my_id {
+                            if !own_swarm_started && swarm_name == my_name {
                                 eprintln!(
                                     "Oh, seems like my swarm is already there, I'll just join it"
                                 );
@@ -569,7 +573,7 @@ async fn serve_app_manager(
                             } else {
                                 let (active_id, _sender) = app_mgr.active_app_data.clone();
                                 for (s_id, s_name) in &s_ids {
-                                    app_mgr.remove_gnome_mapping(&s_name.founder);
+                                    app_mgr.remove_name_mapping(&s_name);
                                     eprintln!(
                                         "{} {} terminated (my id: {})",
                                         s_id, s_name, app_mgr.gnome_id
@@ -855,6 +859,7 @@ async fn serve_app_data(
             }
             ToAppData::AppendContent(d_type, data) => {
                 if let Some(next_id) = app_data.next_c_id() {
+                    eprintln!("AppendContent: {:?}", data);
                     let pre: Vec<(ContentID, u64)> = vec![(next_id, 0)];
                     let post: Vec<(ContentID, u64)> = vec![(next_id, data.get_hash())];
                     //TODO: we push this 0 to inform Content::from that we are dealing
@@ -904,12 +909,12 @@ async fn serve_app_data(
             // A local request from application to synchronize with swarm
             ToAppData::UpdateData(c_id, d_id, data) => {
                 //TODO:serve this
-                // eprintln!(
-                //     "Got ToAppData::UpdateData({}, {}, Dlen: {})",
-                //     c_id,
-                //     d_id,
-                //     data.len()
-                // );
+                eprintln!(
+                    "Got ToAppData::UpdateData({}, {}, Dlen: {})",
+                    c_id,
+                    d_id,
+                    data.len()
+                );
                 let pre_hash = app_data.content_root_hash(c_id).unwrap();
                 let pre: Vec<(ContentID, u64)> = vec![(c_id, pre_hash.1)];
                 let prev_data = app_data
@@ -1559,6 +1564,7 @@ async fn serve_app_data(
                     //     }
                     // }
                     SyncMessageType::AppendContent(d_type) => {
+                        eprintln!("AppendContent {:?}", d_type);
                         // TODO: potentially for AddContent & ChangeContent
                         // post requirements could be empty
                         // pre requirements can not be empty since we need
@@ -1585,7 +1591,7 @@ async fn serve_app_data(
                                     Data::empty(0)
                                 };
                                 let _res = app_data.append(content);
-                                // eprintln!("Content added: {:?}", res);
+                                eprintln!("Content added: {:?}", _res);
                                 // let hash = app_data.root_hash();
                                 // eprintln!("Sending updated hash: {}", hash);
                                 // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
@@ -2594,7 +2600,7 @@ async fn serve_app_data(
                                                 ),
                                             );
                                         } else {
-                                            // eprintln!("Create new Link 2");
+                                            eprintln!("Create new Link 2");
                                             let _ = to_app_mgr_send
                                                 .send(ToAppMgr::ContentAdded(
                                                     swarm_id,

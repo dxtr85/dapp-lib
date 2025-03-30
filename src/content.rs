@@ -34,6 +34,12 @@ impl DataType {
             DataType::Data(val) => *val,
         }
     }
+    pub fn is_link(&self) -> bool {
+        match self {
+            DataType::Link => true,
+            DataType::Data(_val) => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +50,18 @@ impl Description {
             return Err(());
         }
         Ok(Self(text))
+    }
+    pub fn text(&self) -> String {
+        self.0.clone()
+    }
+    pub fn as_bytes(&self) -> Vec<u8> {
+        let len = self.0.len();
+        let mut bytes = Vec::with_capacity(1 + len);
+        bytes.push(len as u8);
+        for b in self.0.bytes() {
+            bytes.push(b);
+        }
+        bytes
     }
 }
 #[derive(Debug, Clone)]
@@ -419,58 +437,81 @@ impl Content {
     pub fn from(d_type: DataType, data: Data) -> Result<Self, AppError> {
         let d_hash = data.get_hash();
         let data_empty = data.is_empty();
-        let bytes = data.bytes();
         // eprintln!("Content from bytes: {:?}", bytes);
-        let mut bytes_iter = bytes.into_iter();
         // let d_type = bytes_iter.next();
         // println!("First byte: {:?}", first_byte);
         match d_type {
             // None => Err(AppError::Smthg),
             DataType::Link => {
-                // first 8 bytes is GnomeId
-                let d_type = bytes_iter.next().unwrap();
-                let b1 = bytes_iter.next().unwrap();
-                let b2 = bytes_iter.next().unwrap();
-                let b3 = bytes_iter.next().unwrap();
-                let b4 = bytes_iter.next().unwrap();
-                let b5 = bytes_iter.next().unwrap();
-                let b6 = bytes_iter.next().unwrap();
-                let b7 = bytes_iter.next().unwrap();
-                let b8 = bytes_iter.next().unwrap();
-                let g_id = GnomeId(u64::from_be_bytes([b1, b2, b3, b4, b5, b6, b7, b8]));
-                // next 2 bytes is ContentID
-                let b1 = bytes_iter.next().unwrap();
-                let b2 = bytes_iter.next().unwrap();
-                let c_id = u16::from_be_bytes([b1, b2]);
-                let name_len = bytes_iter.next().unwrap();
-                eprintln!("Name len: {}", name_len);
-                let mut name_vec = Vec::with_capacity(name_len as usize);
-                for _i in 0..name_len {
-                    name_vec.push(bytes_iter.next().unwrap());
-                }
-                let swarm_name: String = String::from_utf8(name_vec).unwrap();
-                let swarm_name: SwarmName = SwarmName::new(g_id, swarm_name).unwrap();
-                let descr_len = bytes_iter.next().unwrap();
-                let mut descr_vec = Vec::with_capacity(descr_len as usize);
-                for _i in 0..descr_len {
-                    descr_vec.push(bytes_iter.next().unwrap());
-                }
-                let description: Description =
-                    Description::new(String::from_utf8(descr_vec).unwrap()).unwrap();
-                let data_len = bytes_iter.next().unwrap();
-                let mut data_vec = Vec::with_capacity(data_len as usize);
-                for _i in 0..data_len {
-                    data_vec.push(bytes_iter.next().unwrap());
-                }
+                data_to_link(data)
+                // let bytes = data.bytes();
+                // // TODO: first goes variable len SwarmName
+                // // and then CID
+                // let mut bytes_iter = bytes.into_iter();
+                // let mut name_len = bytes_iter.next().unwrap();
+                // let mut name_bytes = vec![name_len];
+                // name_len = if name_len < 128 {
+                //     name_len
+                // } else {
+                //     name_len - 128
+                // };
+                // for _i in 0..name_len {
+                //     name_bytes.push(bytes_iter.next().unwrap())
+                // }
+                // let s_name = SwarmName::from(&name_bytes);
+                // let tid1 = bytes_iter.next().unwrap();
+                // let tid2 = bytes_iter.next().unwrap();
+                // let c_id = ContentID::from_be_bytes([tid1, tid2]);
+                // if let Ok(n) = &s_name {
+                //     eprintln!("Link to swarm: {}", n);
+                // } else {
+                //     eprintln!("Failed to read SN from bytes: {:?}", s_name);
+                // }
+                // // let b1 = bytes_iter.next().unwrap();
+                // // let b2 = bytes_iter.next().unwrap();
+                // // let b3 = bytes_iter.next().unwrap();
+                // // let b4 = bytes_iter.next().unwrap();
+                // // let b5 = bytes_iter.next().unwrap();
+                // // let b6 = bytes_iter.next().unwrap();
+                // // let b7 = bytes_iter.next().unwrap();
+                // // let b8 = bytes_iter.next().unwrap();
+                // // let g_id = GnomeId(u64::from_be_bytes([b1, b2, b3, b4, b5, b6, b7, b8]));
+                // // // next 2 bytes is ContentID
+                // // let b1 = bytes_iter.next().unwrap();
+                // // let b2 = bytes_iter.next().unwrap();
+                // // let c_id = u16::from_be_bytes([b1, b2]);
+                // let tags_len = bytes_iter.next().unwrap();
+                // eprintln!("Tags len: {}", tags_len);
+                // let mut tag_vec = Vec::with_capacity(tags_len as usize + 1);
+                // tag_vec.push(tags_len);
+                // for _i in 0..tags_len {
+                //     tag_vec.push(bytes_iter.next().unwrap());
+                // }
+                // // let swarm_name: String = String::from_utf8(name_vec).unwrap();
+                // // let swarm_name: SwarmName = SwarmName::new(g_id, swarm_name).unwrap();
+                // // let descr_len = bytes_iter.next().unwrap();
+                // // let mut descr_vec = Vec::with_capacity(descr_len as usize);
+                // // for _i in 0..descr_len {
+                // //     descr_vec.push(bytes_iter.next().unwrap());
+                // // }
+                // let description: Description =
+                //     Description::new(String::from_utf8(bytes_iter.collect()).unwrap()).unwrap();
+                // // let data_len = bytes_iter.next().unwrap();
+                // // let mut data_vec = Vec::with_capacity(data_len as usize);
+                // // for _i in 0..data_len {
+                // //     data_vec.push(bytes_iter.next().unwrap());
+                // // }
+                // // TODO: we have to encode Link properly with Data and TI
 
-                let ti = TransformInfo::from(bytes_iter.collect());
-                Ok(Content::Link(
-                    swarm_name,
-                    c_id,
-                    description,
-                    Data::new(data_vec).unwrap(),
-                    ti,
-                ))
+                // // let ti = TransformInfo::from(bytes_iter.collect());
+                // Ok(Content::Link(
+                //     s_name.unwrap(),
+                //     c_id,
+                //     description,
+                //     Data::empty(0),
+                //     // Data::new(data_vec).unwrap(),
+                //     None,
+                // ))
             }
             // TODO: we can define instructions to create hollow Content
             // containing only hashes of either Data or non-data hashes
@@ -491,10 +532,32 @@ impl Content {
                     Ok(Content::Data(
                         DataType::from(other),
                         1,
-                        ContentTree::new(Data::new(bytes_iter.collect()).unwrap()),
+                        ContentTree::new(data),
                     ))
                 }
             }
+        }
+    }
+    pub fn tag_ids(&self) -> Vec<u8> {
+        match self {
+            Self::Link(_sn, _c, _descr, d_tags, _ti) => {
+                if d_tags.is_empty() {
+                    return vec![];
+                }
+                let mut t_bytes = d_tags.clone().bytes();
+                let _len = t_bytes.remove(0);
+                t_bytes
+            }
+            Self::Data(_d_type, _mem, _ct) => {
+                //TODO
+                vec![]
+            }
+        }
+    }
+    pub fn description(&self) -> String {
+        match self {
+            Self::Link(_sn, _c, descr, _tags, _ti) => descr.0.clone(),
+            Self::Data(d_type, _mem, _ct) => String::new(),
         }
     }
     pub fn data_type(&self) -> DataType {
@@ -535,7 +598,7 @@ impl Content {
                 //     }
                 // } else {
                 if data_id == 0 {
-                    eprintln!("Converting link to data, TI: {:?}", ti.is_some());
+                    eprintln!("Converting link to data, {} TI: {:?}", s_name, ti.is_some());
                     Ok(link_to_data(
                         s_name.clone(),
                         *c_id,
@@ -544,7 +607,10 @@ impl Content {
                         ti.clone(),
                     ))
                 } else {
-                    eprintln!("Link indexing error");
+                    eprintln!(
+                        "TODO: Link indexing error (idx {} > 0 not yet supported)",
+                        data_id
+                    );
                     Err(AppError::IndexingError)
                 }
                 // }
@@ -598,6 +664,26 @@ impl Content {
         match self {
             Self::Link(_s, _c, _descr, _data, _ti) => Err(AppError::DatatypeMismatch),
             Self::Data(_dt, _mem, tree) => tree.insert(d_id, data),
+        }
+    }
+    pub fn link_params(
+        &self,
+    ) -> Option<(
+        SwarmName,
+        ContentID,
+        Description,
+        Data,
+        Option<TransformInfo>,
+    )> {
+        match self {
+            Self::Link(s_name, c_id, descr, data, ti_opt) => Some((
+                s_name.clone(),
+                *c_id,
+                descr.clone(),
+                data.clone(),
+                ti_opt.clone(),
+            )),
+            _ => None,
         }
     }
     pub fn update_data(&mut self, data_id: u16, data: Data) -> Result<Data, AppError> {
@@ -672,20 +758,29 @@ impl Content {
     }
     pub fn hash(&self) -> u64 {
         match self {
-            Self::Link(s_name, c_id, _descr, _data, _ti) => {
-                let mut b_vec = vec![];
-                for byte in s_name.founder.bytes() {
-                    b_vec.push(byte);
-                }
-                for byte in s_name.name.bytes() {
-                    b_vec.push(byte);
-                }
-                for byte in c_id.to_be_bytes() {
-                    b_vec.push(byte);
-                }
-                let mut hasher = DefaultHasher::new();
-                b_vec.hash(&mut hasher);
-                hasher.finish()
+            Self::Link(s_name, c_id, description, data, ti) => {
+                let mut data = link_to_data(
+                    s_name.clone(),
+                    *c_id,
+                    description.clone(),
+                    data.clone(),
+                    ti.clone(),
+                );
+                eprintln!("data: {:?}, {}", data, data.get_hash());
+                data.hash()
+                // let mut b_vec = vec![];
+                // for byte in s_name.founder.bytes() {
+                //     b_vec.push(byte);
+                // }
+                // for byte in s_name.name.bytes() {
+                //     b_vec.push(byte);
+                // }
+                // for byte in c_id.to_be_bytes() {
+                //     b_vec.push(byte);
+                // }
+                // let mut hasher = DefaultHasher::new();
+                // b_vec.hash(&mut hasher);
+                // hasher.finish()
             }
             Self::Data(_type, _mem, tree) => tree.hash(),
         }
@@ -705,6 +800,7 @@ impl Content {
         let mut v = vec![];
         match self {
             Self::Link(_s_name, _c_id, _descr, _data, ti_opt) => {
+                v.push(self.hash());
                 if let Some(transform_info) = ti_opt {
                     for hash in &transform_info.data_hashes {
                         let mut bytes = hash.clone().bytes().into_iter();
@@ -720,8 +816,7 @@ impl Content {
                             v.push(hash);
                         }
                     }
-                } else {
-                    v.push(self.hash());
+                    // } else {
                 }
             }
             _other => {
@@ -764,51 +859,72 @@ impl Content {
 }
 
 pub fn data_to_link(data: Data) -> Result<Content, AppError> {
+    eprintln!("data_to_link: {:?}", data);
     let mut bytes_iter = data.bytes().into_iter();
     let len = bytes_iter.len();
     eprintln!("creating link from {} bytes", len);
-    bytes_iter.next().unwrap();
     if len < 11 {
         return Err(AppError::Smthg);
     }
-    let first_eight = [
-        bytes_iter.next().unwrap(),
-        bytes_iter.next().unwrap(),
-        bytes_iter.next().unwrap(),
-        bytes_iter.next().unwrap(),
-        bytes_iter.next().unwrap(),
-        bytes_iter.next().unwrap(),
-        bytes_iter.next().unwrap(),
-        bytes_iter.next().unwrap(),
-    ];
-    let next_two = [bytes_iter.next().unwrap(), bytes_iter.next().unwrap()];
-
-    let name_len = bytes_iter.next().unwrap();
-    eprintln!("S name len: {}", name_len);
-    let mut name_vec = Vec::with_capacity(name_len as usize);
-    for _i in 0..name_len {
-        name_vec.push(bytes_iter.next().unwrap());
+    let d_len = bytes_iter.next().unwrap();
+    let mut d_bytes = Vec::with_capacity(d_len as usize + 1);
+    d_bytes.push(d_len);
+    for _i in 0..d_len {
+        d_bytes.push(bytes_iter.next().unwrap());
     }
+    let data = Data::new(d_bytes).unwrap();
+    let olds_len = bytes_iter.next().unwrap();
+    let s_len = if olds_len < 128 {
+        olds_len
+    } else {
+        olds_len - 128
+    };
+    let mut s_bytes = Vec::with_capacity(s_len as usize + 1);
+    s_bytes.push(olds_len);
+    for _i in 0..s_len {
+        s_bytes.push(bytes_iter.next().unwrap());
+    }
+    let s_name = SwarmName::from(&s_bytes).unwrap();
+    let next_two = [bytes_iter.next().unwrap(), bytes_iter.next().unwrap()];
+    let c_id = u16::from_be_bytes(next_two);
+
     let descr_len = bytes_iter.next().unwrap();
     eprintln!("Descr len: {}", descr_len);
     let mut descr_vec = Vec::with_capacity(descr_len as usize);
     for _i in 0..descr_len {
         descr_vec.push(bytes_iter.next().unwrap());
     }
-    let data_len = bytes_iter.next().unwrap();
-    let mut data_vec = Vec::with_capacity(data_len as usize);
-    for _i in 0..data_len {
-        data_vec.push(bytes_iter.next().unwrap());
-    }
-    let g_id = GnomeId::from(first_eight);
-    let s_name = String::from_utf8(name_vec).unwrap();
-    let swarm_name = SwarmName::new(g_id, s_name).unwrap();
+    // data_len byte
+    // data bytes
+    // swarm_name len
+    // swarm_name
+    // c_id
+    // description len
+    // description
+    // TransformInfo len
+    // TransformInfo (if above > 0)
+    //
+    let ti_len = bytes_iter.next().unwrap();
+    let ti = if ti_len == 0 {
+        None
+    } else {
+        let mut ti_bytes = Vec::with_capacity(ti_len as usize);
+        for _i in 0..ti_len {
+            ti_bytes.push(bytes_iter.next().unwrap());
+        }
+        TransformInfo::from(ti_bytes)
+    };
+    // let mut data_vec = Vec::with_capacity(data_len as usize);
+    // for _i in 0..data_len {
+    //     data_vec.push(bytes_iter.next().unwrap());
+    // }
+    // // let g_id = GnomeId::from(first_eight);
+    // // let s_name = String::from_utf8(name_vec).unwrap();
+    // let swarm_name = SwarmName::new(g_id, s_name).unwrap();
     let description = Description::new(String::from_utf8(descr_vec).unwrap()).unwrap();
-    let data = Data::new(data_vec).unwrap();
-    let c_id = u16::from_be_bytes(next_two);
+    eprintln!("Link {} {}, data: {:?}", s_name, c_id, data);
 
-    let ti = TransformInfo::from(bytes_iter.collect());
-    Ok(Content::Link(swarm_name, c_id, description, data, ti))
+    Ok(Content::Link(s_name, c_id, description, data, ti))
 }
 
 // TODO: make sure that we do not exceed 1024 bytes
@@ -819,33 +935,45 @@ fn link_to_data(
     data: Data,
     ti: Option<TransformInfo>,
 ) -> Data {
-    let mut v = vec![DataType::Link.byte()];
-    for b in s_name.founder.bytes() {
-        v.push(b);
-    }
+    // data_len byte
+    let mut v = data.bytes();
+    // data bytes
+    // v.append(&mut data.bytes());
+    // v.push(data_bytes.len() as u8);
+    // for b in data_bytes {
+    //     v.push(b);
+    // }
+    eprintln!("S name: {},", s_name.name,);
+    // swarm_name len
+    // swarm_name
+    v.append(&mut s_name.as_bytes());
+    // eprintln!(" len: {}", s_bytes.len());
+    // v.push(s_bytes.len() as u8);// covered by s_name.as_bytes
+    // eprintln!("link to data data: {:?}", data);
+    // for b in s_bytes {
+    //     v.push(b);
+    // }
+    //
+    // c_id
     for b in c_id.to_be_bytes() {
         v.push(b);
     }
-    eprintln!("S name: {},", s_name.name,);
-    let s_bytes = s_name.name.into_bytes();
-    eprintln!(" len: {}", s_bytes.len());
-    v.push(s_bytes.len() as u8);
-    for b in s_bytes {
-        v.push(b);
-    }
-    let d_bytes = description.0.into_bytes();
-    eprintln!("descr len: {}", d_bytes.len());
-    v.push(d_bytes.len() as u8);
-    for b in d_bytes {
-        v.push(b);
-    }
-    let data_bytes = data.bytes();
-    v.push(data_bytes.len() as u8);
-    for b in data_bytes {
-        v.push(b);
-    }
+    // description len
+    // description
+    v.append(&mut description.as_bytes());
+    // eprintln!("descr len: {}", d_bytes.len());
+    // v.push(d_bytes.len() as u8);
+    // for b in d_bytes {
+    //     v.push(b);
+    // }
+    //
+    // TransformInfo len
+    // TransformInfo (if above > 0)
+    //
     if let Some(ti) = ti {
         v.append(&mut ti.bytes());
+    } else {
+        v.push(0);
     }
     eprintln!("link_to_data len: {}\n{:?}", v.len(), v);
     Data::new(v).unwrap()

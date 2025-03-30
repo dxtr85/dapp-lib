@@ -7,7 +7,7 @@ use async_std::io::prelude::SeekExt;
 use async_std::io::{BufReader, BufWriter, ReadExt, WriteExt};
 use gnome::prelude::{GnomeId, SwarmName};
 
-use crate::content::{Content, ContentID, ContentTree, DataType, Description};
+use crate::content::{data_to_link, Content, ContentID, ContentTree, DataType, Description};
 use crate::{ApplicationData, Data};
 
 // TODO: We need to define different storage policies given swarm can have:
@@ -81,21 +81,24 @@ pub async fn read_datastore_from_disk(
     for i in 0..=highest_inserted_id {
         if let Some((dtype, hash)) = temp_store.remove(&i) {
             eprintln!("Disk read CID-{} with hash: {}", i, hash);
-            let content = if dtype == DataType::Link {
-                Content::Link(
-                    SwarmName {
-                        founder: GnomeId::any(),
-                        name: String::new(),
-                    },
-                    0,
-                    Description::new(String::new()).unwrap(),
-                    Data::empty(hash),
-                    None,
-                )
-            } else {
-                let ctree = ContentTree::empty(hash);
-                Content::Data(dtype, 0, ctree)
-            };
+            let content =
+            // = if dtype == DataType::Link {
+            //     Content::Link(
+            //         SwarmName {
+            //             founder: GnomeId::any(),
+            //             name: String::new(),
+            //         },
+            //         0,
+            //         Description::new(String::new()).unwrap(),
+            //         Data::empty(hash),
+            //         None,
+            //     )
+            // } else {
+            // 
+            // We do not distinguish between Link and Data at this point
+                // let ctree = ContentTree::empty(hash);
+                Content::Data(dtype, 0, ContentTree::empty(hash));
+            // };
             // eprintln!("RH: {}", app_data.root_hash());
             if let Some(next_cid) = app_data.next_c_id() {
                 if next_cid == i {
@@ -441,7 +444,13 @@ pub async fn load_content_from_disk(
                 }
             }
             // eprintln!("Loaded content from disk: {:?} {}", s_storage, cid);
-            Some(Content::Data(dtype, mem_size, c_tree))
+            if dtype.is_link() {
+                //TODO: convert also remaining
+                let link_data = c_tree.read(0).unwrap();
+                Some(data_to_link(link_data).unwrap())
+            } else {
+                Some(Content::Data(dtype, mem_size, c_tree))
+            }
         } else {
             eprintln!("Content from hdr file hash {} mismatch {}", dhash, hash,);
             None
@@ -461,7 +470,7 @@ async fn load_content_from_header_file(
         eprintln!("File {:?} does not exist!", file_path);
         return None;
     }
-    // eprintln!("Reading {:?} file", file_path);
+    eprintln!("Reading {:?} file", file_path);
     // hdr file format:
     // PID(2B)    PageHash(8B)    Offset(4B)    Size(2B)
     let mut buffer: [u8; 16] = [0; 16];
@@ -486,7 +495,8 @@ async fn load_content_from_header_file(
     // eprintln!("Read {} entries", temp_storage.len());
     if let Some((hash, _offset, _size)) = temp_storage.get(&0) {
         // eprintln!("Has root entry!");
-        let mut content = Content::from(dtype, Data::empty(*hash)).unwrap();
+        // let mut content = Content::from(dtype, Data::empty(*hash)).unwrap();
+        let mut content = Content::Data(dtype, 0, ContentTree::Empty(*hash));
         let mut page_id = 1;
         while let Some((hash, _offset, _size)) = temp_storage.get(&page_id) {
             let _ = content.push_data(Data::empty(*hash));
@@ -500,8 +510,6 @@ async fn load_content_from_header_file(
 }
 
 pub async fn write_datastore_to_disk(file_path: PathBuf, app_data: &ApplicationData) {
-    //TODO: first read file contents and only update those records that have changed
-    // or are not present
     let mut temp_store = HashMap::new();
     let mut root_hash = 0;
     let _ = parse_datastore_file(file_path.clone(), &mut temp_store, &mut root_hash).await;

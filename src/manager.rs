@@ -10,7 +10,7 @@ pub struct ApplicationManager {
     pub gnome_id: GnomeId,
     pub app_data_store: HashMap<SwarmID, Sender<ToAppData>>,
     pub active_app_data: (SwarmID, Sender<ToAppData>),
-    gnome_to_swarm: HashMap<GnomeId, (SwarmID, bool)>,
+    name_to_id: HashMap<SwarmName, (SwarmID, bool)>,
 }
 
 impl ApplicationManager {
@@ -20,32 +20,35 @@ impl ApplicationManager {
             gnome_id,
             app_data_store: HashMap::new(),
             active_app_data: (SwarmID(0), active_app_data),
-            gnome_to_swarm: HashMap::new(),
+            name_to_id: HashMap::new(),
         }
     }
-    pub fn update_app_data_founder(&mut self, s_id: SwarmID, f_id: GnomeId) {
-        self.gnome_to_swarm.insert(f_id, (s_id, false));
-        if let Some((swarm_id, synced)) = self.gnome_to_swarm.remove(&GnomeId::any()) {
+    pub fn update_app_data_founder(&mut self, s_id: SwarmID, s_name: SwarmName) {
+        self.name_to_id.insert(s_name, (s_id, false));
+        let empty = SwarmName {
+            founder: GnomeId::any(),
+            name: "/".to_string(),
+        };
+        if let Some((swarm_id, synced)) = self.name_to_id.remove(&empty) {
             if swarm_id != s_id {
-                self.gnome_to_swarm
-                    .insert(GnomeId::any(), (swarm_id, synced));
+                self.name_to_id.insert(empty, (swarm_id, synced));
             } else {
-                // eprintln!("Removed generic gnome to swarm mapping from AppMgr");
+                eprintln!("Removed generic gnome to swarm mapping from AppMgr");
             }
         }
     }
-    pub fn set_active(&mut self, g_id: &GnomeId) -> Result<SwarmID, ()> {
+    pub fn set_active(&mut self, s_name: &SwarmName) -> Result<SwarmID, ()> {
         eprintln!(
             "Known gnomes: {:?}, searching for: {:?}",
-            self.gnome_to_swarm.keys(),
-            g_id
+            self.name_to_id.keys(),
+            s_name
         );
         // for key in self.gnome_to_swarm.keys() {
         //     if let Some(value) = self.gnome_to_swarm.get(&key) {
         //         eprintln!("K: {:?} - V: {:?}", key, value);
         //     }
         // }
-        if let Some((s_id, _synced)) = self.gnome_to_swarm.get(g_id) {
+        if let Some((s_id, _synced)) = self.name_to_id.get(s_name) {
             if let Some(sender) = self.app_data_store.get(s_id) {
                 self.active_app_data = (*s_id, sender.clone());
                 eprintln!("Swarm {} is now active", s_id);
@@ -58,7 +61,7 @@ impl ApplicationManager {
         }
     }
     pub fn set_synced(&mut self, s_id: SwarmID) {
-        for val in self.gnome_to_swarm.values_mut() {
+        for val in self.name_to_id.values_mut() {
             if val.0 == s_id {
                 val.1 = true;
                 break;
@@ -69,27 +72,27 @@ impl ApplicationManager {
         if self.app_data_store.is_empty() {
             self.active_app_data = (s_id, sender.clone());
         }
-        self.gnome_to_swarm.insert(s_name.founder, (s_id, false));
+        self.name_to_id.insert(s_name, (s_id, false));
         self.app_data_store.insert(s_id, sender);
     }
-    pub fn get_mapping(&self) -> HashMap<GnomeId, SwarmID> {
+    pub fn get_mapping(&self) -> HashMap<SwarmName, SwarmID> {
         let mut mapping = HashMap::new();
-        for (g_id, value) in self.gnome_to_swarm.iter() {
+        for (s_name, value) in self.name_to_id.iter() {
             if value.1 {
-                mapping.insert(*g_id, value.0);
+                mapping.insert(s_name.clone(), value.0);
             }
         }
         mapping
     }
     pub fn get_swarm_founder(&self, swarm_id: &SwarmID) -> Option<GnomeId> {
-        for (f_id, (s_id, _synced)) in self.gnome_to_swarm.iter() {
+        for (s_name, (s_id, _synced)) in self.name_to_id.iter() {
             if swarm_id == s_id {
-                return Some(*f_id);
+                return Some(s_name.founder);
             }
         }
         None
     }
-    pub fn remove_gnome_mapping(&mut self, g_id: &GnomeId) -> Option<(SwarmID, bool)> {
-        self.gnome_to_swarm.remove(g_id)
+    pub fn remove_name_mapping(&mut self, s_name: &SwarmName) -> Option<(SwarmID, bool)> {
+        self.name_to_id.remove(s_name)
     }
 }
