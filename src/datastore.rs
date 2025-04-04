@@ -138,7 +138,7 @@ impl Datastore {
                 Ok(hash)
             }
             Self::Hashed(mut substore) => {
-                // println!("Append to Hashed");
+                // eprintln!("Append to Hashed");
                 let result = substore.append(content);
                 *self = Datastore::Hashed(substore);
                 result
@@ -538,10 +538,10 @@ impl Substore {
     pub fn append(&mut self, content: Content) -> Result<u64, AppError> {
         // println!("Substore count: {}", self.data_count);
         let mem_used = 1 + content.used_memory_slots() + (content.len() as usize >> 7);
-        eprintln!(
-            "Substore append content with {} pages into memory",
-            mem_used
-        );
+        // eprintln!(
+        //     "Substore append content with {} pages into memory",
+        //     mem_used
+        // );
         if self.content_count < u16::MAX {
             let result = self.right.append(content);
             if let Ok(_h) = result {

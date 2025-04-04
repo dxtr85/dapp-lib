@@ -455,7 +455,7 @@ async fn serve_app_manager(
                             if !founder.is_any() && founder != my_name.founder {
                                 eprintln!("Starting a new swarm, where I {} am Founder…", my_name);
                                 let _ = to_gnome_mgr
-                                    .send(ToGnomeManager::JoinSwarm(my_name.clone()))
+                                    .send(ToGnomeManager::JoinSwarm(my_name.clone(), None))
                                     .await;
                                 own_swarm_started = true;
                             }
@@ -508,7 +508,11 @@ async fn serve_app_manager(
                             // }
                             let _ = to_user.send(ToApp::MyPublicIPs(ip_list)).await;
                         }
-                        FromGnomeManager::NewSwarmAvailable(swarm_name, gnome_id, swarm_exists) => {
+                        FromGnomeManager::NewSwarmAvailable(
+                            swarm_name,
+                            (swarm_id, gnome_id),
+                            swarm_exists,
+                        ) => {
                             // We have to go through dapp-lib and can not directly join/extend
                             // from gnome manager since dapp-lib can decide it has no resources
                             // for starting a new swarm.
@@ -522,12 +526,14 @@ async fn serve_app_manager(
                             if swarm_exists {
                                 eprintln!("Extending {}", swarm_name);
                                 let _res = to_gnome_mgr
-                                    .send(ToGnomeManager::ExtendSwarm(swarm_name, gnome_id))
+                                    .send(ToGnomeManager::ExtendSwarm(
+                                        swarm_name, swarm_id, gnome_id,
+                                    ))
                                     .await;
                             } else {
                                 eprintln!("NewSwarm available, joining: {}", swarm_name);
                                 let _res = to_gnome_mgr
-                                    .send(ToGnomeManager::JoinSwarm(swarm_name))
+                                    .send(ToGnomeManager::JoinSwarm(swarm_name, Some(gnome_id)))
                                     .await;
                             }
                             // eprintln!("Join sent: {:?}", _res);
@@ -582,7 +588,7 @@ async fn serve_app_manager(
                                         //TODO: we need to reconnect
                                         eprintln!("Reconnecting with swarm {}", s_name);
                                         let _ = to_gnome_mgr
-                                            .send(ToGnomeManager::JoinSwarm(s_name.clone()))
+                                            .send(ToGnomeManager::JoinSwarm(s_name.clone(), None))
                                             .await;
                                         //TODO: we need to inform user about loosing active swarm
                                         // temporary we send Disconnected
@@ -592,7 +598,7 @@ async fn serve_app_manager(
                                     } else {
                                         eprintln!("Reconnecting with swarm {}", s_name);
                                         let _ = to_gnome_mgr
-                                            .send(ToGnomeManager::JoinSwarm(s_name.clone()))
+                                            .send(ToGnomeManager::JoinSwarm(s_name.clone(), None))
                                             .await;
                                         let _ = to_user
                                             .send(ToApp::Disconnected(true, *s_id, s_name.clone()))
@@ -1314,6 +1320,7 @@ async fn serve_app_data(
                 // }
             }
             ToAppData::ListNeighbors => {
+                eprintln!("Requesting neighbors from gnome");
                 let _ = to_gnome_sender.send(ToGnome::ListNeighbors);
             }
             ToAppData::TransformLinkRequest(_sync_data) => {
@@ -2201,7 +2208,7 @@ async fn serve_app_data(
                                             }
                                             let (data_type, len) =
                                                 app_data.get_type_and_len(c_id).unwrap();
-                                            let total = len - 1;
+                                            let total = if len > 0 { len - 1 } else { 0 };
 
                                             for (part_no, data) in data_vec.into_iter().enumerate()
                                             {
