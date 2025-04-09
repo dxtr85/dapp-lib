@@ -197,7 +197,7 @@ pub async fn initialize(
     // TODO: neighbors contain also our own public IP, get rid of it!
     eprintln!("Storage neighbors: {:?}", neighbors);
     let config = Configuration::new(config_dir.clone());
-    if let Some(ns) = config.neighbors {
+    if let Some(ns) = config.neighbors.clone() {
         for n in ns {
             // if !neighbors.contains(&n) {
             eprintln!("Pushing config.neighbor");
@@ -212,7 +212,7 @@ pub async fn initialize(
     // let (gmgr_send, gmgr_recv, my_id) = init(config_dir, config.neighbors);
     let (gmgr_send, gmgr_recv, my_id) = init(config_dir, Some(neighbors)).await;
     spawn(serve_app_manager(
-        config.storage.clone(),
+        config,
         gmgr_send,
         gmgr_recv,
         to_user_send,
@@ -223,7 +223,9 @@ pub async fn initialize(
 }
 
 async fn serve_app_manager(
-    storage: PathBuf,
+    // storage: PathBuf,
+    // max_connected_swarms: u8,
+    config: Configuration,
     to_gnome_mgr: ASender<ToGnomeManager>,
     from_gnome_mgr: AReceiver<FromGnomeManager>,
     to_user: ASender<ToApp>,
@@ -238,7 +240,7 @@ async fn serve_app_manager(
     // by max swarms. Later this can be upgraded, but we need to have any mechanism in place.
     // We provide that number to every instance of app_data_service we spawn.
     // app_data_service can not exceed memory usage above provided threshold.
-    eprintln!("Storage root, gmgr: {:?}", storage);
+    eprintln!("Storage root, gmgr: {:?}", config.storage);
     // let message = from_gnome_mgr
     //     .recv()
     //     .await
@@ -531,10 +533,94 @@ async fn serve_app_manager(
                                     ))
                                     .await;
                             } else {
-                                eprintln!("NewSwarm available, joining: {}", swarm_name);
-                                let _res = to_gnome_mgr
-                                    .send(ToGnomeManager::JoinSwarm(swarm_name, Some(gnome_id)))
-                                    .await;
+                                if app_mgr.number_of_connected_swarms()
+                                    < config.max_connected_swarms
+                                {
+                                    eprintln!("NewSwarm available, joining: {}", swarm_name);
+                                    let _res = to_gnome_mgr
+                                        .send(ToGnomeManager::JoinSwarm(swarm_name, Some(gnome_id)))
+                                        .await;
+                                } else {
+                                    // TODO: implement Swarm rotation mechanism
+                                    // We have at hand number of existing Swarms.
+                                    // They can give us access to some new Swarms through
+                                    // their Neighbors.
+                                    // Once in a while we can ask existing Swarm for it's
+                                    // neigboring Swarms.
+                                    // We compare that list with our current Swarms, and
+                                    // we get a list of new Swarms instantly available.
+                                    // Now for each of those new swarms we need to have
+                                    // a Swarm slot available so that we are never connected
+                                    // to more than config.max_connected_swarms.
+                                    // So we have to drop some existing Swarms.
+                                    // But we can not drop a Source Swarm (we can drop our own
+                                    // Swarm, but maybe we don't want to).
+                                    // We also can not drop Active Swarm (the one User is
+                                    // interacting with).
+                                    // So we create an UntouchableSwarm list with SwarmIDs
+                                    // we want to keep running.
+                                    //
+                                    // Every running Swarm should keep a State indicating
+                                    // whether or not underlying Gnome says it is safe to
+                                    // disconnect and also upper Application layer has to
+                                    // give consent.
+                                    // So either Gnome or Application send us a Message
+                                    // indicating a SwarmID that is safe to let go.
+                                    // Once we receive such a message, we update it's state,
+                                    // and check if all conditions to drop a Swarm are met.
+                                    // This conditions are:
+                                    // - a non-empty list of awaiting swarms
+                                    // - both Gnome and App give green light
+                                    // - this SwarmID is not on Untouchable list
+                                    //
+                                    // If all conditions are met we drop this Swarm and join
+                                    // the next one from the list of available Swarms.
+                                    // We repeat above until some condition is not met.
+                                    //
+                                    // If we have an empty list, we check if inquiry_cooldown
+                                    // flag is set. If it is true we are done.
+                                    // Otherwise we send an inquiry to next
+                                    // Gnome about it's neighboring Swarms.
+                                    // Once we receive a reply we filter that list and see if
+                                    // he has a new Swarm available. If he does we scan
+                                    // existing SwarmID to find one that has two green lights
+                                    // from both Gnome and Application and is not Untouchable.
+                                    // We drop existing and join a new.
+                                    // We repeat above until some condition is not met.
+                                    //
+                                    // If the reply from Gnome had no new Swarms, we query
+                                    // next one, until we have queried every existing Swarm.
+                                    // Once every existing Gnome was queried we spawn a Timer
+                                    // for inquiry_cooldown,
+                                    // so that we do not overwhelm the CPU.
+                                    // We also set a flag to indicate a timer is running,
+                                    // so that when we receive a green light message and
+                                    // there is no new swarms available and flag is set,
+                                    // we do nothing.
+                                    // Once the time is up we check if there are any
+                                    // Swarms with double green lights and if so we
+                                    // start querying round. If there are no Swarms with
+                                    // double green lights we do nothing.
+                                    //
+                                    // We also have to cover for case when user wants to
+                                    // follow a link and targeted Swarm is not connected.
+                                    // But in order for this to work we need to know if
+                                    // there is a Gnome that has targeted Swarm as his
+                                    // neighboring Swarm.
+                                    // If yes we search for doubly greenlighted Swarm,
+                                    // if none found then for single greenlighted from App,
+                                    // if none then single greenlighted from Gnome, if none
+                                    // then any and tell it to disconnect. Then we can connect
+                                    // to targeted Swarm.
+                                    // If we have no gnome that has targeted Swarm as his
+                                    // neighboring Swarm we have to notify user about it.
+                                    // Maybe in future we could provide User with
+                                    // unsynced Content from local storage, but that is
+                                    // not yet implemented.
+                                    //
+                                    //
+                                    eprintln!("NewSwarm {} available, but we have no more swarm slots free", swarm_name);
+                                }
                             }
                             // eprintln!("Join sent: {:?}", _res);
                         }
@@ -552,7 +638,7 @@ async fn serve_app_manager(
                             // eprintln!("spawning new serve_app_data");
                             let app_data = ApplicationData::new(AppType::Catalog);
                             spawn(serve_app_data(
-                                storage.clone(),
+                                config.storage.clone(),
                                 max_pages_in_memory,
                                 s_id,
                                 app_data,
@@ -635,7 +721,7 @@ async fn serve_gnome_mgr_requests(
 ) {
     //TODO: convert msgs from GMgr to ToAppMgr::FromGMgr
     while let Ok(request) = from_gnome_mgr.recv().await {
-        to_app_mgr.send(ToAppMgr::FromGMgr(request)).await;
+        let _ = to_app_mgr.send(ToAppMgr::FromGMgr(request)).await;
     }
 }
 async fn serve_app_data(

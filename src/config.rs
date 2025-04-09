@@ -10,23 +10,63 @@ pub struct Configuration {
     pub work_dir: PathBuf,
     pub storage: PathBuf,
     pub neighbors: Option<Vec<NetworkSettings>>,
+    pub max_connected_swarms: u8,
 }
 
 impl Configuration {
     pub fn new(dir: PathBuf) -> Configuration {
+        let conf_path = dir.join("dapp-lib.conf");
         let n_path = dir.join("neigh.conf");
         let neighbors = if n_path.exists() {
             Some(parse_neighbors(&n_path))
         } else {
             None
         };
+        let mut max_connected_swarms = 8;
+        if !conf_path.exists() {
+            return Configuration {
+                work_dir: dir.clone(),
+                storage: dir.join("storage"),
+                neighbors,
+                max_connected_swarms,
+            };
+        }
+        let lines_iter = read_lines(conf_path).unwrap().into_iter();
+        for line in lines_iter {
+            let ls = line.unwrap().to_string();
+            if ls.starts_with('#') || ls.is_empty() {
+                eprintln!("Ignoring Line: {}", ls);
+            } else {
+                eprintln!("Parsing Line: {}", ls);
+                let mut split = ls.split_whitespace();
+                let line_header = split.next().unwrap();
+                match line_header {
+                    "MAX_CONNECTED_SWARMS" => {
+                        if let Some(number_str) = split.next() {
+                            if let Ok(number) = u8::from_str_radix(number_str, 10) {
+                                eprintln!(
+                                    "Updating MAX_CONNECTED_SWARMS from {} to {}",
+                                    max_connected_swarms, number
+                                );
+                                max_connected_swarms = number;
+                            }
+                        }
+                    }
+                    other => {
+                        eprintln!("Unrecognized config line: {}", other);
+                    }
+                }
+            }
+        }
         Configuration {
             work_dir: dir.clone(),
             storage: dir.join("storage"),
             neighbors,
+            max_connected_swarms,
         }
     }
 }
+
 fn parse_neighbors(file: &Path) -> Vec<NetworkSettings> {
     let mut parsed_neighbors = vec![];
     let lines_iter = read_lines(file).unwrap().into_iter();

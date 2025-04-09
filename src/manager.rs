@@ -37,6 +37,9 @@ impl ApplicationManager {
             }
         }
     }
+    pub fn number_of_connected_swarms(&self) -> u8 {
+        self.name_to_id.len() as u8
+    }
     pub fn set_active(&mut self, s_name: &SwarmName) -> Result<SwarmID, ()> {
         eprintln!(
             "Known gnomes: {:?}, searching for: {:?}",
