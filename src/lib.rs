@@ -139,6 +139,7 @@ pub enum ToAppMgr {
 pub enum TimeoutType {
     Cooldown,
     NewSwarmsAvailable,
+    PeriodicalCheckForNewSwarms,
 }
 
 #[derive(Debug)]
@@ -342,6 +343,11 @@ async fn serve_app_manager(
     let mut quit_application = false;
     let mut swarm_swap = SwarmSwap::new();
     spawn(serve_gnome_mgr_requests(from_gnome_mgr, to_app_mgr.clone()));
+    spawn(start_a_timer(
+        to_app_mgr.clone(),
+        TimeoutType::PeriodicalCheckForNewSwarms,
+        Duration::from_secs(60),
+    ));
     'outer: loop {
         // sleep(sleep_time).await;
 
@@ -600,6 +606,22 @@ async fn serve_app_manager(
                                 .await;
                         }
                     }
+                    TimeoutType::PeriodicalCheckForNewSwarms => {
+                        spawn(start_a_timer(
+                            to_app_mgr.clone(),
+                            TimeoutType::PeriodicalCheckForNewSwarms,
+                            Duration::from_secs(60),
+                        ));
+                        if !swarm_swap.is_cooldown() {
+                            eprintln!("Periodical Cooldown start");
+                            spawn(start_a_timer(
+                                to_app_mgr.clone(),
+                                TimeoutType::Cooldown,
+                                Duration::from_secs(5),
+                            ));
+                            swarm_swap.set_cooldown(true);
+                        }
+                    }
                 },
                 ToAppMgr::FromGMgr(message) => {
                     //TODO: serve this
@@ -649,6 +671,9 @@ async fn serve_app_manager(
                             let _ = to_user.send(ToApp::MyPublicIPs(ip_list)).await;
                         }
                         FromGnomeManager::NewSwarmsAvailable(s_id, neighboring_swarms) => {
+                            if neighboring_swarms.is_empty() {
+                                continue;
+                            }
                             if swarm_swap.is_leaving_a_swarm.is_some() {
                                 eprintln!(
                                     "NewSwarmsAvailable, but we are in process of leaving a swarm"
@@ -899,10 +924,10 @@ async fn serve_app_manager(
                             // TODO: Check SwarmSwap if there are other NewSwarms waiting to join
                             app_mgr.update_app_data_founder(s_id, s_name.clone());
                             swarm_swap.not_a_candidate(&s_name);
-                            if swarm_swap.has_candidates() {
-                                eprintln!("SwapNewSwarm 4");
-                                let _ = to_app_mgr.send(ToAppMgr::SwapNewSwarm(None)).await;
-                            }
+                            // if swarm_swap.has_candidates() {
+                            //     eprintln!("SwapNewSwarm 4");
+                            //     let _ = to_app_mgr.send(ToAppMgr::SwapNewSwarm(None)).await;
+                            // }
                             eprintln!("{} joined {}", s_id, s_name);
                             // TODO: we need to identify to which application
                             //       given swarm should be assigned
@@ -1022,6 +1047,12 @@ async fn serve_app_manager(
                         // If we have a new SwarmName we proceed.
                         // we do not have to LeaveSwarm if we have SwarmSlots available
                         if app_mgr.number_of_connected_swarms() >= config.max_connected_swarms {
+                            if swarm_swap.is_leaving_a_swarm.is_some()
+                                || swarm_swap.leave_when_joined.is_some()
+                            {
+                                eprintln!("Another swapping procedure running");
+                                continue;
+                            }
                             eprintln!(
                                 "We've reached max swarms limit: {}",
                                 config.max_connected_swarms
@@ -1114,6 +1145,7 @@ async fn serve_app_manager(
                                 .await;
                         } else {
                             if let Some((_name, leave_id)) = swarm_swap.leave_when_joined.take() {
+                                swarm_swap.is_leaving_a_swarm = Some(leave_id);
                                 let _ = to_gnome_mgr
                                     .send(ToGnomeManager::LeaveSwarm(leave_id))
                                     .await;
@@ -1124,7 +1156,7 @@ async fn serve_app_manager(
                         // If there is no new SwarmName we check inquiry_cooldown
                         // flag.
                         if !swarm_swap.is_cooldown()
-                            && app_mgr.number_of_connected_swarms() >= config.max_connected_swarms
+                        // && app_mgr.number_of_connected_swarms() >= config.max_connected_swarms
                         {
                             eprintln!("Maybe I'll ask for some swarms to swap in");
                             // If it is false we query existing swarms, excluding
