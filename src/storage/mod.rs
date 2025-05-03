@@ -114,6 +114,7 @@ pub async fn read_datastore_from_disk(
             break;
         }
     }
+    app_data.set_disk_hash();
     // eprintln!(
     //     "Loaded from file: {}, expected: {}",
     //     app_data.root_hash(),
@@ -130,13 +131,20 @@ pub async fn store_data_on_disk(
     if matches!(policy, StoragePolicy::Discard) {
         return;
     }
+    if app_data.disk_root_hash == app_data.root_hash() {
+        eprintln!("Not writing to disk: all synced");
+        return;
+    }
     let dsync_store = s_storage.join("datastore.sync");
     let last_defined_c_id = if let Some(next_c_id) = app_data.next_c_id() {
         next_c_id - 1
     } else {
         u16::MAX
     };
-    write_datastore_to_disk(dsync_store, &app_data).await;
+    let content_changed = write_datastore_to_disk(dsync_store, &app_data).await;
+    if !content_changed {
+        return;
+    }
     store_content_on_disk(0, &s_storage, &app_data, 64).await;
     if matches!(policy, StoragePolicy::Datastore) {
         // Do nothing more
@@ -509,15 +517,17 @@ async fn load_content_from_header_file(
     }
 }
 
-pub async fn write_datastore_to_disk(file_path: PathBuf, app_data: &ApplicationData) {
+pub async fn write_datastore_to_disk(file_path: PathBuf, app_data: &ApplicationData) -> bool {
+    let mut content_changed = false;
     let mut temp_store = HashMap::new();
     let mut root_hash = 0;
     let _ = parse_datastore_file(file_path.clone(), &mut temp_store, &mut root_hash).await;
     let root_hash_in_memory = app_data.root_hash();
     if root_hash_in_memory == root_hash {
-        // eprintln!("datastore.sync is up to date - {}", root_hash);
-        return;
+        eprintln!("datastore.sync is up to date - {}", root_hash);
+        return content_changed;
     }
+    content_changed = true;
     eprintln!("Writing Datastore to {:?}…", file_path);
     let file = OpenOptions::new()
         .write(true)
@@ -560,5 +570,6 @@ pub async fn write_datastore_to_disk(file_path: PathBuf, app_data: &ApplicationD
     eprintln!("Root hash: {}", root_hash);
 
     let _ = file.flush().await;
+    content_changed
     // Maybe we provide this function what ordered changes should be appended?
 }

@@ -127,8 +127,8 @@ pub enum ToAppMgr {
     ContentChanged(SwarmID, ContentID, DataType, Option<Data>),
     TransformLinkRequest(Box<SyncData>),
     ProvideGnomeToSwarmMapping,
-    SwarmSynced(SwarmID),
-    SwapNewSwarm(Option<SwarmID>),
+    SwarmSynced(SwarmID),                       //TODO: process inside AppMgr
+    SwapNewSwarm(Option<(SwarmName, SwarmID)>), //TODO: process inside AppMgr
     FromGMgr(FromGnomeManager),
     QueryForNeighboringSwarms(Option<SwarmID>), // SwarmID should not be queried
     TimeoutOver(TimeoutType),
@@ -201,9 +201,9 @@ struct SwarmSwap {
     inquiry_cooldown: bool,
     query_list: Vec<SwarmID>,
     candidates: VecDeque<(SwarmID, SwarmName, GnomeId)>,
-    scheduled_to_disconnect: HashSet<SwarmID>,
-    leave_when_joined: Option<(SwarmName, SwarmID)>,
-    is_leaving_a_swarm: Option<SwarmID>,
+    scheduled_to_disconnect: HashSet<(SwarmName, SwarmID)>,
+    leave_when_joined: Option<(SwarmName, (SwarmName, SwarmID))>,
+    is_leaving_a_swarm: Option<(SwarmName, SwarmID)>,
     pending_new_swarms: Option<(SwarmID, HashSet<(SwarmName, GnomeId, bool)>)>,
 }
 impl SwarmSwap {
@@ -222,6 +222,17 @@ impl SwarmSwap {
         !self.candidates.is_empty()
     }
 
+    pub fn filter_out_candidates(&mut self, swarm_id: SwarmID) {
+        let c_len = self.candidates.len();
+        for i in 0..c_len {
+            if let Some((s_id, s_name, g_id)) = self.candidates.pop_front() {
+                if s_id == swarm_id {
+                    continue;
+                }
+                self.candidates.push_back((s_id, s_name, g_id));
+            }
+        }
+    }
     pub fn not_a_candidate(&mut self, s_name: &SwarmName) {
         let c_len = self.candidates.len();
         for _i in 0..c_len {
@@ -245,12 +256,12 @@ impl SwarmSwap {
             }
         }
     }
-    pub fn was_disconnect_planned(&mut self, disconnected_id: &SwarmID) -> bool {
-        eprintln!("Was {} planned?", disconnected_id);
+    pub fn was_disconnect_planned(&mut self, disconnected_id: &(SwarmName, SwarmID)) -> bool {
+        eprintln!("Was disconnecting of {} planned?", disconnected_id.0);
         self.scheduled_to_disconnect.take(disconnected_id).is_some()
     }
-    pub fn schedule_to_disconnect(&mut self, id_to_be_disconnected: SwarmID) {
-        eprintln!("Planning to disconnect {}", id_to_be_disconnected);
+    pub fn schedule_to_disconnect(&mut self, id_to_be_disconnected: (SwarmName, SwarmID)) {
+        eprintln!("Planning to disconnect {}", id_to_be_disconnected.0);
         self.scheduled_to_disconnect.insert(id_to_be_disconnected);
     }
 
@@ -335,7 +346,11 @@ async fn serve_app_manager(
         SwarmName{founder:GnomeId(u64::MAX),name:format!("/")};
     // };
     // eprintln!("My-ID: {}", my_id);
-    let mut app_mgr = ApplicationManager::new(my_name.founder);
+    let mut app_mgr = ApplicationManager::new(
+        my_name.founder,
+        config.max_connected_swarms,
+        (to_gnome_mgr.clone(), to_user.clone(), to_app_mgr.clone()),
+    );
 
     // let sleep_time = Duration::from_millis(16);
     let mut own_swarm_started = false;
@@ -401,6 +416,7 @@ async fn serve_app_manager(
                         .await;
                 }
                 ToAppMgr::SetActiveApp(swarm_name) => {
+                    eprintln!("SetActiveApp req");
                     if let Ok(s_id) = app_mgr.set_active(&swarm_name) {
                         let _ = to_user.send(ToApp::ActiveSwarm(swarm_name, s_id)).await;
                     } else {
@@ -541,86 +557,149 @@ async fn serve_app_manager(
                         .await;
                 }
                 ToAppMgr::SwarmSynced(s_id) => {
-                    eprintln!("SwarmSynced {}", s_id);
-                    let can_be_dropped = app_mgr.set_synced(s_id);
-                    if app_mgr.number_of_connected_swarms() >= config.max_connected_swarms
-                        && can_be_dropped
-                    {
-                        eprintln!("SwapNewSwarm 1");
-                        let _ = to_app_mgr.send(ToAppMgr::SwapNewSwarm(Some(s_id))).await;
-                        // eprintln!(
-                        //     "TODO: we have to trigger swarm swap mechanism (and implement it)"
-                        // );
-                    }
-                    eprintln!("!own_swarm_started");
-                    if let Some(founder) = app_mgr.get_swarm_founder(&s_id) {
-                        if founder.is_any() {
-                            eprintln!("Not starting my swarm - current founder is any");
-                        } else {
-                            if !own_swarm_started {
-                                if founder != my_name.founder {
-                                    eprintln!(
-                                        "Starting a new swarm, where I {} am Founder…",
-                                        my_name
-                                    );
-                                    let _ = to_gnome_mgr
-                                        .send(ToGnomeManager::JoinSwarm(my_name.clone(), None))
-                                        .await;
-                                } else {
-                                    own_swarm_started = true;
-                                    let _ = to_app_mgr
-                                        .send(ToAppMgr::SetActiveApp(my_name.clone()))
-                                        .await;
-                                    let _ = to_user
-                                        .send(ToApp::ActiveSwarm(my_name.clone(), s_id))
-                                        .await;
-                                    // own_swarm_started = true;
-                                }
-                            } else if !own_swarm_activated && founder == my_name.founder {
-                                eprintln!("own_swarm_activated");
-                                own_swarm_activated = true;
-                                let _ = to_user
-                                    .send(ToApp::ActiveSwarm(my_name.clone(), s_id))
-                                    .await;
-                            }
-                        }
-                    }
+                    app_mgr.swarm_synced(s_id).await;
+                    // eprintln!("SwarmSynced {}", s_id);
+                    // if !own_swarm_activated && own_swarm_started {
+                    //     if let Some(s_name) = app_mgr.get_name(s_id) {
+                    //         if s_name == my_name {
+                    //             own_swarm_activated = true;
+                    //             let _ = to_app_mgr
+                    //                 .send(ToAppMgr::SetActiveApp(my_name.clone()))
+                    //                 .await;
+                    //             let _ = to_user
+                    //                 .send(ToApp::ActiveSwarm(my_name.clone(), s_id))
+                    //                 .await;
+                    //         }
+                    //     }
+                    // }
+                    // if let Some((expected_name, swarm_to_drop)) =
+                    //     swarm_swap.leave_when_joined.take()
+                    // {
+                    //     if let Some(s_name) = app_mgr.get_name(s_id) {
+                    //         if expected_name == s_name {
+                    //             swarm_swap.is_leaving_a_swarm = Some(swarm_to_drop.clone());
+                    //             let _ = to_gnome_mgr
+                    //                 .send(ToGnomeManager::LeaveSwarm(swarm_to_drop.1))
+                    //                 .await;
+                    //             let _ = to_user
+                    //                 .send(ToApp::Disconnected(
+                    //                     false,
+                    //                     swarm_to_drop.1,
+                    //                     swarm_to_drop.0,
+                    //                 ))
+                    //                 .await;
+                    //         } else {
+                    //             swarm_swap.leave_when_joined = Some((expected_name, swarm_to_drop));
+                    //         }
+                    //     }
+                    // }
+                    // let can_be_dropped = app_mgr.set_synced(s_id);
+                    // if app_mgr.number_of_connected_swarms() >= config.max_connected_swarms
+                    //     && can_be_dropped
+                    // {
+                    //     if let Some(sw_name) = app_mgr.get_name(s_id) {
+                    //         eprintln!("SwapNewSwarm 1");
+                    //         let _ = to_app_mgr
+                    //             .send(ToAppMgr::SwapNewSwarm(Some((sw_name, s_id))))
+                    //             .await;
+                    //         // eprintln!(
+                    //         //     "TODO: we have to trigger swarm swap mechanism (and implement it)"
+                    //         // );
+                    //         continue;
+                    //     }
+                    // }
+                    // eprintln!("!own_swarm_started");
+                    // if let Some(founder) = app_mgr.get_swarm_founder(&s_id) {
+                    //     if founder.is_any() {
+                    //         eprintln!("Not starting my swarm - current founder is any");
+                    //     } else {
+                    //         if !own_swarm_started {
+                    //             if founder != my_name.founder {
+                    //                 eprintln!(
+                    //                     "Starting a new swarm, where I {} am Founder…",
+                    //                     my_name
+                    //                 );
+                    //                 let _ = to_gnome_mgr
+                    //                     .send(ToGnomeManager::JoinSwarm(my_name.clone(), None))
+                    //                     .await;
+                    //             } else {
+                    //                 let _ = to_app_mgr
+                    //                     .send(ToAppMgr::SetActiveApp(my_name.clone()))
+                    //                     .await;
+                    //                 let _ = to_user
+                    //                     .send(ToApp::ActiveSwarm(my_name.clone(), s_id))
+                    //                     .await;
+                    //                 own_swarm_activated = true;
+                    //             }
+                    //             own_swarm_started = true;
+                    //         } else if !own_swarm_activated && founder == my_name.founder {
+                    //             eprintln!("own_swarm_activated");
+                    //             own_swarm_activated = true;
+                    //             let _ = to_user
+                    //                 .send(ToApp::ActiveSwarm(my_name.clone(), s_id))
+                    //                 .await;
+                    //         }
+                    //     }
+                    // }
                 }
                 ToAppMgr::TimeoutOver(t_type) => match t_type {
                     TimeoutType::Cooldown => {
-                        swarm_swap.set_cooldown(false);
-                        if app_mgr.number_of_connected_swarms() >= config.max_connected_swarms {
-                            let _ = to_app_mgr
-                                .send(ToAppMgr::QueryForNeighboringSwarms(None))
-                                .await;
-                        }
+                        app_mgr.cooldown_over();
+                        // TODO: use timeout to Join/Leave a new swarm
+                        //
+                        // swarm_swap.set_cooldown(false);
+                        // if app_mgr.number_of_connected_swarms() >= config.max_connected_swarms {
+                        //     let _ = to_app_mgr
+                        //         .send(ToAppMgr::QueryForNeighboringSwarms(None))
+                        //         .await;
+                        // }
                     }
                     TimeoutType::NewSwarmsAvailable => {
+                        // This type should no longer match
                         if let Some((s_id, new_swarms_avail)) = swarm_swap.pending_new_swarms.take()
                         {
-                            let _ = to_app_mgr
-                                .send(ToAppMgr::FromGMgr(FromGnomeManager::NewSwarmsAvailable(
-                                    s_id,
-                                    new_swarms_avail,
-                                )))
-                                .await;
+                            if app_mgr.has_swarm_id(s_id) {
+                                let _ = to_app_mgr
+                                    .send(ToAppMgr::FromGMgr(FromGnomeManager::NewSwarmsAvailable(
+                                        s_id,
+                                        new_swarms_avail,
+                                    )))
+                                    .await;
+                            } else if let Some(query_id) = swarm_swap.next_query_item() {
+                                // If this list is empty, we query next Swarm.
+                                let _ = to_gnome_mgr
+                                    .send(ToGnomeManager::ProvideNeighboringSwarms(query_id))
+                                    .await;
+                            } else {
+                                if !swarm_swap.is_cooldown() {
+                                    eprintln!("Cooldown start 1");
+                                    spawn(start_a_timer(
+                                        to_app_mgr.clone(),
+                                        TimeoutType::Cooldown,
+                                        Duration::from_secs(5),
+                                    ));
+                                    swarm_swap.set_cooldown(true);
+                                }
+                            }
                         }
                     }
                     TimeoutType::PeriodicalCheckForNewSwarms => {
+                        // Currently Periodical timer is disabled
                         spawn(start_a_timer(
                             to_app_mgr.clone(),
                             TimeoutType::PeriodicalCheckForNewSwarms,
-                            Duration::from_secs(60),
+                            Duration::from_secs(15),
                         ));
-                        if !swarm_swap.is_cooldown() {
-                            eprintln!("Periodical Cooldown start");
-                            spawn(start_a_timer(
-                                to_app_mgr.clone(),
-                                TimeoutType::Cooldown,
-                                Duration::from_secs(5),
-                            ));
-                            swarm_swap.set_cooldown(true);
-                        }
+                        app_mgr.update_swap_state_after_leave(None).await;
+                        // if !swarm_swap.is_cooldown() {
+                        //     eprintln!("Periodical Cooldown start");
+                        //     spawn(start_a_timer(
+                        //         to_app_mgr.clone(),
+                        //         TimeoutType::Cooldown,
+                        //         Duration::from_secs(5),
+                        //     ));
+                        //     swarm_swap.set_cooldown(true);
+                        // }
                     }
                 },
                 ToAppMgr::FromGMgr(message) => {
@@ -629,36 +708,16 @@ async fn serve_app_manager(
                     match message {
                         FromGnomeManager::MyName(m_name) => {
                             eprintln!("I know my id: {}", m_name);
-                            app_mgr.gnome_id = m_name.founder;
+                            app_mgr.update_my_name(m_name.clone());
                             my_name = m_name
                         }
                         FromGnomeManager::SwarmFounderDetermined(swarm_id, s_name) => {
-                            let founder = s_name.founder;
-                            eprintln!("SwarmFounderDetermined {}: {}", swarm_id, founder);
-                            app_mgr.update_app_data_founder(swarm_id, s_name.clone());
-                            //TODO: distinguish between founder and my_id, if not equal
-                            // request gnome manager to join another swarm where f_id == my_id
-                            // if f_id != my_id {
-                            //     if !own_swarm_started {
-                            //         own_swarm_started = true;
-                            //         eprintln!(
-                            //             "Starting a new swarm, where I {} am Founder…",
-                            //             my_id
-                            //         );
-                            //         let _ = to_gnome_mgr
-                            //             .send(ToGnomeManager::JoinSwarm(
-                            //                 SwarmName::new(my_id, "/".to_string()).unwrap(),
-                            //             ))
-                            //             .await;
-                            //     } else {
-                            //         // eprintln!("TODO: Need to notify neighbor about my swarm");
-                            //         let _ = app_mgr.set_active(&my_id);
-                            //     }
-                            // } else {
-                            if founder == my_name.founder {
-                                own_swarm_started = true;
-                                let _ = to_user.send(ToApp::ActiveSwarm(s_name, swarm_id));
-                            }
+                            eprintln!("SwarmFounderDet {}: {}", swarm_id, s_name.founder);
+                            app_mgr.update_app_data_founder(swarm_id, s_name);
+
+                            // This is in order to trigger initial home swarm activation
+                            app_mgr.active_app_data =
+                                (SwarmID(255), app_mgr.active_app_data.1.clone());
                         }
                         FromGnomeManager::MyPublicIPs(ip_list) => {
                             // eprintln!("dapp_lib got list of my public IP");
@@ -671,87 +730,88 @@ async fn serve_app_manager(
                             let _ = to_user.send(ToApp::MyPublicIPs(ip_list)).await;
                         }
                         FromGnomeManager::NewSwarmsAvailable(s_id, neighboring_swarms) => {
-                            if neighboring_swarms.is_empty() {
-                                continue;
-                            }
-                            if swarm_swap.is_leaving_a_swarm.is_some() {
-                                eprintln!(
-                                    "NewSwarmsAvailable, but we are in process of leaving a swarm"
-                                );
-                                //TODO: maybe a delayed send?
-                                // let prev_pending = swarm_swap.pending_new_swarms.take();
-                                // if prev_pending.is_none() {
-                                if swarm_swap.pending_new_swarms.is_none() {
-                                    eprintln!("Starting a timer for NewSwarms");
-                                    swarm_swap.pending_new_swarms =
-                                        Some((s_id, neighboring_swarms));
-                                    spawn(start_a_timer(
-                                        to_app_mgr.clone(),
-                                        TimeoutType::NewSwarmsAvailable,
-                                        Duration::from_secs(5),
-                                    ));
-                                }
-                                // let _ =to_app_mgr
-                                // .send(ToAppMgr::FromGMgr(FromGnomeManager::NewSwarmsAvailable(
-                                //     s_id,
-                                //     neighboring_swarms,
-                                // )))
-                                //     .await;
-                                continue;
-                            }
-                            eprintln!(
-                                "NewSwarmsAvailable from {} len: {}",
-                                s_id,
-                                neighboring_swarms.len()
-                            );
-                            for (sn, g_id, exists) in &neighboring_swarms {
-                                eprintln!("{} (thru {} exists: {})", sn, g_id, exists);
-                            }
-                            // FromGnomeManager::NeighboringSwarms(s_id, neighboring_swarms) => {
-                            //TODO: here we need to filter received list, excluding those
-                            // we are already member of.
-                            let mapping = app_mgr.get_mapping();
-                            let mut filtered_swarms = Vec::with_capacity(neighboring_swarms.len());
-                            for (s_name, g_id, swarm_exists) in neighboring_swarms.into_iter() {
-                                if mapping.contains_key(&s_name) {
-                                    eprintln!("Extending {}", s_name);
-                                    let _res = to_gnome_mgr
-                                        .send(ToGnomeManager::ExtendSwarm(s_name, s_id, g_id))
-                                        .await;
-                                    continue;
-                                }
-                                if !swarm_exists {
-                                    filtered_swarms.push((s_id, s_name, g_id));
-                                }
-                            }
-                            // Then we update SwarmSwap structure to include this list.
-                            if !filtered_swarms.is_empty() {
-                                swarm_swap.add_candidates(filtered_swarms);
-                                // TODO: If list is not empty, we can proceed
-                                // to Stage one of Swarm Swap.
-                                eprintln!("SwapNewSwarm 2");
-                                let _ = to_app_mgr.send(ToAppMgr::SwapNewSwarm(None)).await;
-                            } else {
-                                if let Some(query_id) = swarm_swap.next_query_item() {
-                                    // If this list is empty, we query next Swarm.
-                                    let _ = to_gnome_mgr
-                                        .send(ToGnomeManager::ProvideNeighboringSwarms(query_id))
-                                        .await;
-                                } else {
-                                    // If we have queried all possible Swarms, we start cooldown.
-                                    // TODO: spawn a timer
-                                    if !swarm_swap.is_cooldown() {
-                                        eprintln!("Cooldown start 1");
-                                        spawn(start_a_timer(
-                                            to_app_mgr.clone(),
-                                            TimeoutType::Cooldown,
-                                            Duration::from_secs(5),
-                                        ));
-                                        swarm_swap.set_cooldown(true);
-                                    }
-                                }
-                            }
-                            // eprintln!("TODO: {} neighboring swarms", s_id,);
+                            app_mgr.update_swap_state_after_leave(None).await;
+                            // if neighboring_swarms.is_empty() {
+                            //     continue;
+                            // }
+                            // if swarm_swap.is_leaving_a_swarm.is_some() {
+                            //     eprintln!(
+                            //         "NewSwarmsAvailable, but we are in process of leaving a swarm"
+                            //     );
+                            //     //TODO: maybe a delayed send?
+                            //     // let prev_pending = swarm_swap.pending_new_swarms.take();
+                            //     // if prev_pending.is_none() {
+                            //     if swarm_swap.pending_new_swarms.is_none() {
+                            //         eprintln!("Starting a timer for NewSwarms");
+                            //         swarm_swap.pending_new_swarms =
+                            //             Some((s_id, neighboring_swarms));
+                            //         spawn(start_a_timer(
+                            //             to_app_mgr.clone(),
+                            //             TimeoutType::NewSwarmsAvailable,
+                            //             Duration::from_secs(5),
+                            //         ));
+                            //     }
+                            //     // let _ =to_app_mgr
+                            //     // .send(ToAppMgr::FromGMgr(FromGnomeManager::NewSwarmsAvailable(
+                            //     //     s_id,
+                            //     //     neighboring_swarms,
+                            //     // )))
+                            //     //     .await;
+                            //     continue;
+                            // }
+                            // eprintln!(
+                            //     "NewSwarmsAvailable from {} len: {}",
+                            //     s_id,
+                            //     neighboring_swarms.len()
+                            // );
+                            // for (sn, g_id, exists) in &neighboring_swarms {
+                            //     eprintln!("{} (thru {} exists: {})", sn, g_id, exists);
+                            // }
+                            // // FromGnomeManager::NeighboringSwarms(s_id, neighboring_swarms) => {
+                            // //TODO: here we need to filter received list, excluding those
+                            // // we are already member of.
+                            // let mapping = app_mgr.get_mapping();
+                            // let mut filtered_swarms = Vec::with_capacity(neighboring_swarms.len());
+                            // for (s_name, g_id, swarm_exists) in neighboring_swarms.into_iter() {
+                            //     if mapping.contains_key(&s_name) {
+                            //         eprintln!("Extending {}", s_name);
+                            //         let _res = to_gnome_mgr
+                            //             .send(ToGnomeManager::ExtendSwarm(s_name, s_id, g_id))
+                            //             .await;
+                            //         continue;
+                            //     }
+                            //     if !swarm_exists {
+                            //         filtered_swarms.push((s_id, s_name, g_id));
+                            //     }
+                            // }
+                            // // Then we update SwarmSwap structure to include this list.
+                            // if !filtered_swarms.is_empty() {
+                            //     swarm_swap.add_candidates(filtered_swarms);
+                            //     // TODO: If list is not empty, we can proceed
+                            //     // to Stage one of Swarm Swap.
+                            //     eprintln!("SwapNewSwarm 2");
+                            //     let _ = to_app_mgr.send(ToAppMgr::SwapNewSwarm(None)).await;
+                            // } else {
+                            //     if let Some(query_id) = swarm_swap.next_query_item() {
+                            //         // If this list is empty, we query next Swarm.
+                            //         let _ = to_gnome_mgr
+                            //             .send(ToGnomeManager::ProvideNeighboringSwarms(query_id))
+                            //             .await;
+                            //     } else {
+                            //         // If we have queried all possible Swarms, we start cooldown.
+                            //         // TODO: spawn a timer
+                            //         if !swarm_swap.is_cooldown() {
+                            //             eprintln!("Cooldown start 1");
+                            //             spawn(start_a_timer(
+                            //                 to_app_mgr.clone(),
+                            //                 TimeoutType::Cooldown,
+                            //                 Duration::from_secs(5),
+                            //             ));
+                            //             swarm_swap.set_cooldown(true);
+                            //         }
+                            //     }
+                            // }
+                            // // eprintln!("TODO: {} neighboring swarms", s_id,);
                         }
                         FromGnomeManager::SwarmNeighbors(s_id, g_set) => {
                             //TODO
@@ -909,12 +969,17 @@ async fn serve_app_manager(
                         //     // eprintln!("Join sent: {:?}", _res);
                         // }
                         FromGnomeManager::SwarmBusy(s_id, is_busy) => {
-                            let can_be_dropped = app_mgr.set_busy(s_id, is_busy);
-                            if can_be_dropped {
-                                eprintln!("SwapNewSwarm 3");
-                                let _ = to_app_mgr.send(ToAppMgr::SwapNewSwarm(Some(s_id))).await;
-                                // eprintln!("TODO: we have to trigger swarm swap mechanism");
-                            }
+                            app_mgr.swarm_busy(s_id, is_busy).await;
+                            // let can_be_dropped = app_mgr.set_busy(s_id, is_busy);
+                            // if can_be_dropped {
+                            //     if let Some(sw_name) = app_mgr.get_name(s_id) {
+                            //         eprintln!("SwapNewSwarm 3");
+                            //         let _ = to_app_mgr
+                            //             .send(ToAppMgr::SwapNewSwarm(Some((sw_name, s_id))))
+                            //             .await;
+                            //     }
+                            // eprintln!("TODO: we have to trigger swarm swap mechanism");
+                            // }
                             // eprintln!("TODO: Swarm {} busy: {}", s_id, is_busy);
                         }
 
@@ -922,7 +987,7 @@ async fn serve_app_manager(
                             // TODO: in swarm-consensus we need to add a timeout when waiting
                             // for neighboring Gnomes so that we are not stuck forever there
                             // TODO: Check SwarmSwap if there are other NewSwarms waiting to join
-                            app_mgr.update_app_data_founder(s_id, s_name.clone());
+                            app_mgr.swarm_joined(s_name.clone());
                             swarm_swap.not_a_candidate(&s_name);
                             // if swarm_swap.has_candidates() {
                             //     eprintln!("SwapNewSwarm 4");
@@ -955,84 +1020,169 @@ async fn serve_app_manager(
                                 from_swarm,
                                 to_app_data_send.clone(),
                             ));
-                            if let Some((expected_name, swarm_id_to_drop)) =
-                                swarm_swap.leave_when_joined.take()
-                            {
-                                // if expected_name == s_name {
-                                swarm_swap.is_leaving_a_swarm = Some(swarm_id_to_drop);
-                                let _ = to_gnome_mgr
-                                    .send(ToGnomeManager::LeaveSwarm(swarm_id_to_drop))
-                                    .await;
-                                // } else {
-                                //     swarm_swap.leave_when_joined =
-                                //         Some((expected_name, swarm_id_to_drop));
-                                // }
-                            }
+                            // TODO: move following after we are sure to have
+                            // some neighbors in new swarm
+                            //
+                            // if let Some((expected_name, swarm_to_drop)) =
+                            //     swarm_swap.leave_when_joined.take()
+                            // {
+                            //     if expected_name == s_name {
+                            //         swarm_swap.is_leaving_a_swarm = Some(swarm_to_drop.clone());
+                            //         let _ = to_gnome_mgr
+                            //             .send(ToGnomeManager::LeaveSwarm(swarm_to_drop.1))
+                            //             .await;
+                            //         let _ = to_user
+                            //             .send(ToApp::Disconnected(
+                            //                 false,
+                            //                 swarm_to_drop.1,
+                            //                 swarm_to_drop.0,
+                            //             ))
+                            //             .await;
+                            //     } else {
+                            //         swarm_swap.leave_when_joined =
+                            //             Some((expected_name, swarm_to_drop));
+                            //     }
+                            // }
                         }
                         // FromGnomeManager::SwarmTerminated(swarm_id, s_name) => {
                         //     eprintln!("dapp-lib got info about {} {} terminated", swarm_id, s_name);
                         //     to_app_mgr.send(ToAppMgr::SwarmTerminated(swarm_id, s_name));
                         // }
                         FromGnomeManager::Disconnected(s_ids) => {
-                            // eprintln!("AppMgr received Disconnected");
+                            eprintln!("AppMgr received Disconnected:");
+                            for (s_id, s_name) in &s_ids {
+                                eprintln!("{} {}", s_id, s_name);
+                            }
+                            eprintln!();
                             if quit_application {
                                 let _ = to_user.send(ToApp::Quit).await;
                                 break 'outer;
                             } else {
-                                let (active_id, _sender) = app_mgr.active_app_data.clone();
-                                let mut expected_id = swarm_swap.is_leaving_a_swarm.take();
-                                for (s_id, s_name) in &s_ids {
-                                    expected_id = if let Some(exp_id) = expected_id {
-                                        if exp_id == *s_id {
-                                            None
-                                        } else {
-                                            Some(exp_id)
-                                        }
-                                    } else {
-                                        None
-                                    };
-                                    app_mgr.remove_name_mapping(&s_name);
-                                    if let Some(app_data) = app_mgr.app_data_store.get(&s_id) {
-                                        let _ = app_data.send(ToAppData::Terminate).await;
-                                    }
-                                    if swarm_swap.was_disconnect_planned(s_id) {
-                                        eprintln!(
-                                            "{} {} terminated (my id: {})",
-                                            s_id, s_name, app_mgr.gnome_id
-                                        );
-                                        // let _ = to_user
-                                        //     .send(ToApp::Disconnected(false, *s_id, s_name.clone()))
-                                        //     .await;
-                                        continue;
-                                    }
-                                    eprintln!("Not planned disconnection");
-                                    if active_id == *s_id || s_name.founder == app_mgr.gnome_id {
-                                        eprintln!("Reconnecting with swarm {}", s_name);
-                                        let _ = to_gnome_mgr
-                                            .send(ToGnomeManager::JoinSwarm(s_name.clone(), None))
-                                            .await;
-                                        // we need to inform user about loosing active swarm
-                                        // temporary we send Disconnected
-                                        let _ = to_user
-                                            .send(ToApp::Disconnected(true, *s_id, s_name.clone()))
-                                            .await;
-                                        // } else {
-                                        //     eprintln!("Reconnecting with swarm {}", s_name);
-                                        //     let _ = to_gnome_mgr
-                                        //         .send(ToGnomeManager::JoinSwarm(s_name.clone(), None))
-                                        //         .await;
-                                        //     let _ = to_user
-                                        //         .send(ToApp::Disconnected(true, *s_id, s_name.clone()))
-                                        //         .await;
-                                    }
+                                // let active_id = app_mgr.active_app_data.0;
+                                // let mut expected_id = swarm_swap.is_leaving_a_swarm.take();
+                                for (s_id, s_name) in s_ids {
+                                    app_mgr.swarm_disconnected(s_id, s_name).await;
+                                    //TODO: replace following logic inside swarm_disconnected
+                                    // expected_id = if let Some((exp_name, exp_id)) = expected_id {
+                                    //     if exp_id == *s_id {
+                                    //         None
+                                    //     } else {
+                                    //         Some((exp_name, exp_id))
+                                    //     }
+                                    // } else {
+                                    //     None
+                                    // };
+                                    // app_mgr.remove_name_mapping(&s_name);
+                                    // if let Some(app_data) = app_mgr.app_data_store.get(&s_id) {
+                                    //     let _ = app_data.send(ToAppData::Terminate).await;
+                                    // }
+                                    // if swarm_swap.was_disconnect_planned(&(s_name.clone(), *s_id)) {
+                                    //     eprintln!(
+                                    //         "{} {} terminated (my id: {})",
+                                    //         s_id, s_name, app_mgr.my_name.founder
+                                    //     );
+                                    //     // let _ = to_user
+                                    //     //     .send(ToApp::Disconnected(false, *s_id, s_name.clone()))
+                                    //     //     .await;
+                                    //     continue;
+                                    // }
+                                    //     eprintln!("Not planned disconnection");
+                                    //     if active_id == *s_id
+                                    //         || s_name.founder == app_mgr.my_name.founder
+                                    //     {
+                                    //         eprintln!("Reconnecting with swarm {}", s_name);
+                                    //         let _ = to_gnome_mgr
+                                    //             .send(ToGnomeManager::JoinSwarm(s_name.clone(), None))
+                                    //             .await;
+                                    //         // we need to inform user about loosing active swarm
+                                    //         // temporary we send Disconnected
+                                    //         let _ = to_user
+                                    //             .send(ToApp::Disconnected(true, *s_id, s_name.clone()))
+                                    //             .await;
+                                    //         // } else {
+                                    //         //     eprintln!("Reconnecting with swarm {}", s_name);
+                                    //         //     let _ = to_gnome_mgr
+                                    //         //         .send(ToGnomeManager::JoinSwarm(s_name.clone(), None))
+                                    //         //         .await;
+                                    //         //     let _ = to_user
+                                    //         //         .send(ToApp::Disconnected(true, *s_id, s_name.clone()))
+                                    //         //         .await;
+                                    //     }
+                                    // }
+                                    // if app_mgr.number_of_connected_swarms()
+                                    //     > config.max_connected_swarms
+                                    // {
+                                    //     eprintln!("We have to drop more swarms");
+                                    //     if swarm_swap.is_leaving_a_swarm.is_none() {
+                                    //         if let Some(leave_pair) = swarm_swap
+                                    //             .scheduled_to_disconnect
+                                    //             .iter()
+                                    //             .next()
+                                    //             .cloned()
+                                    //         {
+                                    //             swarm_swap.scheduled_to_disconnect.remove(&leave_pair);
+                                    //             swarm_swap.is_leaving_a_swarm =
+                                    //                 Some(leave_pair.clone());
+                                    //             let _ = to_gnome_mgr
+                                    //                 .send(ToGnomeManager::LeaveSwarm(leave_pair.1))
+                                    //                 .await;
+                                    //             let _ = to_user
+                                    //                 .send(ToApp::Disconnected(
+                                    //                     false,
+                                    //                     leave_pair.1,
+                                    //                     leave_pair.0,
+                                    //                 ))
+                                    //                 .await;
+                                    //         }
+                                    //     } else {
+                                    //         eprintln!("But there are no candidates to drop");
+                                    //     }
                                 }
                             }
+                        }
+                        FromGnomeManager::SelectedSwarm(s_name_opt) => {
+                            eprintln!("SelectedSwarm recvd: {:?}", s_name_opt);
+                            app_mgr.selected_swarm(s_name_opt);
                         }
                     }
                     // }                    //
                 }
                 ToAppMgr::SwapNewSwarm(swap_id_opt) => {
                     eprintln!("I am supposed to swap in a new swarm");
+                    if swarm_swap.is_leaving_a_swarm.is_some()
+                        || swarm_swap.leave_when_joined.is_some()
+                    {
+                        eprintln!("Another swapping procedure running");
+                        continue;
+                    }
+                    if app_mgr.number_of_connected_swarms() > config.max_connected_swarms {
+                        eprintln!("We have to drop some swarm");
+                        if let Some((s_name, s_id)) = swap_id_opt {
+                            eprintln!("Leaving {}", s_name);
+                            swarm_swap.schedule_to_disconnect((s_name.clone(), s_id));
+                            swarm_swap.is_leaving_a_swarm = Some((s_name.clone(), s_id));
+                            let _ = to_gnome_mgr.send(ToGnomeManager::LeaveSwarm(s_id)).await;
+                            let _ = to_user.send(ToApp::Disconnected(false, s_id, s_name)).await;
+                        } else {
+                            eprintln!("First we have to find a swarm to drop");
+                            if let Some((s_name, s_id)) = app_mgr.ready_to_be_swapped() {
+                                swarm_swap.is_leaving_a_swarm = Some((s_name.clone(), s_id));
+                                let _ = to_gnome_mgr.send(ToGnomeManager::LeaveSwarm(s_id)).await;
+                                let _ =
+                                    to_user.send(ToApp::Disconnected(false, s_id, s_name)).await;
+                            }
+                        }
+                        if !swarm_swap.is_cooldown() {
+                            eprintln!("Cooldown start 0");
+                            spawn(start_a_timer(
+                                to_app_mgr.clone(),
+                                TimeoutType::Cooldown,
+                                Duration::from_secs(5),
+                            ));
+                            swarm_swap.set_cooldown(true);
+                        }
+                        continue;
+                    }
 
                     //TODO: first stage of Swarm swap mechanism
                     // We have an existing Swarm ready to get swapped for a new
@@ -1047,16 +1197,14 @@ async fn serve_app_manager(
                         // If we have a new SwarmName we proceed.
                         // we do not have to LeaveSwarm if we have SwarmSlots available
                         if app_mgr.number_of_connected_swarms() >= config.max_connected_swarms {
-                            if swarm_swap.is_leaving_a_swarm.is_some()
-                                || swarm_swap.leave_when_joined.is_some()
-                            {
-                                eprintln!("Another swapping procedure running");
-                                continue;
-                            }
                             eprintln!(
                                 "We've reached max swarms limit: {}",
                                 config.max_connected_swarms
                             );
+                            if !own_swarm_activated {
+                                eprintln!("Not leaving any swarm until our own swarm is running");
+                                continue;
+                            }
                             // TODO: entire swarm swap mechanism is very experimental
                             // and needs to be done in a more thoughtful way.
                             //
@@ -1079,32 +1227,33 @@ async fn serve_app_manager(
                             // swarm then we are being left with this single swarm being
                             // connected. There should be some mechanism that tries
                             // to join additional swarms.
-                            let swap_opt = if let Some(swap_id) = swap_id_opt {
+                            let swap_opt = if let Some((sw_name, swap_id)) = swap_id_opt {
                                 if swap_id.0 != app_mgr.active_app_data.0 .0 {
-                                    Some(swap_id)
+                                    Some((sw_name, swap_id))
                                 } else {
                                     None
                                 }
                             } else {
                                 None
                             };
-                            if let Some(swap_id) = swap_opt {
-                                eprintln!("About to leave swarm: {}", swap_id);
-                                swarm_swap.schedule_to_disconnect(swap_id);
+                            if let Some(swap_pair) = swap_opt {
+                                eprintln!("About to leave swarm: {}", swap_pair.0);
+                                swarm_swap.schedule_to_disconnect(swap_pair.clone());
                                 // if swap_id.0 == s_thru_id.0 {
                                 // eprintln!("TODO: We should not leave this swarm yet!");
                                 swarm_swap.leave_when_joined =
-                                    Some((s_candidate_name.clone(), swap_id));
+                                    Some((s_candidate_name.clone(), swap_pair));
                                 // } else {
                                 //     let _ = to_gnome_mgr
                                 //         .send(ToGnomeManager::LeaveSwarm(swap_id))
                                 //         .await;
                                 // }
-                            } else if let Some(next_id) =
-                                app_mgr.ready_to_be_swapped(app_mgr.active_app_data.0)
-                            {
-                                eprintln!("About to leave swarm: {} (2)", next_id);
-                                swarm_swap.schedule_to_disconnect(next_id);
+                            } else if let Some(next_id) = app_mgr.ready_to_be_swapped() {
+                                eprintln!(
+                                    "About to leave swarm: {} (2) {}",
+                                    next_id.0, app_mgr.active_app_data.0
+                                );
+                                swarm_swap.schedule_to_disconnect(next_id.clone());
                                 // if next_id.0 == s_thru_id.0 {
                                 eprintln!("TODO: We should not leave this swarm yet! 2");
                                 swarm_swap.leave_when_joined =
@@ -1143,14 +1292,23 @@ async fn serve_app_manager(
                                     Some(g_thru_id),
                                 ))
                                 .await;
-                        } else {
-                            if let Some((_name, leave_id)) = swarm_swap.leave_when_joined.take() {
-                                swarm_swap.is_leaving_a_swarm = Some(leave_id);
-                                let _ = to_gnome_mgr
-                                    .send(ToGnomeManager::LeaveSwarm(leave_id))
-                                    .await;
-                            }
                         }
+                        // } else {
+                        //     if let Some((expected_name, leave_pair)) =
+                        //         swarm_swap.leave_when_joined.take()
+                        //     {
+                        //         // We have to drop candidate swarms if they come from a swarm
+                        //         // we are about to drop.
+                        //         swarm_swap.filter_out_candidates(leave_pair.1);
+                        //         swarm_swap.is_leaving_a_swarm = Some(leave_pair.clone());
+                        //         let _ = to_gnome_mgr
+                        //             .send(ToGnomeManager::LeaveSwarm(leave_pair.1))
+                        //             .await;
+                        //         let _ = to_user
+                        //             .send(ToApp::Disconnected(false, leave_pair.1, leave_pair.0))
+                        //             .await;
+                        //     }
+                        // }
                     } else {
                         eprintln!("No candidates to swap in");
                         // If there is no new SwarmName we check inquiry_cooldown
@@ -1162,8 +1320,13 @@ async fn serve_app_manager(
                             // If it is false we query existing swarms, excluding
                             // the one that is ready to get swapped, to provide a list
                             // of neighboring SwarmNames.
+                            let s_i_opt = if let Some((s_name, s_id)) = swap_id_opt {
+                                Some(s_id)
+                            } else {
+                                None
+                            };
                             let _ = to_app_mgr
-                                .send(ToAppMgr::QueryForNeighboringSwarms(swap_id_opt))
+                                .send(ToAppMgr::QueryForNeighboringSwarms(s_i_opt))
                                 .await;
                         }
                         // If inquiry_cooldown flag is set we do nothing.
@@ -1411,7 +1574,7 @@ async fn serve_app_data(
                         let _ = c.push_data(Data::empty(u64::from_be_bytes(
                             hash_bytes.try_into().unwrap(),
                         )));
-                        for h in c.data_hashes() {
+                        for _h in c.data_hashes() {
                             // eprintln!("New hashes: {:?}", h.to_be_bytes());
                         }
                         // eprintln!("Len: {}", c.len());
@@ -3261,11 +3424,11 @@ async fn serve_app_data(
                 }
             }
             ToAppData::ReadData(c_id) => {
-                eprintln!(
-                    "ToAppData::ReadData({}) when DStore synced: {}",
-                    c_id,
-                    datastore_sync.is_none()
-                );
+                // eprintln!(
+                //     "ToAppData::ReadData({}) when DStore synced: {}",
+                //     c_id,
+                //     datastore_sync.is_none()
+                // );
                 //TODO: find a way to decide if we are completely synced with swarm, or not
                 //      if not request to sync from any Neighbor
                 if datastore_sync.is_some() {
@@ -3701,6 +3864,7 @@ pub struct ApplicationData {
     contents: Datastore,
     hash_to_temp_idx: HashMap<u64, u16>,
     partial_data: HashMap<u16, (Vec<u64>, HashMap<u64, Data>)>,
+    disk_root_hash: u64,
 }
 
 impl ApplicationData {
@@ -3719,7 +3883,7 @@ impl ApplicationData {
             contents: Datastore::new(app_type),
             hash_to_temp_idx: HashMap::new(),
             partial_data: HashMap::new(),
-            // used_memory_slots: 0,
+            disk_root_hash: 0,
         }
     }
 
@@ -3860,6 +4024,9 @@ impl ApplicationData {
         }
     }
 
+    pub fn set_disk_hash(&mut self) {
+        self.disk_root_hash = self.root_hash();
+    }
     pub fn root_hash(&self) -> u64 {
         self.contents.hash()
     }
@@ -4061,7 +4228,11 @@ fn get_root_hash(hashes: &Vec<u64>) -> u64 {
         get_root_hash(&sub_hashes)
     }
 }
-async fn start_a_timer(sender: ASender<ToAppMgr>, timeout_type: TimeoutType, timeout: Duration) {
+pub async fn start_a_timer(
+    sender: ASender<ToAppMgr>,
+    timeout_type: TimeoutType,
+    timeout: Duration,
+) {
     // let timeout = Duration::from_secs(5);
     sleep(timeout).await;
     eprintln!("Timeout for {:?} is over", timeout_type);
