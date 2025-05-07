@@ -72,6 +72,7 @@ pub mod prelude {
     pub use crate::ApplicationManager;
     pub use crate::Configuration;
     pub use crate::ToApp;
+    pub use gnome::prelude::sha_hash;
     pub use gnome::prelude::CastData;
     pub use gnome::prelude::GnomeId;
     pub use gnome::prelude::Nat;
@@ -1402,6 +1403,7 @@ async fn serve_app_data(
     to_app_mgr_send: ASender<ToAppMgr>,
 ) {
     let mut s_storage = PathBuf::new();
+    let mut missing_pages = (0, HashMap::new());
     // TODO: Understand & implement Tiny Pointers for efficient data storage in RAM
     // TODO: RAM management
     // We will receive a maximum number of page slots available to us.
@@ -1560,7 +1562,7 @@ async fn serve_app_data(
                 }
             }
             ToAppData::AppendShelledDatas(c_id, hash_data, data_vec) => {
-                // eprintln!("evaluating AppendShelledDatas");
+                eprintln!("evaluating AppendShelledDatas");
                 if let Ok((_d_type, pre_hash)) = app_data.content_root_hash(c_id) {
                     //TODO: here we need to calculate root hash
                     let mut c = app_data.shell(c_id).unwrap();
@@ -1592,6 +1594,7 @@ async fn serve_app_data(
                     );
                     let parts = msg.into_parts();
                     for part in parts {
+                        eprintln!("ToGnome::AddData");
                         let _ = to_gnome_sender.send(ToGnome::AddData(part));
                     }
                     let reqs = SyncRequirements {
@@ -1611,6 +1614,7 @@ async fn serve_app_data(
                         // eprintln!("Parts count: {}", parts.len());
                         for part in parts {
                             // eprintln!("SyncData len: {}", part.len());
+                            eprintln!("ToGnome::AddData 2");
                             let _ = to_gnome_sender.send(ToGnome::AddData(part));
                         }
                     }
@@ -1916,6 +1920,7 @@ async fn serve_app_data(
                     );
                     let parts = msg.into_parts();
                     for part in parts {
+                        eprintln!("ToGnome::AddData");
                         let _ = to_gnome_sender.send(ToGnome::AddData(part));
                     }
 
@@ -1938,6 +1943,7 @@ async fn serve_app_data(
                         );
                         let parts = msg.into_parts();
                         for part in parts {
+                            eprintln!("ToGnome::AddData 2");
                             let _ = to_gnome_sender.send(ToGnome::AddData(part));
                         }
                     }
@@ -2374,7 +2380,7 @@ async fn serve_app_data(
                         }
                     }
                     SyncMessageType::ChangeContent(d_type, c_id) => {
-                        // println!("ChangeContent");
+                        eprintln!("ChangeContent {} (chunks len: {})", c_id, data.len() >> 3);
                         //TODO: we need to verify we actually can change content
                         // this is possible only if existing and new d_types match
                         // or if existing d_type is Link
@@ -2384,22 +2390,36 @@ async fn serve_app_data(
                         }
                         //TODO: take 8-byte hashes from data and push Data::empty(hash)
                         // to new Content
+                        // We need to inform AppMgr about how many pages are missing
+                        // (and possibly their ids and hashes)
+                        let old_missing_pages =
+                            std::mem::replace(&mut missing_pages, (c_id, HashMap::new()));
+                        if !old_missing_pages.1.is_empty() {
+                            eprintln!(
+                                "Old ChangeContent procedure not complete! ({})",
+                                old_missing_pages.1.len()
+                            );
+                        }
                         let bytes = data.bytes();
                         let mut byte_groups_iter = bytes.chunks_exact(8);
-                        let new_data_len = byte_groups_iter.len() as u16;
+                        // let new_data_len = byte_groups_iter.len() as u16;
                         let first_hash = u64::from_be_bytes(
                             byte_groups_iter.next().unwrap().try_into().unwrap(),
                         );
                         let mut new_hashes = vec![first_hash];
-                        // eprintln!("New content\n{}", first_hash);
+                        missing_pages.1.insert(first_hash, 0);
+                        eprintln!("New content\n{}", first_hash);
                         let mut new_content =
                             Content::from(d_type, Data::empty(first_hash)).unwrap();
                         // eprintln!("New content hash: {}", new_content.hash());
+                        let mut i = 1;
                         while let Some(bytes_group) = byte_groups_iter.next() {
                             let hash = u64::from_be_bytes(bytes_group.try_into().unwrap());
-                            // eprintln!("push: {}", hash);
+                            eprintln!("push: {}", hash);
                             let _ = new_content.push_data(Data::empty(hash));
                             new_hashes.push(hash);
+                            missing_pages.1.insert(hash, i);
+                            i += 1;
                             // let d_hashes = new_content.data_hashes();
                             // for d_hash in d_hashes {
                             // eprintln!("NCDH: {:?}", d_hashes);
@@ -2432,6 +2452,7 @@ async fn serve_app_data(
                                             "Restoring Page {}-{} from existing data",
                                             c_id, d_id
                                         );
+                                        missing_pages.1.remove(hash);
                                         let _ = app_data.update_data(c_id, d_id as u16, data);
                                     }
                                 }
@@ -2440,14 +2461,16 @@ async fn serve_app_data(
                                 } else {
                                     Some(Data::empty(first_hash))
                                 };
-                                let _to_mgr_res = to_app_mgr_send
-                                    .send(ToAppMgr::ContentChanged(
-                                        swarm_id,
-                                        c_id,
-                                        d_type,
-                                        main_page_option,
-                                    ))
-                                    .await;
+                                if missing_pages.1.is_empty() {
+                                    let _to_mgr_res = to_app_mgr_send
+                                        .send(ToAppMgr::ContentChanged(
+                                            swarm_id,
+                                            c_id,
+                                            d_type,
+                                            main_page_option,
+                                        ))
+                                        .await;
+                                }
                                 let hash = app_data.root_hash();
                                 // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
                                 eprintln!("ChangeContent completed successfully ({})", hash);
@@ -2592,6 +2615,7 @@ async fn serve_app_data(
                         //     eprintln!("hash2: {}", bot);
                         // }
                         let main_page_option = if d_id == 0 { Some(data.clone()) } else { None };
+                        let data_hash = data.get_hash();
                         let res = app_data.update_data(c_id, d_id, data);
                         if let Ok(updated_data) = res {
                             if !requirements.post_validate(c_id, &app_data) {
@@ -2601,18 +2625,32 @@ async fn serve_app_data(
                                 eprintln!("Restore result: {:?}", res);
                             } else {
                                 let hash = app_data.root_hash();
+                                if missing_pages.0 == c_id {
+                                    missing_pages.1.remove(&data_hash);
+                                    if missing_pages.1.is_empty() {
+                                        let _to_mgr_res = to_app_mgr_send
+                                            .send(ToAppMgr::ContentChanged(
+                                                swarm_id,
+                                                c_id,
+                                                d_type,
+                                                main_page_option,
+                                            ))
+                                            .await;
+                                    }
+                                } else {
+                                    let _to_mgr_res = to_app_mgr_send
+                                        .send(ToAppMgr::ContentChanged(
+                                            swarm_id,
+                                            c_id,
+                                            d_type,
+                                            main_page_option,
+                                        ))
+                                        .await;
+                                }
                                 // eprintln!("Sending updated hash: {}", hash);
                                 // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
                                 // eprintln!("Send res: {:?}", res);
                                 eprintln!("Data updated successfully ({})", hash);
-                                let _to_mgr_res = to_app_mgr_send
-                                    .send(ToAppMgr::ContentChanged(
-                                        swarm_id,
-                                        c_id,
-                                        d_type,
-                                        main_page_option,
-                                    ))
-                                    .await;
                             }
                         } else {
                             eprintln!("UpdateData failed: {}", res.err().unwrap());
@@ -3343,14 +3381,16 @@ async fn serve_app_data(
                                             }
                                         } else if data_type < DataType::Link {
                                             // eprintln!("Create new Data");
-                                            let _ = to_app_mgr_send
-                                                .send(ToAppMgr::ContentAdded(
-                                                    swarm_id,
-                                                    c_id,
-                                                    data_type,
-                                                    data.clone(),
-                                                ))
-                                                .await;
+                                            if c_id > 0 {
+                                                let _ = to_app_mgr_send
+                                                    .send(ToAppMgr::ContentAdded(
+                                                        swarm_id,
+                                                        c_id,
+                                                        data_type,
+                                                        data.clone(),
+                                                    ))
+                                                    .await;
+                                            }
                                             let _res = app_data.update(
                                                 c_id,
                                                 Content::Data(
@@ -3424,14 +3464,15 @@ async fn serve_app_data(
                 }
             }
             ToAppData::ReadData(c_id) => {
-                // eprintln!(
-                //     "ToAppData::ReadData({}) when DStore synced: {}",
-                //     c_id,
-                //     datastore_sync.is_none()
-                // );
+                eprintln!(
+                    "ToAppData::ReadData({}) when DStore synced: {}",
+                    c_id,
+                    datastore_sync.is_none()
+                );
                 //TODO: find a way to decide if we are completely synced with swarm, or not
                 //      if not request to sync from any Neighbor
                 if datastore_sync.is_some() {
+                    eprintln!("Not synced");
                     let _ = to_app_mgr_send
                         .send(ToAppMgr::ReadError(
                             swarm_id,
@@ -3443,6 +3484,7 @@ async fn serve_app_data(
                 }
                 let type_and_len_result = app_data.get_type_and_len(c_id);
                 if type_and_len_result.is_err() {
+                    eprintln!("Unable to get type and len");
                     let error = type_and_len_result.err().unwrap();
                     let _ = to_app_mgr_send
                         .send(ToAppMgr::ReadError(swarm_id, c_id, error))
@@ -3464,6 +3506,7 @@ async fn serve_app_data(
                 } else {
                     let error = all_data_result.err().unwrap();
                     if matches!(error, AppError::ContentEmpty) {
+                        eprintln!("got ContentEmpty");
                         let sync_requests: Vec<SyncRequest> =
                             vec![SyncRequest::AllPages(vec![c_id])];
                         let _ = to_gnome_sender.send(ToGnome::AskData(

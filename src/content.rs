@@ -1,9 +1,9 @@
 use gnome::prelude::*;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::hash::DefaultHasher;
+// use std::hash::DefaultHasher;
 use std::hash::Hash;
-use std::hash::Hasher;
+// use std::hash::Hasher;
 
 use crate::error::SubtreeError;
 use crate::prelude::AppError;
@@ -1128,8 +1128,8 @@ impl ContentTree {
             }
             Self::Hashed(sub_tree) => sub_tree.replace(idx, new_data),
             Self::Empty(hash) => {
-                // eprintln!("Existing hash: {}", hash);
-                // eprintln!("New data hash: {} {}", new_data.get_hash(), new_data.hash());
+                eprintln!("Existing hash: {}", hash);
+                eprintln!("New data hash: {} {}", new_data.get_hash(), new_data.hash());
                 let new_hash = new_data.hash();
                 if idx == 0 && *hash == new_hash {
                     *self = Self::Filled(new_data);
@@ -1430,9 +1430,10 @@ impl Subtree {
     }
 
     pub fn hash(&mut self) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        [self.left.hash(), self.right.hash()].hash(&mut hasher);
-        self.hash = hasher.finish();
+        // let mut hasher = DefaultHasher::new();
+        // [self.left.hash(), self.right.hash()].hash(&mut hasher);
+        // self.hash = hasher.finish();
+        self.hash = double_hash(self.left.hash(), self.right.hash());
         self.hash
     }
     pub fn get_data_hash(&self, idx: u16) -> Result<u64, AppError> {
@@ -1581,7 +1582,15 @@ impl Subtree {
 }
 
 pub fn double_hash(num_one: u64, num_two: u64) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    [num_one, num_two].hash(&mut hasher);
-    hasher.finish()
+    // let mut hasher = DefaultHasher::new();
+    // [num_one, num_two].hash(&mut hasher);
+    // hasher.finish()
+    let mut bytes = Vec::with_capacity(16);
+    for byte in num_one.to_be_bytes() {
+        bytes.push(byte);
+    }
+    for byte in num_two.to_be_bytes() {
+        bytes.push(byte);
+    }
+    sha_hash(&bytes)
 }

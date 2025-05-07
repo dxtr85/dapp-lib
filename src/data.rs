@@ -1,9 +1,10 @@
 // use crate::BlockID;
-use std::hash::{DefaultHasher, Hasher};
-use std::{fmt, hash::Hash};
-
+use gnome::prelude::sha_hash;
 use gnome::prelude::CastData;
 use gnome::prelude::SyncData;
+// use std::hash::{DefaultHasher, Hasher};
+// use std::{fmt, hash::Hash};
+use std::fmt;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Data(u64, Vec<u8>);
@@ -17,9 +18,9 @@ impl Data {
         // let mut with_prefix = vec![0, 0, 0, 0];
         // with_prefix.append(&mut contents);
         // Ok(Self(with_prefix))
-        let mut hasher = DefaultHasher::new();
-        contents.hash(&mut hasher);
-        Ok(Self(hasher.finish(), contents))
+
+        // Ok(Self(hasher.finish(), contents))
+        Ok(Self(sha_hash(&contents), contents))
     }
 
     pub fn empty(hash: u64) -> Self {
@@ -65,9 +66,10 @@ impl Data {
         self.0
     }
     pub fn hash(&mut self) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        self.1.hash(&mut hasher);
-        let hash = hasher.finish();
+        // let mut hasher = DefaultHasher::new();
+        // self.1.hash(&mut hasher);
+        // let hash = hasher.finish();
+        let hash = sha_hash(&self.1);
         self.0 = hash;
         hash
     }
