@@ -11,6 +11,7 @@ pub struct Configuration {
     pub storage: PathBuf,
     pub neighbors: Option<Vec<NetworkSettings>>,
     pub max_connected_swarms: u8,
+    pub upload_bandwidth: u64,
 }
 
 impl Configuration {
@@ -23,12 +24,14 @@ impl Configuration {
             None
         };
         let mut max_connected_swarms = 8;
+        let mut upload_bandwidth = 8192;
         if !conf_path.exists() {
             return Configuration {
                 work_dir: dir.clone(),
                 storage: dir.join("storage"),
                 neighbors,
                 max_connected_swarms,
+                upload_bandwidth,
             };
         }
         let lines_iter = read_lines(conf_path).unwrap().into_iter();
@@ -52,6 +55,17 @@ impl Configuration {
                             }
                         }
                     }
+                    "MAX_UPLOAD_BYTES_PER_SECOND" => {
+                        if let Some(number_str) = split.next() {
+                            if let Ok(number) = u64::from_str_radix(number_str, 10) {
+                                eprintln!(
+                                    "Updating MAX_UPLOAD_BYTES_PER_SECOND from {} to {}",
+                                    upload_bandwidth, number
+                                );
+                                upload_bandwidth = number;
+                            }
+                        }
+                    }
                     other => {
                         eprintln!("Unrecognized config line: {}", other);
                     }
@@ -63,6 +77,7 @@ impl Configuration {
             storage: dir.join("storage"),
             neighbors,
             max_connected_swarms,
+            upload_bandwidth,
         }
     }
 }

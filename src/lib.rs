@@ -304,7 +304,9 @@ pub async fn initialize(
     // init function
     // let neighbors =
     // let (gmgr_send, gmgr_recv, my_id) = init(config_dir, config.neighbors);
-    let (gmgr_send, gmgr_recv, my_id) = init(config_dir, Some(neighbors)).await;
+    let bandwidth_per_swarm = config.upload_bandwidth / config.max_connected_swarms as u64;
+    let (gmgr_send, gmgr_recv, my_id) =
+        init(config_dir, Some(neighbors), bandwidth_per_swarm).await;
     spawn(serve_app_manager(
         config,
         gmgr_send,
