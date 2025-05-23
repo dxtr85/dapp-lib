@@ -141,6 +141,7 @@ pub enum TimeoutType {
     Cooldown,
     NewSwarmsAvailable,
     PeriodicalCheckForNewSwarms,
+    StartOwnSwarm,
 }
 
 #[derive(Debug)]
@@ -646,6 +647,11 @@ async fn serve_app_manager(
                     // }
                 }
                 ToAppMgr::TimeoutOver(t_type) => match t_type {
+                    TimeoutType::StartOwnSwarm => {
+                        let _ = to_gnome_mgr
+                            .send(ToGnomeManager::JoinSwarm(my_name.clone(), None))
+                            .await;
+                    }
                     TimeoutType::Cooldown => {
                         app_mgr.cooldown_over();
                         // TODO: use timeout to Join/Leave a new swarm
@@ -716,6 +722,13 @@ async fn serve_app_manager(
                         }
                         FromGnomeManager::SwarmFounderDetermined(swarm_id, s_name) => {
                             eprintln!("SwarmFounderDet {}: {}", swarm_id, s_name.founder);
+                            if s_name.founder != my_name.founder {
+                                spawn(start_a_timer(
+                                    to_app_mgr.clone(),
+                                    TimeoutType::StartOwnSwarm,
+                                    Duration::from_millis(5000),
+                                ));
+                            }
                             app_mgr.update_app_data_founder(swarm_id, s_name);
 
                             // This is in order to trigger initial home swarm activation
