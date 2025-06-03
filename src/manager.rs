@@ -72,6 +72,10 @@ impl SwapState {
         // );
         self.running_swarms.len() < self.max_swarms
     }
+    pub fn quit(&mut self) {
+        eprintln!("JS: Quit, curr SwapProcess: {:?}", self.process);
+        self.process = SwapProcess::Idle;
+    }
     fn swarm_to_join(&mut self) -> Option<SwarmName> {
         //TODO: AppMgr should hold a list of names that Application layer wants to get
         // connected
@@ -155,12 +159,14 @@ impl ApplicationManager {
         match prev_swap_state {
             SwapProcess::Joining(js_name) => {
                 if s_name != js_name {
+                    eprintln!("JS: Joined {}, expected {}", s_name, js_name);
                     self.swap_state.process = SwapProcess::Joining(js_name);
                 } else {
-                    eprintln!("Reseting SwapProcess");
+                    eprintln!("JS: Reseting SwapProcess");
                 }
             }
             other => {
+                eprintln!("JS: Restoring to {:?}", other);
                 self.swap_state.process = other;
             }
         }
@@ -272,15 +278,20 @@ impl ApplicationManager {
 
         match prev_swap_state {
             SwapProcess::Cooldown => {
-                eprintln!("Swap cooldown is over");
+                eprintln!("JS: Swap cooldown is over");
             }
             other => {
-                eprintln!("Cooldown over when in state: {:?}", other);
+                eprintln!("JS: Cooldown over when in state: {:?}", other);
                 self.swap_state.process = other;
             }
         }
     }
-    pub async fn swarm_disconnected(&mut self, s_id: SwarmID, s_name: SwarmName) {
+    pub async fn swarm_disconnected(
+        &mut self,
+        s_id: SwarmID,
+        s_name: SwarmName,
+        has_neighbors: bool,
+    ) {
         // 1 update process value from Leaving to Idle
         self.swap_state.running_swarms.remove(&s_id);
         let prev_swap_state = std::mem::replace(&mut self.swap_state.process, SwapProcess::Idle);
@@ -288,12 +299,14 @@ impl ApplicationManager {
         match prev_swap_state {
             SwapProcess::Leaving(leave_id) => {
                 if leave_id != s_id {
+                    eprintln!("JS: Left {}, expected: {}", s_id, leave_id);
                     self.swap_state.process = SwapProcess::Leaving(leave_id);
-                } else {
+                } else if has_neighbors {
                     if self.swap_state.any_swap_slot_available() {
                         eprintln!("> We should start a cooldown period before");
                         eprintln!("> joining another swarm in order for");
                         eprintln!("> Networking to settle down");
+                        eprintln!("JS: Start Cooldown");
                         self.swap_state.process = SwapProcess::Cooldown;
                         //TODO: gnome manager should take care of this instead,
                         spawn(start_a_timer(
@@ -308,12 +321,14 @@ impl ApplicationManager {
             }
             SwapProcess::Joining(join_name) => {
                 if join_name != s_name {
+                    eprintln!("JS: Joining {} disconnected: {}", join_name, s_name);
                     self.swap_state.process = SwapProcess::Joining(join_name);
                 } else {
-                    eprintln!("Reseting SwapProcess after Joining");
+                    eprintln!("JS: Reseting SwapProcess after Joining");
                 }
             }
             other => {
+                eprintln!("JS: Restoring prev state: {:?}", other);
                 self.swap_state.process = other;
             }
         }
@@ -330,17 +345,36 @@ impl ApplicationManager {
         //3 if swarm is on untouchables list, add it on top of
         // list of swarms to join from app
         if self.is_untouchable(s_id) {
-            self.swap_state.to_join.push(s_name.clone());
+            spawn(start_a_timer(
+                self.to_app_mgr.clone(),
+                TimeoutType::AddToWaitList(s_name.clone()),
+                Duration::from_millis(1024),
+            ));
+            // self.swap_state.to_join.push(s_name.clone());
         }
 
         // 4 notify user if necessary
-        eprintln!("maybe notify user?");
+        // eprintln!("maybe notify user?");
         // 5 update_swap_state
-        self.update_swap_state_after_leave(Some(s_name)).await;
+        if has_neighbors {
+            eprintln!("mgr has_neighbors");
+            self.update_swap_state_after_leave(Some(s_name)).await;
+        }
     }
 
+    pub fn add_swarm_to_wait_list(&mut self, s_name: SwarmName) {
+        self.swap_state.to_join.push(s_name);
+    }
+    pub fn reset_swap_state(&mut self) {
+        self.swap_state = SwapState {
+            max_swarms: self.swap_state.max_swarms,
+            running_swarms: HashSet::new(),
+            process: SwapProcess::Idle,
+            to_join: vec![],
+        };
+    }
     pub async fn update_swap_state_after_leave(&mut self, left_id: Option<SwarmName>) {
-        eprintln!("update_swap_state_after_leave");
+        eprintln!("update_swap_state_after_leave {:?}", left_id);
         // If some other procedure is running we quit
         if !self.swap_state.process.is_idle() {
             eprintln!("Proces not idle: {:?}", self.swap_state.process);
@@ -349,7 +383,7 @@ impl ApplicationManager {
         // if self.swap_state.is_overloaded(self.name_to_id.len()) {
         if !self.swap_state.any_swap_slot_available() {
             if let Some((_name, leave_id)) = self.ready_to_be_swapped() {
-                eprintln!("3 Set to Leaving({})", leave_id);
+                eprintln!("JS: 3 Set to Leaving({})", leave_id);
                 // self.swap_state.running_swarms.remove(&leave_id);
                 self.swap_state.process = SwapProcess::Leaving(leave_id);
                 let _ = self
@@ -361,11 +395,11 @@ impl ApplicationManager {
             // if let Some((swarm_name, neighbor_ids)) = self.swarm_to_join() {
             let mut is_joining = false;
             while let Some(swarm_name) = self.swap_state.swarm_to_join() {
-                eprintln!("1 Swarm to join: {}", swarm_name);
                 if self.name_to_id.contains_key(&swarm_name) {
                     continue;
                 }
                 is_joining = true;
+                eprintln!("JS: Swarm to join: {}", swarm_name);
                 self.swap_state.process = SwapProcess::Joining(swarm_name.clone());
                 let _ = self
                     .to_gnome_mgr
@@ -374,7 +408,7 @@ impl ApplicationManager {
                 break;
             }
             if !is_joining {
-                eprintln!("1 Waiting for GMgr to join a random swarm");
+                eprintln!("JS: Waiting for GMgr to join a random swarm");
                 self.swap_state.process = SwapProcess::WaitingForGnomeMgr;
                 let _ = self
                     .to_gnome_mgr
@@ -487,17 +521,22 @@ impl ApplicationManager {
         self.name_to_id.remove(s_name)
     }
 
+    pub fn quit(&mut self) {
+        self.swap_state.quit();
+    }
     pub fn selected_swarm(&mut self, s_name: Option<SwarmName>) {
         if !self.swap_state.process.is_waiting() {
             eprintln!(
-                "Got info from GMgr when in state {:?}",
+                "JS: Got info from GMgr when in state {:?}",
                 self.swap_state.process
             );
             return;
         }
         self.swap_state.process = if let Some(s_name) = s_name {
+            eprintln!("JS: Selected, joining {}", s_name);
             SwapProcess::Joining(s_name)
         } else {
+            eprintln!("JS: Selected, Idle");
             SwapProcess::Idle
         };
     }
