@@ -85,7 +85,7 @@ pub mod prelude {
 }
 
 pub enum ToApp {
-    ActiveSwarm(SwarmName, SwarmID), //TODO: also send Vec<Data> from CID=0(Manifest)
+    ActiveSwarm(SwarmName, SwarmID), //TODO: send Vec<Data> from CID=0(Manifest)
     Neighbors(SwarmID, Vec<GnomeId>),
     NeighborLeft(SwarmID, GnomeId),
     NewContent(SwarmID, ContentID, DataType, Data),
@@ -96,7 +96,7 @@ pub enum ToApp {
     FirstPages(SwarmID, Vec<(ContentID, DataType, Data)>),
     MyPublicIPs(Vec<(IpAddr, u16, Nat, (PortAllocationRule, i8))>),
     NameToIDMapping(HashMap<SwarmName, SwarmID>),
-    // FromPresentation(FromPresentation),
+    AllNeighborsGone,
     Disconnected(bool, SwarmID, SwarmName), //bool indicates if we try to reconnect
     Quit,
 }
@@ -133,6 +133,7 @@ pub enum ToAppMgr {
     FromGMgr(FromGnomeManager),
     QueryForNeighboringSwarms(Option<SwarmID>), // SwarmID should not be queried
     TimeoutOver(TimeoutType),
+    StorageNeighbors(Vec<(GnomeId, NetworkSettings)>),
     Quit,
 }
 
@@ -368,6 +369,11 @@ async fn serve_app_manager(
 
         while let Ok(message) = to_app_mgr_recv.recv().await {
             match message {
+                ToAppMgr::StorageNeighbors(ns) => {
+                    let _ = to_gnome_mgr
+                        .send(ToGnomeManager::StartListeningSwarm(ns))
+                        .await;
+                }
                 ToAppMgr::UploadData => {
                     let _ = app_mgr.active_app_data.1.send(ToAppData::UploadData).await;
                 }
@@ -718,9 +724,13 @@ async fn serve_app_manager(
                     // while let Ok(message) = from_gnome_mgr.recv().await {
                     match message {
                         FromGnomeManager::AllNeighborsGone => {
+                            //TODO: start a timer, if application does not provide NetworkSettings
+                            // before timeout, request starting a listening swarm
                             eprintln!("AppMgr: AllNeighborsGone");
                             has_neighbors = false;
                             app_mgr.reset_swap_state();
+                            let _ = to_user.send(ToApp::AllNeighborsGone).await;
+
                             //TODO: stop sending JoinRandom requests
                             // TODO: only send JoinSwarm with Some NetworkSettings
                             // TODO: find and send to GMgr some NetworkSettings
