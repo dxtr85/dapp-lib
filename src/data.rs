@@ -6,6 +6,9 @@ use gnome::prelude::SyncData;
 // use std::{fmt, hash::Hash};
 use std::fmt;
 
+use crate::prelude::data_to_link;
+use crate::prelude::DataType;
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Data(u64, Vec<u8>);
 impl Data {
@@ -79,4 +82,40 @@ impl fmt::Display for Data {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "[len:{:?}]", self.len())
     }
+}
+
+pub fn read_tags_and_header(d_type: DataType, data: Data) -> (Vec<u8>, String) {
+    if data.is_empty() {
+        return (vec![], String::new());
+    }
+    if d_type.is_link() {
+        let link = data_to_link(data).unwrap();
+        return (link.tag_ids(), link.description());
+        // eprintln!("Not updating Links for now");
+        // return (vec![], String::new());
+    };
+    let mut bytes = data.bytes();
+    let how_many_tags = bytes.remove(0);
+    eprintln!("We have {} tags", how_many_tags);
+    let mut tag_ids = Vec::with_capacity(how_many_tags as usize);
+    for _i in 0..how_many_tags {
+        if !bytes.is_empty() {
+            tag_ids.push(bytes.remove(0));
+        } else {
+            eprintln!("NO TAGS, This should not happen!");
+        }
+    }
+    let header = if bytes.is_empty() {
+        String::new()
+    } else {
+        String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .trim()
+            .to_string()
+    };
+    eprintln!("Hdr: {}", header);
+    (tag_ids, header)
 }

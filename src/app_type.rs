@@ -1,4 +1,4 @@
-#[derive(Debug, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub enum AppType {
     Catalog,
     //Forum,
@@ -20,6 +20,9 @@ impl AppType {
             255 => Self::Catalog,
             other => Self::Other(other),
         }
+    }
+    pub fn is_catalog(&self) -> bool {
+        matches!(self, Self::Catalog)
     }
 }
 

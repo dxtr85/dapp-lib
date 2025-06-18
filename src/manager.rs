@@ -187,6 +187,13 @@ impl ApplicationManager {
         }
         None
     }
+    pub fn get_swarm_id(&self, s_name: &SwarmName) -> Option<SwarmID> {
+        if let Some(s_state) = self.name_to_id.get(s_name) {
+            Some(s_state.s_id)
+        } else {
+            None
+        }
+    }
     pub fn number_of_connected_swarms(&self) -> u8 {
         self.name_to_id.len() as u8
     }

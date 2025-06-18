@@ -1,6 +1,8 @@
 use crate::content::data_to_link;
 use crate::prelude::SyncRequirements;
 use crate::prelude::TransformInfo;
+use crate::search::SearchMsg;
+use crate::search::SwarmLink;
 use crate::sync_message::serialize_requests;
 use std::collections::VecDeque;
 use std::net::IpAddr;
@@ -14,12 +16,16 @@ mod data;
 mod datastore;
 mod error;
 mod manager;
+mod manifest;
 mod message;
 mod registry;
+mod search;
 mod storage;
 mod sync_message;
 use app_type::AppType;
 use async_std::fs::create_dir_all;
+use manifest::Manifest;
+use search::Hit;
 // use async_std::net::ToSocketAddrs;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -31,6 +37,7 @@ use sync_message::SyncRequest;
 use sync_message::SyncResponse;
 
 use crate::content::double_hash;
+use crate::search::serve_search_engine;
 use async_std::task::sleep;
 use async_std::task::spawn;
 pub use config::Configuration;
@@ -60,17 +67,22 @@ pub mod prelude {
         data_to_link, double_hash, Content, ContentID, ContentTree, DataType, Description,
         TransformInfo,
     };
+    pub use crate::data::read_tags_and_header;
     pub use crate::data::Data;
     pub use crate::error::AppError;
     pub use crate::initialize;
+    pub use crate::manifest::Manifest;
+    pub use crate::manifest::Tag;
     pub use crate::message::SyncMessage;
     pub use crate::message::SyncMessageType;
     pub use crate::message::SyncRequirements;
+    pub use crate::search::Hit;
     pub use crate::storage::load_content_from_disk;
     pub use crate::storage::read_datastore_from_disk;
     pub use crate::ApplicationData;
     pub use crate::ApplicationManager;
     pub use crate::Configuration;
+    pub use crate::LibRequest;
     pub use crate::ToApp;
     pub use gnome::prelude::sha_hash;
     pub use gnome::prelude::CastData;
@@ -90,7 +102,7 @@ pub enum ToApp {
     NeighborLeft(SwarmID, GnomeId),
     NewContent(SwarmID, ContentID, DataType, Data),
     ContentChanged(SwarmID, ContentID, DataType, Option<Data>),
-    ReadSuccess(SwarmID, ContentID, DataType, Vec<Data>),
+    ReadSuccess(SwarmID, SwarmName, ContentID, DataType, Vec<Data>),
     ReadError(SwarmID, ContentID, AppError),
     GetCIDsForTags(SwarmID, GnomeId, Vec<u8>, Vec<(ContentID, Data)>),
     FirstPages(SwarmID, Vec<(ContentID, DataType, Data)>),
@@ -98,6 +110,8 @@ pub enum ToApp {
     NameToIDMapping(HashMap<SwarmName, SwarmID>),
     AllNeighborsGone,
     Disconnected(bool, SwarmID, SwarmName), //bool indicates if we try to reconnect
+    SearchQueries(Vec<(String, usize)>),
+    SearchResults(String, Vec<Hit>),
     Quit,
 }
 
@@ -106,13 +120,8 @@ pub enum ToAppMgr {
     CIDsForTag(SwarmID, GnomeId, u8, ContentID, Data),
     ContentLoadedFromDisk(SwarmID, ContentID, DataType, Data),
     ContentRequestedFromNeighbor(SwarmID, ContentID, DataType),
-    ReadData(SwarmID, ContentID),
-    ReadSuccess(SwarmID, ContentID, DataType, Vec<Data>),
-    ReadError(SwarmID, ContentID, AppError),
-    ReadAllFirstPages(SwarmID),
-    FirstPages(SwarmID, Vec<(ContentID, DataType, Data)>),
     UploadData,
-    SetActiveApp(SwarmName),
+    // SetActiveApp(SwarmName),
     StartUnicast,
     StartBroadcast,
     EndBroadcast,
@@ -128,15 +137,37 @@ pub enum ToAppMgr {
     ContentChanged(SwarmID, ContentID, DataType, Option<Data>),
     TransformLinkRequest(Box<SyncData>),
     ProvideGnomeToSwarmMapping,
-    SwarmSynced(SwarmID),                       //TODO: process inside AppMgr
     SwapNewSwarm(Option<(SwarmName, SwarmID)>), //TODO: process inside AppMgr
-    FromGMgr(FromGnomeManager),
     QueryForNeighboringSwarms(Option<SwarmID>), // SwarmID should not be queried
     TimeoutOver(TimeoutType),
     StorageNeighbors(Vec<(GnomeId, NetworkSettings)>),
     Quit,
+    // TODO: move above into below
+    FromGMgr(FromGnomeManager),
+    FromApp(LibRequest),
+    // FromSearch(LibRequest),
+    FromDatastore(LibResponse),
 }
 
+#[derive(Debug)]
+pub enum LibRequest {
+    ReadData(SwarmID, ContentID),
+    ReadDataGlobal(SwarmName, ContentID),
+    ReadAllFirstPages(SwarmID),
+    Search(String),
+    RemoveSearch(String),
+    ListSearches,
+    GetSearchResults(String),
+    SetActiveApp(SwarmName),
+}
+#[derive(Debug)]
+pub enum LibResponse {
+    SwarmSynced(SwarmID),
+    SwarmSyncedExt(SwarmID, SwarmName, u64, ASender<ToAppData>),
+    FirstPages(SwarmID, Vec<(ContentID, DataType, Data)>),
+    ReadSuccess(SwarmID, SwarmName, ContentID, DataType, Vec<Data>),
+    ReadError(SwarmID, ContentID, AppError),
+}
 #[derive(Debug)]
 pub enum TimeoutType {
     Cooldown,
@@ -147,11 +178,17 @@ pub enum TimeoutType {
 }
 
 #[derive(Debug)]
+pub enum Requestor {
+    App,
+    Search,
+}
+
+#[derive(Debug)]
 pub enum ToAppData {
     Response(GnomeToApp),
-    ReadData(ContentID),
+    ReadData(Requestor, ContentID),
     SendFirstPage(GnomeId, ContentID, Data),
-    ReadAllFirstPages,
+    ReadAllFirstPages(Requestor),
     UploadData,
     StartUnicast,
     StartBroadcast,
@@ -310,13 +347,20 @@ pub async fn initialize(
     let bandwidth_per_swarm = config.upload_bandwidth / config.max_connected_swarms as u64;
     let (gmgr_send, gmgr_recv, my_id) =
         init(config_dir, Some(neighbors), bandwidth_per_swarm).await;
+    let (to_search_engine_send, to_search_engine_recv) = achannel::unbounded();
     spawn(serve_app_manager(
         config,
         gmgr_send,
         gmgr_recv,
-        to_user_send,
+        to_user_send.clone(),
         to_app_mgr_send,
         to_app_mgr_recv,
+        to_search_engine_send,
+    ));
+    spawn(serve_search_engine(
+        to_user_send,
+        // to_app_mgr_send,
+        to_search_engine_recv,
     ));
     my_id
 }
@@ -330,6 +374,7 @@ async fn serve_app_manager(
     to_user: ASender<ToApp>,
     to_app_mgr: ASender<ToAppMgr>,
     to_app_mgr_recv: AReceiver<ToAppMgr>,
+    to_search_enigne: ASender<SearchMsg>,
 ) {
     // TODO: AppMgr should hold state
     // We need to define a total number of Pages that can be stored in memory.
@@ -377,19 +422,65 @@ async fn serve_app_manager(
                 ToAppMgr::UploadData => {
                     let _ = app_mgr.active_app_data.1.send(ToAppData::UploadData).await;
                 }
-                ToAppMgr::ReadData(s_id, c_id) => {
+                ToAppMgr::FromApp(LibRequest::Search(phrase)) => {
+                    to_search_enigne.send(SearchMsg::AddQuery(phrase)).await;
+                }
+                ToAppMgr::FromApp(LibRequest::RemoveSearch(phrase)) => {
+                    to_search_enigne.send(SearchMsg::DelQuery(phrase)).await;
+                }
+                ToAppMgr::FromApp(LibRequest::ListSearches) => {
+                    to_search_enigne.send(SearchMsg::ListQueries).await;
+                }
+                ToAppMgr::FromApp(LibRequest::GetSearchResults(phrase)) => {
+                    to_search_enigne.send(SearchMsg::GetResults(phrase)).await;
+                }
+                ToAppMgr::FromApp(LibRequest::ReadData(s_id, c_id)) => {
                     if let Some(to_app_data) = app_mgr.app_data_store.get(&s_id) {
-                        let _ = to_app_data.send(ToAppData::ReadData(c_id)).await;
+                        let _ = to_app_data
+                            .send(ToAppData::ReadData(Requestor::App, c_id))
+                            .await;
                     }
                 }
-                ToAppMgr::ReadAllFirstPages(s_id) => {
-                    //TODO
-                    if let Some(to_app_data) = app_mgr.app_data_store.get(&s_id) {
-                        let _ = to_app_data.send(ToAppData::ReadAllFirstPages).await;
+                ToAppMgr::FromApp(LibRequest::ReadDataGlobal(s_name, c_id)) => {
+                    eprintln!("App sent ReadData request for {}-{}", s_name, c_id);
+                    if let Some(s_id) = app_mgr.get_swarm_id(&s_name) {
+                        if let Some(to_app_data) = app_mgr.app_data_store.get(&s_id) {
+                            let _ = to_app_data
+                                .send(ToAppData::ReadData(Requestor::App, c_id))
+                                .await;
+                        } else {
+                            eprintln!("Could not find sender for {}", s_name);
+                        }
+                    } else {
+                        eprintln!("{} not attached to gnome", s_name);
+                        //TODO: read from storage or request join
                     }
                 }
-                ToAppMgr::FirstPages(s_id, first_pages) => {
+                ToAppMgr::FromApp(LibRequest::ReadAllFirstPages(s_id)) => {
+                    if let Some(to_app_data) = app_mgr.app_data_store.get(&s_id) {
+                        let _ = to_app_data
+                            .send(ToAppData::ReadAllFirstPages(Requestor::App))
+                            .await;
+                    }
+                }
+                // ToAppMgr::FromSearch(LibRequest::ReadAllFirstPages(s_id)) => {
+                //     if let Some(to_app_data) = app_mgr.app_data_store.get(&s_id) {
+                //         let _ = to_app_data
+                //             .send(ToAppData::ReadAllFirstPages(Requestor::Search))
+                //             .await;
+                //     }
+                // }
+                ToAppMgr::FromDatastore(LibResponse::FirstPages(s_id, first_pages)) => {
+                    // match requestor {
+                    //     Requestor::App => {
                     let _ = to_user.send(ToApp::FirstPages(s_id, first_pages)).await;
+                    //     }
+                    //     Requestor::Search => {
+                    //         let _ = to_search_enigne
+                    //             .send(SearchMsg::FirstPages(s_id, first_pages))
+                    //             .await;
+                    //     }
+                    // }
                 }
                 ToAppMgr::GetCIDsForTags(swarm_id, n_id, tags, all_first_pages) => {
                     eprintln!("We are requesting tags {:?} for {:?} swarm", tags, swarm_id);
@@ -406,13 +497,38 @@ async fn serve_app_manager(
                             .await;
                     }
                 }
-                ToAppMgr::ReadSuccess(s_id, c_id, dtype, data_vec) => {
+                // ToAppMgr::ReadSuccess(s_id, c_id, dtype, data_vec) => {
+                ToAppMgr::FromDatastore(LibResponse::ReadSuccess(
+                    s_id,
+                    s_name,
+                    c_id,
+                    dtype,
+                    data_vec,
+                )) => {
+                    // match requestor {
+                    //     Requestor::App => {
                     let _ = to_user
-                        .send(ToApp::ReadSuccess(s_id, c_id, dtype, data_vec))
+                        .send(ToApp::ReadSuccess(s_id, s_name, c_id, dtype, data_vec))
                         .await;
+                    //     }
+                    //     Requestor::Search => {
+                    //         let _ = to_search_enigne
+                    //             .send(SearchMsg::ReadSuccess(s_name, c_id, dtype, data_vec))
+                    //             .await;
+                    //     }
+                    // }
                 }
-                ToAppMgr::ReadError(s_id, c_id, error) => {
+                ToAppMgr::FromDatastore(LibResponse::ReadError(s_id, c_id, error)) => {
+                    // match requestor {
+                    //     Requestor::App => {
                     let _ = to_user.send(ToApp::ReadError(s_id, c_id, error)).await;
+                    //     }
+                    //     Requestor::Search => {
+                    //         let _ = to_search_enigne
+                    //             .send(SearchMsg::ReadError(s_id, c_id, error))
+                    //             .await;
+                    //     }
+                    // }
                 }
                 ToAppMgr::TransformLinkRequest(boxed_s_data) => {
                     let _ = app_mgr
@@ -421,7 +537,7 @@ async fn serve_app_manager(
                         .send(ToAppData::TransformLinkRequest(*boxed_s_data))
                         .await;
                 }
-                ToAppMgr::SetActiveApp(swarm_name) => {
+                ToAppMgr::FromApp(LibRequest::SetActiveApp(swarm_name)) => {
                     eprintln!("SetActiveApp req");
                     if let Ok(s_id) = app_mgr.set_active(&swarm_name) {
                         let _ = to_user.send(ToApp::ActiveSwarm(swarm_name, s_id)).await;
@@ -535,7 +651,9 @@ async fn serve_app_manager(
                     } else {
                         // eprintln!("Not informing user about Manifest in {:?}", s_id);
                         if let Some(to_app_data) = app_mgr.app_data_store.get(&s_id) {
-                            let _ = to_app_data.send(ToAppData::ReadData(c_id)).await;
+                            let _ = to_app_data
+                                .send(ToAppData::ReadData(Requestor::App, c_id))
+                                .await;
                         }
                     }
                 }
@@ -562,7 +680,13 @@ async fn serve_app_manager(
                         .send(ToApp::NameToIDMapping(app_mgr.get_mapping()))
                         .await;
                 }
-                ToAppMgr::SwarmSynced(s_id) => {
+                ToAppMgr::FromDatastore(
+                    // _requestor,
+                    LibResponse::SwarmSyncedExt(s_id, s_name, root_hash, appdata_sender),
+                ) => {
+                    eprintln!("Unexpected SwarmSyncedExt message");
+                }
+                ToAppMgr::FromDatastore(LibResponse::SwarmSynced(s_id)) => {
                     app_mgr.swarm_synced(s_id).await;
                     // eprintln!("SwarmSynced {}", s_id);
                     // if !own_swarm_activated && own_swarm_started {
@@ -648,6 +772,14 @@ async fn serve_app_manager(
                     //     }
                     // }
                 }
+                // ToAppMgr::FromSearch(LibRequest::ReadData(s_id, c_id)) => {
+                //     //TODO: send request to datastore
+                //     if let Some(to_app_data) = app_mgr.app_data_store.get(&s_id) {
+                //         let _ = to_app_data
+                //             .send(ToAppData::ReadData(Requestor::Search, c_id))
+                //             .await;
+                //     }
+                // }
                 ToAppMgr::TimeoutOver(t_type) => match t_type {
                     TimeoutType::AddToWaitList(s_name) => {
                         app_mgr.add_swarm_to_wait_list(s_name);
@@ -1052,7 +1184,7 @@ async fn serve_app_manager(
                             // TODO: we need a bi-directional communication between
                             // AppMgr and each AppData
                             // TODO: we need a bi-directional comm between AppMgr and user App
-                            let (to_app_data_send, to_app_data_recv) = achannel::bounded(32);
+                            let (to_app_data_send, to_app_data_recv) = achannel::unbounded();
                             app_mgr.add_app_data(s_name.clone(), s_id, to_app_data_send.clone());
                             // TODO: build an algorithm that decides how many pages should be provisioned
                             let max_pages_in_memory = 32768;
@@ -1067,6 +1199,7 @@ async fn serve_app_manager(
                                 to_app_data_recv,
                                 to_swarm,
                                 to_app_mgr.clone(),
+                                to_search_enigne.clone(),
                             ));
                             spawn(serve_swarm(
                                 Duration::from_millis(64),
@@ -1457,6 +1590,7 @@ async fn serve_app_data(
     app_data_recv: AReceiver<ToAppData>,
     to_gnome_sender: Sender<ToGnome>,
     to_app_mgr_send: ASender<ToAppMgr>,
+    to_search_enigne: ASender<SearchMsg>,
 ) {
     let mut s_storage = PathBuf::new();
     let mut missing_pages = (0, HashMap::new());
@@ -1513,6 +1647,7 @@ async fn serve_app_data(
     //       and if so, which parts of it (maybe all?)
     //       This should be merged with application logic
     let mut store_on_disk = false;
+    let mut swarm_name = SwarmName::new(GnomeId::any(), "".to_string()).unwrap();
     eprintln!("Storage root app data: {:?}", storage);
     let mut b_cast_origin: Option<(CastID, Sender<CastData>)> = None;
     let mut link_with_transform_info: Option<ContentID> = None;
@@ -1527,6 +1662,7 @@ async fn serve_app_data(
             // TODO: We should always assume to be out of sync
             ToAppData::SwarmReady(s_name, am_i_founder) => {
                 i_am_founder = am_i_founder;
+                swarm_name = s_name.clone();
                 s_storage = storage.join(s_name.to_path());
                 let dsync_store = s_storage.join("datastore.sync");
                 if dsync_store.exists() {
@@ -2317,7 +2453,7 @@ async fn serve_app_data(
                     eprintln!("SFP Main page of {} sent successfully.", c_id,);
                 }
             }
-            ToAppData::ReadAllFirstPages => {
+            ToAppData::ReadAllFirstPages(requestor) => {
                 let mut first_pages_vec = vec![];
                 let last_idx = if let Some(idx) = app_data.next_c_id() {
                     idx
@@ -2333,9 +2469,26 @@ async fn serve_app_data(
                         }
                     }
                 }
-                let _ = to_app_mgr_send
-                    .send(ToAppMgr::FirstPages(swarm_id, first_pages_vec))
-                    .await;
+                match requestor {
+                    Requestor::App => {
+                        let _ = to_app_mgr_send
+                            .send(ToAppMgr::FromDatastore(
+                                // requestor,
+                                LibResponse::FirstPages(swarm_id, first_pages_vec),
+                            ))
+                            .await;
+                    }
+                    Requestor::Search => {
+                        eprintln!("Sending reply to Search engine");
+                        to_search_enigne
+                            .send(SearchMsg::FirstPages(
+                                swarm_id,
+                                swarm_name.clone(),
+                                first_pages_vec,
+                            ))
+                            .await;
+                    }
+                }
             }
             ToAppData::Response(GnomeToApp::Block(_id, data)) => {
                 // println!("Processing data...");
@@ -3315,8 +3468,29 @@ async fn serve_app_data(
                                             max_pages_in_memory
                                         );
                                         let _ = to_app_mgr_send
-                                            .send(ToAppMgr::SwarmSynced(swarm_id))
+                                            .send(ToAppMgr::FromDatastore(
+                                                // Requestor::App,
+                                                LibResponse::SwarmSynced(swarm_id),
+                                            ))
                                             .await;
+                                        if app_data.app_type.is_catalog() {
+                                            let max_cid = if let Some(c_id) = app_data.next_c_id() {
+                                                c_id - 1
+                                            } else {
+                                                u16::MAX
+                                            };
+                                            let s_link = SwarmLink {
+                                                s_name: swarm_name.clone(),
+                                                max_cid,
+                                                sender: app_data_send.clone(),
+                                                root_hash: app_data.root_hash(),
+                                                s_descr: String::new(),
+                                                s_tags: HashMap::new(),
+                                            };
+                                            to_search_enigne
+                                                .send(SearchMsg::SwarmSynced(swarm_id, s_link))
+                                                .await;
+                                        }
                                     } else {
                                         eprintln!("Datastore is synced, why sent this?");
                                     }
@@ -3519,7 +3693,7 @@ async fn serve_app_data(
                     }
                 }
             }
-            ToAppData::ReadData(c_id) => {
+            ToAppData::ReadData(requestor, c_id) => {
                 eprintln!(
                     "ToAppData::ReadData({}) when DStore synced: {}",
                     c_id,
@@ -3530,10 +3704,9 @@ async fn serve_app_data(
                 if datastore_sync.is_some() {
                     eprintln!("Not synced");
                     let _ = to_app_mgr_send
-                        .send(ToAppMgr::ReadError(
-                            swarm_id,
-                            c_id,
-                            AppError::AppDataNotSynced,
+                        .send(ToAppMgr::FromDatastore(
+                            // requestor,
+                            LibResponse::ReadError(swarm_id, c_id, AppError::AppDataNotSynced),
                         ))
                         .await;
                     continue;
@@ -3543,7 +3716,10 @@ async fn serve_app_data(
                     eprintln!("Unable to get type and len");
                     let error = type_and_len_result.err().unwrap();
                     let _ = to_app_mgr_send
-                        .send(ToAppMgr::ReadError(swarm_id, c_id, error))
+                        .send(ToAppMgr::FromDatastore(
+                            // requestor,
+                            LibResponse::ReadError(swarm_id, c_id, error),
+                        ))
                         .await;
                     continue;
                 }
@@ -3552,14 +3728,25 @@ async fn serve_app_data(
                 // eprintln!("Read {}, data len: {}", c_id, len);
                 let all_data_result = app_data.get_all_data(c_id);
                 if let Ok(data_vec) = all_data_result {
+                    eprintln!("AppData Sending back contents of {}", c_id);
                     // let calculated_hash =
                     // if c_id == 0 {
                     //     eprintln!("Sending read result with {} data blocks", data_vec.len());
                     // }
                     let _ = to_app_mgr_send
-                        .send(ToAppMgr::ReadSuccess(swarm_id, c_id, t, data_vec))
+                        .send(ToAppMgr::FromDatastore(
+                            // requestor,
+                            LibResponse::ReadSuccess(
+                                swarm_id,
+                                swarm_name.clone(),
+                                c_id,
+                                t,
+                                data_vec,
+                            ),
+                        ))
                         .await;
                 } else {
+                    eprintln!("AppData error when reading contents of {}", c_id);
                     let error = all_data_result.err().unwrap();
                     if matches!(error, AppError::ContentEmpty) {
                         eprintln!("got ContentEmpty");
@@ -3574,7 +3761,10 @@ async fn serve_app_data(
                         ));
                     }
                     let _ = to_app_mgr_send
-                        .send(ToAppMgr::ReadError(swarm_id, c_id, error))
+                        .send(ToAppMgr::FromDatastore(
+                            // requestor,
+                            LibResponse::ReadError(swarm_id, c_id, error),
+                        ))
                         .await;
                 }
             }
@@ -3681,6 +3871,9 @@ async fn serve_app_data(
             }
         }
     }
+    to_search_enigne
+        .send(SearchMsg::AppDataTerminated(swarm_id))
+        .await;
 }
 
 async fn serve_swarm(
@@ -3959,6 +4152,7 @@ fn parse_cast(cast_data: CastData) -> Result<AppMessage, Data> {
     }
 }
 pub struct ApplicationData {
+    app_type: AppType,
     change_reg: ChangeRegistry,
     contents: Datastore,
     hash_to_temp_idx: HashMap<u64, u16>,
@@ -3978,6 +4172,7 @@ impl ApplicationData {
     // pub fn new(manifest: Manifest) -> Self {
     pub fn new(app_type: AppType) -> Self {
         ApplicationData {
+            app_type,
             change_reg: ChangeRegistry::new(),
             contents: Datastore::new(app_type),
             hash_to_temp_idx: HashMap::new(),
