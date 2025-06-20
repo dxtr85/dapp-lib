@@ -90,17 +90,18 @@ impl EngineState {
                 *self = Self::Processing(s_id, sender, processing, to_process);
                 return false;
             }
-            for c_done_id in c_done_ids {
-                if let Some(index) = processing.iter().position(|&r| r == c_done_id) {
-                    processing.remove(index);
-                }
-            }
+            // for c_done_id in c_done_ids {
+            processing.retain(|j| !c_done_ids.contains(j));
+            // if let Some(index) = processing.iter().position(|&r| r == c_done_id) {
+            //     processing.remove(index);
+            // }
+            // }
             let is_empty = processing.is_empty();
 
             *self = Self::Processing(s_id, sender, processing, to_process);
             return is_empty;
         }
-        true
+        false
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -314,9 +315,8 @@ impl Engine {
         let current_state = std::mem::replace(&mut self.state, EngineState::Idling);
         match current_state {
             EngineState::Idling => {
-                eprintln!("Not advancing to search next swarm id when idling");
-                // TODO: avoid infinite loop
-                // do nothing, we only transition from idle
+                eprintln!("Not advancing to search next SwarmID when Idling");
+                // Avoid infinite loop — do nothing, we only transition from Idling
                 // when new swarm is synced or new query arrived
             }
             EngineState::Processing(s_id, sender, empty_vec, mut swarms_to_inquire) => {
@@ -326,7 +326,8 @@ impl Engine {
                         EngineState::Processing(s_id, sender, empty_vec, swarms_to_inquire);
                     return;
                 }
-                // TODO: when we are Processing and done with current SwarmID,
+                eprintln!("Searching through next swarm, if any.");
+                // When we are Processing and done with current SwarmID,
                 // take next from list and change state to that one
                 // or to Idling in case all swarms have been searched for
                 while let Some(s_id) = swarms_to_inquire.pop() {
@@ -463,8 +464,11 @@ pub async fn serve_search_engine(
                     engine.parse_content(s_id, s_name, c_id, d_type, data_vec);
                     // }
                 }
-                SearchMsg::ReadError(s_id, c_id, app_err) => {
-                    // TODO: decide what to do
+                SearchMsg::ReadError(s_id, c_id, _err) => {
+                    let advance_to_next_swarm = engine.state.processing_done(s_id, vec![c_id]);
+                    if advance_to_next_swarm {
+                        engine.advance_to_next_swarm().await;
+                    }
                 }
                 SearchMsg::AppDataTerminated(s_id) => {
                     engine.swarm_links.remove(&s_id);
