@@ -94,6 +94,7 @@ pub mod prelude {
     pub use gnome::prelude::SwarmName;
     pub use gnome::prelude::SyncData;
     pub use gnome::prelude::ToGnome;
+    pub use gnome::prelude::Transport;
 }
 
 pub enum ToApp {

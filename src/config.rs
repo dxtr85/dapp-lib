@@ -4,7 +4,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use gnome::prelude::{Nat, NetworkSettings, PortAllocationRule};
+use gnome::prelude::{Nat, NetworkSettings, PortAllocationRule, Transport};
 
 pub struct Configuration {
     pub work_dir: PathBuf,
@@ -157,6 +157,22 @@ fn parse_neighbors(file: &Path) -> Vec<NetworkSettings> {
             } else {
                 continue;
             }
+            let transport;
+            if let Some(n) = split.next() {
+                if let Ok(r) = u8::from_str(n) {
+                    if let Ok(t) = Transport::from(r) {
+                        transport = t;
+                    } else {
+                        eprintln!("Unsupported value for Transport: {}", r);
+                        transport = Transport::UDPoverIP4;
+                    }
+                } else {
+                    eprintln!("Failed at parsing Transport type, line {}", ls);
+                    continue;
+                }
+            } else {
+                continue;
+            }
             eprintln!(
                 "IP: {}, Port: {}, NAT: {:?}, rule: {:?}",
                 pub_ip, pub_port, nat_type, rule
@@ -166,6 +182,7 @@ fn parse_neighbors(file: &Path) -> Vec<NetworkSettings> {
                 pub_port,
                 nat_type,
                 port_allocation: (rule, 1), //TODO: value from file
+                transport,
             });
         }
     }

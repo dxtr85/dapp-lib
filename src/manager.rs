@@ -351,7 +351,8 @@ impl ApplicationManager {
         }
         //3 if swarm is on untouchables list, add it on top of
         // list of swarms to join from app
-        if self.is_untouchable(s_id) {
+        if self.is_untouchable(s_id, &s_name) {
+            eprintln!("Adding {} to waitlist", s_name);
             spawn(start_a_timer(
                 self.to_app_mgr.clone(),
                 TimeoutType::AddToWaitList(s_name.clone()),
@@ -567,8 +568,8 @@ impl ApplicationManager {
             true
         }
     }
-    fn is_untouchable(&self, s_id: SwarmID) -> bool {
+    fn is_untouchable(&self, s_id: SwarmID, s_name: &SwarmName) -> bool {
         //TODO: expand this fn
-        self.active_app_data.0 == s_id
+        self.active_app_data.0 == s_id || s_name == &self.my_name
     }
 }
