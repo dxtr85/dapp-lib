@@ -2,6 +2,7 @@ use crate::app_type::AppType;
 use crate::Data;
 use gnome::prelude::sha_hash;
 use gnome::prelude::Nat;
+use gnome::prelude::NetworkSettings;
 // use gnome::prelude::NetworkSettings;
 use gnome::prelude::PortAllocationRule;
 use std::collections::HashMap;
@@ -12,9 +13,90 @@ use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 
 #[derive(Clone, Debug)]
+struct CombinedNetworkSettings {
+    pub udp_ip4: Option<NetworkSettings>,
+    pub tcp_ip4: Option<NetworkSettings>,
+    pub udp_ip6: Option<NetworkSettings>,
+    pub tcp_ip6: Option<NetworkSettings>,
+}
+impl CombinedNetworkSettings {
+    pub fn new() -> Self {
+        CombinedNetworkSettings {
+            udp_ip4: None,
+            tcp_ip4: None,
+            udp_ip6: None,
+            tcp_ip6: None,
+        }
+    }
+
+    pub fn get_bytes(&self) -> Vec<u8> {
+        // TODO: get all network settings as bytes
+        // then push zero & number of those bytes
+        // and the bytes as well
+        let mut total_bytes = vec![0, 0];
+        if let Some(ns) = self.udp_ip4 {
+            total_bytes.append(&mut ns.clone().bytes());
+        }
+        if let Some(ns) = self.tcp_ip4 {
+            total_bytes.append(&mut ns.clone().bytes());
+        }
+        if let Some(ns) = self.udp_ip6 {
+            total_bytes.append(&mut ns.clone().bytes());
+        }
+        if let Some(ns) = self.tcp_ip6 {
+            total_bytes.append(&mut ns.clone().bytes());
+        }
+        total_bytes[1] = (total_bytes.len() - 2) as u8;
+        total_bytes
+    }
+
+    pub fn get_settings(&self) -> Vec<NetworkSettings> {
+        let mut total_settings = vec![];
+        if let Some(ns) = self.udp_ip4 {
+            total_settings.push(ns.clone());
+        }
+        if let Some(ns) = self.tcp_ip4 {
+            total_settings.push(ns.clone());
+        }
+        if let Some(ns) = self.udp_ip6 {
+            total_settings.push(ns.clone());
+        }
+        if let Some(ns) = self.tcp_ip6 {
+            total_settings.push(ns.clone());
+        }
+        total_settings
+    }
+
+    pub fn update(&mut self, new_settings: Vec<NetworkSettings>) -> bool {
+        let mut updated = false;
+        for ns in new_settings {
+            match ns.transport {
+                gnome::prelude::Transport::UDPoverIP4 => {
+                    self.udp_ip4 = Some(ns);
+                    updated = true;
+                }
+                gnome::prelude::Transport::TCPoverIP4 => {
+                    self.tcp_ip4 = Some(ns);
+                    updated = true;
+                }
+                gnome::prelude::Transport::UDPoverIP6 => {
+                    self.udp_ip6 = Some(ns);
+                    updated = true;
+                }
+                gnome::prelude::Transport::TCPoverIP6 => {
+                    self.tcp_ip6 = Some(ns);
+                    updated = true;
+                }
+            }
+        }
+        updated
+    }
+}
+#[derive(Clone, Debug)]
 pub struct Manifest {
     pub app_type: AppType,
-    pub pub_ips: Vec<(IpAddr, u16, Nat, (PortAllocationRule, i8))>,
+    // pub pub_ips: Vec<(IpAddr, u16, Nat, (PortAllocationRule, i8))>,
+    pub_ips: CombinedNetworkSettings,
     pub description: String,
     pub tags: HashMap<u8, Tag>,
     pub d_types: HashMap<u8, Tag>,
@@ -64,7 +146,7 @@ impl Manifest {
     pub fn new(app_type: AppType, tags: HashMap<u8, Tag>) -> Self {
         Manifest {
             app_type,
-            pub_ips: vec![],
+            pub_ips: CombinedNetworkSettings::new(),
             description: String::new(),
             tags,
             d_types: HashMap::new(),
@@ -125,7 +207,7 @@ impl Manifest {
         if data_count == 0 {
             return Manifest {
                 app_type: AppType::Other(0),
-                pub_ips: vec![],
+                pub_ips: CombinedNetworkSettings::new(),
                 description: String::new(),
                 tags: HashMap::new(),
                 d_types: HashMap::new(),
@@ -138,7 +220,7 @@ impl Manifest {
         if data_count == 1 && iter.len() == 1 {
             return Manifest {
                 app_type: AppType::from(iter.next().unwrap()),
-                pub_ips: vec![],
+                pub_ips: CombinedNetworkSettings::new(),
                 description: String::new(),
                 tags: HashMap::new(),
                 d_types: HashMap::new(),
@@ -181,32 +263,91 @@ impl Manifest {
         };
 
         let mut d_types = HashMap::with_capacity(dt_page_count << 5);
-        let mut pub_ips = vec![];
+        let mut pub_ips = CombinedNetworkSettings::new();
         // First byte in UTF-8 encoded String can not start with a 1 bit, so we are good
+        // TODO: read one byte and check its value
+        // if it's higher than 251 use old logic
+        // otherwise it indicates how many following bytes need to be read
+        // in order to retrieve pub_ips
+        // read that many and update pub_ips
         if let Some(next_byte) = iter.clone().peekable().next() {
+            eprintln!("Next_byte: {}", next_byte);
             if next_byte == 255 || next_byte == 254 || next_byte == 253 || next_byte == 252 {
                 match iter.next().unwrap() {
                     255 => {
-                        //TODO:255 we have IPv4 & IPv6
+                        eprintln!("255 we have IPv4 & IPv6");
                         // first read IPv4 address, port,Nat,PortAllocationRule,step
-                        pub_ips.push(read_ipv4(&mut iter));
+                        let (pub_ip, pub_port, nat_type, port_allocation) = read_ipv4(&mut iter);
+                        let ns = NetworkSettings {
+                            pub_ip,
+                            pub_port,
+                            nat_type,
+                            port_allocation,
+                            transport: gnome::prelude::Transport::UDPoverIP4,
+                        };
+                        // pub_ips.push(read_ipv4(&mut iter));
+                        pub_ips.update(vec![ns]);
                         // second read IPv6 address and port, we assume all IPv6 to be public
-                        pub_ips.push(read_ipv6(&mut iter));
+                        // pub_ips.push(read_ipv6(&mut iter));
+                        let (pub_ip, pub_port, nat_type, port_allocation) = read_ipv6(&mut iter);
+                        let ns = NetworkSettings {
+                            pub_ip,
+                            pub_port,
+                            nat_type,
+                            port_allocation,
+                            transport: gnome::prelude::Transport::UDPoverIP4,
+                        };
+                        pub_ips.update(vec![ns]);
                     }
                     254 => {
+                        eprintln!("254 IPv6 only");
                         //     254 IPv6 only
-                        pub_ips.push(read_ipv6(&mut iter));
+                        // pub_ips.push(read_ipv6(&mut iter));
+                        let (pub_ip, pub_port, nat_type, port_allocation) = read_ipv6(&mut iter);
+                        let ns = NetworkSettings {
+                            pub_ip,
+                            pub_port,
+                            nat_type,
+                            port_allocation,
+                            transport: gnome::prelude::Transport::UDPoverIP4,
+                        };
+                        pub_ips.update(vec![ns]);
                     }
                     253 => {
+                        eprintln!("253 IPv4 only");
                         //     253 IPv4 only
-                        pub_ips.push(read_ipv4(&mut iter));
+                        let (pub_ip, pub_port, nat_type, port_allocation) = read_ipv4(&mut iter);
+                        let ns = NetworkSettings {
+                            pub_ip,
+                            pub_port,
+                            nat_type,
+                            port_allocation,
+                            transport: gnome::prelude::Transport::UDPoverIP4,
+                        };
+                        // pub_ips.push(read_ipv4(&mut iter));
+                        pub_ips.update(vec![ns]);
                     }
                     _ => {
+                        eprintln!("252 No Public IPs defined");
                         //     252 No Public IPs defined
                     }
                 }
+            } else if next_byte == 0 {
+                let next_byte = iter.next().unwrap();
+                let next_byte = iter.next().unwrap();
+                let mut ns_bytes = Vec::with_capacity(next_byte as usize);
+                eprintln!(
+                    "We are using new method to load pub_ips from storage {}b",
+                    next_byte
+                );
+                for _i in 0..next_byte {
+                    ns_bytes.push(iter.next().unwrap());
+                }
+                let nss = NetworkSettings::from(&ns_bytes);
+                pub_ips.update(nss);
             }
         }
+        eprintln!("Loading Description…");
         let description = String::from_utf8(iter.collect()).unwrap();
 
         let mut current_tag_id: u8 = 0;
@@ -296,71 +437,75 @@ impl Manifest {
         // TODO: index of other data after Data type definitions, 0 if none
         res.push(0);
         res.push(0);
-        match self.pub_ips.len() {
-            0 => res.push(252),
-            1 => {
-                let (pub_ip, port, nat, (rule, delta)) = self.pub_ips[0];
-                match pub_ip {
-                    IpAddr::V4(ip) => {
-                        res.push(253);
-                        for octet in ip.octets() {
-                            res.push(octet);
-                        }
-                        for byte in port.to_be_bytes() {
-                            res.push(byte);
-                        }
-                        res.push(nat as u8);
-                        res.push(rule as u8);
-                        res.push(delta as u8);
-                    }
-                    IpAddr::V6(ip) => {
-                        res.push(254);
-                        for octet in ip.octets() {
-                            res.push(octet);
-                        }
-                        for byte in port.to_be_bytes() {
-                            res.push(byte);
-                        }
-                        res.push(nat as u8);
-                        res.push(rule as u8);
-                        res.push(delta as u8);
-                    }
-                }
-            }
-            2 => {
-                res.push(255);
-                let (ip4, ip6) = if self.pub_ips[0].0.is_ipv4() {
-                    (self.pub_ips[0], self.pub_ips[1])
-                } else {
-                    (self.pub_ips[1], self.pub_ips[0])
-                };
-                if let (IpAddr::V4(ip), port, nat, (rule, delta)) = ip4 {
-                    for octet in ip.octets() {
-                        res.push(octet);
-                    }
-                    for byte in port.to_be_bytes() {
-                        res.push(byte);
-                    }
-                    res.push(nat as u8);
-                    res.push(rule as u8);
-                    res.push(delta as u8);
-                }
-                if let (IpAddr::V6(ip), port, nat, (rule, delta)) = ip6 {
-                    for octet in ip.octets() {
-                        res.push(octet);
-                    }
-                    for byte in port.to_be_bytes() {
-                        res.push(byte);
-                    }
-                    res.push(nat as u8);
-                    res.push(rule as u8);
-                    res.push(delta as u8);
-                }
-            }
-            other => {
-                eprintln!("Too many public IPs: {}", other);
-            }
-        }
+        res.append(&mut self.pub_ips.get_bytes());
+        // match self.pub_ips.len() {
+        //     0 => res.push(252),
+        //     1 => {
+        //         // TODO: store multiple IP addresses
+        //         // TODO: store trasnport protocol for each address
+        //         // let (pub_ip, port, nat, (rule, delta)) = self.pub_ips[0];
+        //         let ns = self.pub_ips[0];
+        //         match ns.pub_ip {
+        //             IpAddr::V4(ip) => {
+        //                 res.push(253);
+        //                 for octet in ip.octets() {
+        //                     res.push(octet);
+        //                 }
+        //                 for byte in ns.pub_port.to_be_bytes() {
+        //                     res.push(byte);
+        //                 }
+        //                 res.push(ns.nat_type as u8);
+        //                 res.push(ns.port_allocation.0 as u8);
+        //                 res.push(ns.port_allocation.1 as u8);
+        //             }
+        //             IpAddr::V6(ip) => {
+        //                 res.push(254);
+        //                 for octet in ip.octets() {
+        //                     res.push(octet);
+        //                 }
+        //                 for byte in ns.pub_port.to_be_bytes() {
+        //                     res.push(byte);
+        //                 }
+        //                 res.push(ns.nat_type as u8);
+        //                 res.push(ns.port_allocation.0 as u8);
+        //                 res.push(ns.port_allocation.1 as u8);
+        //             }
+        //         }
+        //     }
+        //     2 => {
+        //         res.push(255);
+        //         let (ip4, ip6) = if self.pub_ips[0].pub_ip.is_ipv4() {
+        //             (self.pub_ips[0], self.pub_ips[1])
+        //         } else {
+        //             (self.pub_ips[1], self.pub_ips[0])
+        //         };
+        //         if let IpAddr::V4(ip) = ip4.pub_ip {
+        //             for octet in ip.octets() {
+        //                 res.push(octet);
+        //             }
+        //             for byte in ip4.pub_port.to_be_bytes() {
+        //                 res.push(byte);
+        //             }
+        //             res.push(ip4.nat_type as u8);
+        //             res.push(ip4.port_allocation.0 as u8);
+        //             res.push(ip4.port_allocation.1 as u8);
+        //         }
+        //         if let IpAddr::V6(ip) = ip6.pub_ip {
+        //             for octet in ip.octets() {
+        //                 res.push(octet);
+        //             }
+        //             for byte in ip6.pub_port.to_be_bytes() {
+        //                 res.push(byte);
+        //             }
+        //             res.push(ip6.nat_type as u8);
+        //             res.push(ip6.port_allocation.0 as u8);
+        //             res.push(ip6.port_allocation.1 as u8);
+        //         }
+        //     }
+        //     other => {
+        //         eprintln!("Too many public IPs: {}", other);
+        //     }
+        // }
         for byte in self.description.bytes() {
             res.push(byte);
         }
@@ -551,62 +696,74 @@ impl Manifest {
         type_names
     }
 
+    pub fn get_pub_ips(&self) -> Vec<NetworkSettings> {
+        self.pub_ips.get_settings()
+    }
+
     pub fn update_pub_ips(
         &mut self,
-        ips: Vec<(IpAddr, u16, Nat, (PortAllocationRule, i8))>,
+        // ips: Vec<(IpAddr, u16, Nat, (PortAllocationRule, i8))>,
+        ips: Vec<NetworkSettings>,
     ) -> bool {
-        // eprintln!("We should update Public IPs with \n{:?}", ips);
-        if self.pub_ips.is_empty() {
-            self.pub_ips = ips;
-            eprintln!("Pub IPs updated 1");
-            return true;
-        }
-        let mut ips_to_add = vec![];
-        for ip in ips {
-            if !self.pub_ips.contains(&ip) {
-                ips_to_add.push(ip);
-            }
-        }
-        if ips_to_add.is_empty() {
-            // eprintln!("Public IPs are up to date");
-            return false;
-        }
-        // We need to replace old IPv4 with new IPv4 only
-        // and old IPv6 with new IPv6 only, other replacements are not allowed!
-        // we can not have more than two Public IPs one for each protocol version
-
-        eprintln!("We should add some IPs: \n{:?}", ips_to_add);
-        let mut ip4idx = None;
-        let mut ip6idx = None;
-        for (idx, (ip, _p, _n, _r)) in self.pub_ips.iter().enumerate() {
-            if ip.is_ipv4() {
-                ip4idx = Some(idx);
-            } else {
-                ip6idx = Some(idx);
-            }
-        }
-        for ip in ips_to_add {
-            if ip.0.is_ipv4() {
-                if let Some(idx) = ip4idx {
-                    self.pub_ips[idx] = ip;
-                } else {
-                    self.pub_ips.push(ip);
-                    // Just in case we were given two IP4s
-                    ip4idx = Some(self.pub_ips.len() - 1);
-                }
-            } else {
-                if let Some(idx) = ip6idx {
-                    self.pub_ips[idx] = ip;
-                } else {
-                    self.pub_ips.push(ip);
-                    // Just in case we were given two IP6s
-                    ip6idx = Some(self.pub_ips.len() - 1);
-                }
-            }
-        }
-        eprintln!("Pub IPs updated 2");
-        true
+        self.pub_ips.update(ips)
     }
+    // pub fn update_pub_ips(
+    //     &mut self,
+    //     // ips: Vec<(IpAddr, u16, Nat, (PortAllocationRule, i8))>,
+    //     ips: Vec<NetworkSettings>,
+    // ) -> bool {
+    //     // eprintln!("We should update Public IPs with \n{:?}", ips);
+    //     if self.pub_ips.is_empty() {
+    //         self.pub_ips = ips;
+    //         eprintln!("Pub IPs updated 1");
+    //         return true;
+    //     }
+    //     let mut ips_to_add = vec![];
+    //     for ip in ips {
+    //         if !self.pub_ips.contains(&ip) {
+    //             ips_to_add.push(ip);
+    //         }
+    //     }
+    //     if ips_to_add.is_empty() {
+    //         // eprintln!("Public IPs are up to date");
+    //         return false;
+    //     }
+    //     // We need to replace old IPv4 with new IPv4 only
+    //     // and old IPv6 with new IPv6 only, other replacements are not allowed!
+    //     // we can not have more than two Public IPs one for each protocol version
+
+    //     eprintln!("We should add some IPs: \n{:?}", ips_to_add);
+    //     let mut ip4idx = None;
+    //     let mut ip6idx = None;
+    //     for (idx, ns) in self.pub_ips.iter().enumerate() {
+    //         if ns.pub_ip.is_ipv4() {
+    //             ip4idx = Some(idx);
+    //         } else {
+    //             ip6idx = Some(idx);
+    //         }
+    //     }
+    //     for ip in ips_to_add {
+    //         if ip.pub_ip.is_ipv4() {
+    //             if let Some(idx) = ip4idx {
+    //                 self.pub_ips[idx] = ip;
+    //             } else {
+    //                 self.pub_ips.push(ip);
+    //                 // Just in case we were given two IP4s
+    //                 ip4idx = Some(self.pub_ips.len() - 1);
+    //             }
+    //         } else {
+    //             if let Some(idx) = ip6idx {
+    //                 self.pub_ips[idx] = ip;
+    //             } else {
+    //                 self.pub_ips.push(ip);
+    //                 // Just in case we were given two IP6s
+    //                 ip6idx = Some(self.pub_ips.len() - 1);
+    //             }
+    //         }
+    //     }
+    //     eprintln!("Pub IPs updated 2");
+    //     true
+    // }
 }
 fn read_ipv4<T>(iter: &mut T) -> (IpAddr, u16, Nat, (PortAllocationRule, i8))
 where

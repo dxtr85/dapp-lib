@@ -8,6 +8,7 @@ use gnome::prelude::ToGnomeManager;
 use gnome::prelude::{GnomeId, SwarmID, SwarmName};
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::time::Duration;
 // use std::time::Duration;
 
@@ -54,6 +55,17 @@ impl SwapProcess {
     }
     pub fn is_waiting(&self) -> bool {
         matches!(self, SwapProcess::WaitingForGnomeMgr)
+    }
+}
+impl Display for SwapProcess {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        match self {
+            Self::Idle => write!(f, "Idle"),
+            Self::Cooldown => write!(f, "Cooldown"),
+            Self::WaitingForGnomeMgr => write!(f, "WaitingForGnomeMgr"),
+            Self::Joining(sn) => write!(f, "Joining({}])", sn),
+            Self::Leaving(sn) => write!(f, "Leaving({})", sn),
+        }
     }
 }
 
@@ -247,7 +259,7 @@ impl ApplicationManager {
             s_id, can_be_swapped
         );
         // self.update_swap_state(s_id, can_be_swapped).await;
-        self.update_swap_state_after_leave(None).await;
+        self.update_swap_state_after_leave(None, false).await;
     }
     pub async fn swarm_synced(&mut self, s_id: SwarmID) {
         self.swap_state.running_swarms.insert(s_id);
@@ -277,7 +289,7 @@ impl ApplicationManager {
         //         Duration::from_millis(512),
         //     ));
         // } else {
-        self.update_swap_state_after_leave(None).await;
+        self.update_swap_state_after_leave(None, false).await;
         // }
     }
     pub fn cooldown_over(&mut self) {
@@ -366,7 +378,8 @@ impl ApplicationManager {
         // 5 update_swap_state
         if has_neighbors {
             eprintln!("mgr has_neighbors");
-            self.update_swap_state_after_leave(Some(s_name)).await;
+            self.update_swap_state_after_leave(Some(s_name), false)
+                .await;
         }
     }
 
@@ -381,12 +394,20 @@ impl ApplicationManager {
             to_join: vec![],
         };
     }
-    pub async fn update_swap_state_after_leave(&mut self, left_id: Option<SwarmName>) {
-        eprintln!("update_swap_state_after_leave {:?}", left_id);
+    pub async fn update_swap_state_after_leave(&mut self, left_id: Option<SwarmName>, reset: bool) {
+        eprintln!(
+            "update_swap_state_after_leave {:?}, {}",
+            left_id, self.swap_state.process
+        );
         // If some other procedure is running we quit
         if !self.swap_state.process.is_idle() {
-            eprintln!("Proces not idle: {:?}", self.swap_state.process);
-            return;
+            if reset {
+                eprintln!("Proces reset from: {}", self.swap_state.process);
+                self.swap_state.process = SwapProcess::Idle;
+            } else {
+                eprintln!("Proces not idle: {}", self.swap_state.process);
+                return;
+            }
         }
         // if self.swap_state.is_overloaded(self.name_to_id.len()) {
         if !self.swap_state.any_swap_slot_available() {
@@ -533,6 +554,9 @@ impl ApplicationManager {
         self.swap_state.quit();
     }
     pub fn selected_swarm(&mut self, s_name: Option<SwarmName>) {
+        if let Some(s) = &s_name {
+            eprintln!("Selected: {}", s);
+        }
         if !self.swap_state.process.is_waiting() {
             eprintln!(
                 "JS: Got info from GMgr when in state {:?}",
