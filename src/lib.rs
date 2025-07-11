@@ -1206,6 +1206,7 @@ async fn serve_app_manager(
                                 to_swarm,
                                 to_app_mgr.clone(),
                                 to_search_enigne.clone(),
+                                config.store_data_on_disk,
                             ));
                             spawn(serve_swarm(
                                 Duration::from_millis(64),
@@ -1597,6 +1598,7 @@ async fn serve_app_data(
     to_gnome_sender: Sender<ToGnome>,
     to_app_mgr_send: ASender<ToAppMgr>,
     to_search_enigne: ASender<SearchMsg>,
+    store_on_disk: bool,
 ) {
     let mut s_storage = PathBuf::new();
     let mut missing_pages = (0, HashMap::new());
@@ -1652,7 +1654,7 @@ async fn serve_app_data(
     // TODO: build logic to decide whether or not we should store this Swarm's data on disk
     //       and if so, which parts of it (maybe all?)
     //       This should be merged with application logic
-    let mut store_on_disk = false;
+    // let mut store_on_disk = false;
     let mut swarm_name = SwarmName::new(GnomeId::any(), "".to_string()).unwrap();
     eprintln!("Storage root app data: {:?}", storage);
     let mut b_cast_origin: Option<(CastID, Sender<CastData>)> = None;
@@ -1684,11 +1686,11 @@ async fn serve_app_data(
                 // TODO: spawn a task to load datastore from disk into memory for
                 //       comparison with Swarm's datastore
                 if s_storage.exists() {
-                    store_on_disk = true;
+                    // store_on_disk = true;
                     eprintln!("Swarm storage at: {:?}", s_storage);
                     // TODO: now we need to compare what we have on disk with Swarm
                 } else {
-                    store_on_disk = true;
+                    // store_on_disk = true;
                     // TODO: decide if we should create a dir (possibly after syncing)
                     eprintln!("Creating Swarm storage at: {:?}", s_storage);
                     let _ = create_dir_all(s_storage.clone()).await;

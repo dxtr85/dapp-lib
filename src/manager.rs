@@ -314,7 +314,7 @@ impl ApplicationManager {
         // 1 update process value from Leaving to Idle
         self.swap_state.running_swarms.remove(&s_id);
         let prev_swap_state = std::mem::replace(&mut self.swap_state.process, SwapProcess::Idle);
-        eprintln!("PState: {:?}    {} {}", prev_swap_state, s_id, s_name);
+        eprintln!("PState: {}    {} {}", prev_swap_state, s_id, s_name);
         match prev_swap_state {
             SwapProcess::Leaving(leave_id) => {
                 if leave_id != s_id {
@@ -347,12 +347,12 @@ impl ApplicationManager {
                 }
             }
             other => {
-                eprintln!("JS: Restoring prev state: {:?}", other);
+                eprintln!("JS: Restoring prev state: {}", other);
                 self.swap_state.process = other;
             }
         }
         eprintln!(
-            "PPState: {:?}    {} {}",
+            "PPState: {}    {} {}",
             self.swap_state.process, s_id, s_name
         );
         //2 remove name mapping

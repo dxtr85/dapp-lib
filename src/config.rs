@@ -12,6 +12,7 @@ pub struct Configuration {
     pub neighbors: Option<Vec<NetworkSettings>>,
     pub max_connected_swarms: u8,
     pub upload_bandwidth: u64,
+    pub store_data_on_disk: bool,
 }
 
 impl Configuration {
@@ -25,6 +26,7 @@ impl Configuration {
         };
         let mut max_connected_swarms = 8;
         let mut upload_bandwidth = 8192;
+        let mut store_data_on_disk = true;
         if !conf_path.exists() {
             return Configuration {
                 work_dir: dir.clone(),
@@ -32,6 +34,7 @@ impl Configuration {
                 neighbors,
                 max_connected_swarms,
                 upload_bandwidth,
+                store_data_on_disk,
             };
         }
         let lines_iter = read_lines(conf_path).unwrap().into_iter();
@@ -66,6 +69,23 @@ impl Configuration {
                             }
                         }
                     }
+                    "STORE_DATA_ON_DISK" => {
+                        if let Some(number_str) = split.next() {
+                            if let Ok(number) = u8::from_str_radix(number_str, 10) {
+                                match number {
+                                    1 => store_data_on_disk = true,
+                                    0 => store_data_on_disk = false,
+                                    other => {
+                                        eprintln!(
+                                            "Invalid config value for STORE_DATA_ON_DISK: {}",
+                                            other
+                                        );
+                                        eprintln!("Allowed values: 0 - no data storage\n\t\t 1 - data storage enabled");
+                                    }
+                                }
+                            }
+                        }
+                    }
                     other => {
                         eprintln!("Unrecognized config line: {}", other);
                     }
@@ -78,6 +98,7 @@ impl Configuration {
             neighbors,
             max_connected_swarms,
             upload_bandwidth,
+            store_data_on_disk,
         }
     }
 }
