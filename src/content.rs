@@ -648,12 +648,15 @@ impl Content {
         }
     }
     pub fn pop_data(&mut self) -> Result<Data, AppError> {
+        // eprintln!("pop_data");
         match self {
             Self::Link(_s, _c, _descr, _data, _ti) => Err(AppError::DatatypeMismatch),
             Self::Data(_dt, _mem, tree) => {
                 if tree.is_empty() {
+                    // eprintln!("tree empty");
                     Err(AppError::ContentEmpty)
                 } else {
+                    // eprintln!("tree pop");
                     tree.pop()
                 }
             }
@@ -1026,7 +1029,7 @@ impl ContentTree {
     }
 
     pub fn is_empty(&self) -> bool {
-        matches!(self, Self::Empty(_h))
+        matches!(self, Self::Empty(0))
     }
 
     pub fn len(&self) -> u16 {
@@ -1362,7 +1365,7 @@ impl ContentTree {
     fn pop(&mut self) -> Result<Data, AppError> {
         let myself = std::mem::replace(self, Self::Empty(0));
         match myself {
-            Self::Empty(_hash) => Err(AppError::ContentEmpty),
+            Self::Empty(hash) => Ok(Data::empty(hash)),
             Self::Filled(data) => {
                 // eprintln!("t pop 0 self: {:?}", self);
                 Ok(data)

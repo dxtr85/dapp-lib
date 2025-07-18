@@ -107,12 +107,75 @@ impl SyncRequirements {
 // to post parts of the same message. This is to prevent stalling a Message,
 // when an originating gnome drops out of swarm.
 //
+#[derive(Clone, Copy, Debug)]
+pub enum ChangeContentOperation {
+    DirectCTreeRebuild,
+    DropAndAppend(u16),
+    PopAndAppendConverted(u16),
+    PopAndCTreeRebuild(u16),
+}
+impl ChangeContentOperation {
+    pub fn from(bytes: &mut Vec<u8>) -> Result<Self, ()> {
+        if bytes.is_empty() {
+            eprintln!("Can not build from empty vec");
+            return Err(());
+        }
+        let header = bytes.remove(0);
+
+        match header {
+            1 => Ok(Self::DirectCTreeRebuild),
+            2 => {
+                let b1 = bytes.remove(0);
+                let b2 = bytes.remove(0);
+                Ok(Self::DropAndAppend(u16::from_be_bytes([b1, b2])))
+            }
+            4 => {
+                let b1 = bytes.remove(0);
+                let b2 = bytes.remove(0);
+                Ok(Self::PopAndAppendConverted(u16::from_be_bytes([b1, b2])))
+            }
+            8 => {
+                let b1 = bytes.remove(0);
+                let b2 = bytes.remove(0);
+                Ok(Self::PopAndCTreeRebuild(u16::from_be_bytes([b1, b2])))
+            }
+            other => {
+                eprintln!("Unexpected header byte: {}", other);
+                bytes.insert(0, other);
+                Err(())
+            }
+        }
+    }
+    pub fn bytes(&self) -> Vec<u8> {
+        match self {
+            Self::DirectCTreeRebuild => {
+                //TODO
+                vec![1]
+            }
+            Self::DropAndAppend(drop_how_many) => {
+                //TODO
+                let [b1, b2] = drop_how_many.to_be_bytes();
+                vec![2, b1, b2]
+            }
+            Self::PopAndAppendConverted(pop_how_many) => {
+                //TODO
+                let [b1, b2] = pop_how_many.to_be_bytes();
+                vec![4, b1, b2]
+            }
+            Self::PopAndCTreeRebuild(pop_how_many) => {
+                //TODO
+                let [b1, b2] = pop_how_many.to_be_bytes();
+                vec![8, b1, b2]
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum SyncMessageType {
     // SetManifest, // Should this be a separate type?
     AppendContent(DataType),
-    ChangeContent(DataType, ContentID),
+    ChangeContent(ContentID, DataType, ChangeContentOperation),
     AppendData(ContentID),
     AppendShelledDatas(ContentID),
     RemoveData(ContentID, u16),
@@ -140,7 +203,8 @@ impl SyncMessageType {
                 let b1 = bytes.drain(0..1).next().unwrap();
                 let b2 = bytes.drain(0..1).next().unwrap();
                 let c_id = u16::from_be_bytes([b1, b2]);
-                SyncMessageType::ChangeContent(d_type, c_id)
+                let operation = ChangeContentOperation::from(bytes).unwrap();
+                SyncMessageType::ChangeContent(c_id, d_type, operation)
             }
             252 => {
                 let b1 = bytes.drain(0..1).next().unwrap();
@@ -201,9 +265,11 @@ impl SyncMessageType {
                 vec![255, b1, b2]
             }
             SyncMessageType::AppendContent(d_type) => vec![254, d_type.byte()],
-            SyncMessageType::ChangeContent(d_type, c_id) => {
+            SyncMessageType::ChangeContent(c_id, d_type, operation) => {
                 let [b1, b2] = c_id.to_be_bytes();
-                vec![253, d_type.byte(), b1, b2]
+                let mut bvec = vec![253, d_type.byte(), b1, b2];
+                bvec.append(&mut operation.bytes());
+                bvec
             }
             SyncMessageType::AppendData(c_id) => {
                 let [b1, b2] = c_id.to_be_bytes();
@@ -365,6 +431,7 @@ impl SyncMessage {
                 vec.append(&mut req_and_data_bytes.drain(0..drain_count).collect());
                 let data = SyncData::new(vec).unwrap();
                 let hash = data.hash();
+                eprintln!("into part hash: {}(len: {},\n{})", hash, data.len(), &data);
                 for byte in hash.to_be_bytes() {
                     header_bytes.push(byte);
                 }
