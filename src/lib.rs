@@ -124,7 +124,7 @@ pub enum ToAppMgr {
     ContentLoadedFromDisk(SwarmID, ContentID, DataType, Data),
     ContentRequestedFromNeighbor(SwarmID, ContentID, DataType),
     UploadData,
-    // SetActiveApp(SwarmName),
+    ChangeDiameter(SwarmID, u8),
     StartUnicast,
     StartBroadcast,
     EndBroadcast,
@@ -203,6 +203,7 @@ pub enum ToAppData {
     BCastData(CastID, CastData),
     BCastOrigin(CastID, Sender<CastData>),
     ChangeContent(ContentID, DataType, Vec<Data>),
+    ChangeDiameter(u8),
     UpdateData(ContentID, u16, Data),
     AppendContent(DataType, Data),
     AppendData(ContentID, Data),
@@ -211,7 +212,7 @@ pub enum ToAppData {
     CustomRequest(u8, GnomeId, CastData),
     CustomResponse(u8, GnomeId, CastData),
     TransformLinkRequest(SyncData),
-    TransformLink(SyncData),
+    TransformLink(GnomeId, SyncData),
     TimeoutSyncCheck,
     Terminate,
 }
@@ -596,6 +597,15 @@ async fn serve_app_manager(
                 }
                 ToAppMgr::NeighborsListing(s_id, neighbors) => {
                     let _ = to_user.send(ToApp::Neighbors(s_id, neighbors)).await;
+                }
+                ToAppMgr::ChangeDiameter(s_id, new_diameter) => {
+                    // TODO: make sure we are sending this to correct swarm!
+                    // but for now we just test if this functionality works
+                    let _ = app_mgr
+                        .active_app_data
+                        .1
+                        .send(ToAppData::ChangeDiameter(new_diameter))
+                        .await;
                 }
                 ToAppMgr::ChangeContent(s_id, c_id, d_type, data_vec) => {
                     // TODO: make sure we are sending this to correct swarm!
@@ -2486,6 +2496,10 @@ async fn serve_app_data(
                     eprintln!("Unable to change non existing content");
                 }
             }
+            ToAppData::ChangeDiameter(new_diameter) => {
+                eprintln!("Requesting gnome to change diameter to:{}", new_diameter);
+                let _ = to_gnome_sender.send(ToGnome::ChangeDiameter(new_diameter));
+            }
             ToAppData::ListNeighbors => {
                 eprintln!("Requesting neighbors from gnome");
                 let _ = to_gnome_sender.send(ToGnome::ListNeighbors);
@@ -2500,8 +2514,9 @@ async fn serve_app_data(
                     eprintln!("No link with TransformInfo defined for transformation to begin");
                 }
             }
-            ToAppData::TransformLink(s_data) => {
-                eprintln!("Received TransformLink from gnome");
+            ToAppData::TransformLink(signed_by, s_data) => {
+                eprintln!("Received TransformLink from {}", signed_by);
+                //TODO: verify that singed_by can perform this op
                 let s_bytes = s_data.bytes();
                 let c_id = u16::from_be_bytes([s_bytes[0], s_bytes[1]]);
                 let result = app_data.transform_link(c_id);
@@ -4073,10 +4088,10 @@ async fn serve_swarm(
                     }
                     // println!("Got data from {}", gnome_id);
                 }
-                GnomeToApp::Reconfig(id, sync_data) => match id {
+                GnomeToApp::Reconfig(id, signed_by, sync_data) => match id {
                     0 => {
                         let _ = to_app_data_send
-                            .send(ToAppData::TransformLink(sync_data))
+                            .send(ToAppData::TransformLink(signed_by, sync_data))
                             .await;
                     }
                     other => {
@@ -4166,7 +4181,7 @@ async fn serve_broadcast(
     loop {
         let recv_res = cast_data_recv.try_recv();
         if let Ok(data) = recv_res {
-            // println!("B{:?}: {}", c_id, data);
+            eprintln!("B{:?}: {}", c_id, data);
             let _ = to_app_data_send
                 .send(ToAppData::BCastData(c_id, data))
                 .await;
