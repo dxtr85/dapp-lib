@@ -144,7 +144,7 @@ pub struct TransformInfo {
 
 impl TransformInfo {
     pub fn from(bytes: Vec<u8>) -> Option<Self> {
-        eprintln!("TI from: {:?} bytes", bytes.len());
+        // eprintln!("TI from: {:?} bytes", bytes);
         let mut bytes_iter = bytes.into_iter();
         if let Some(d_type) = bytes_iter.next() {
             let b1 = bytes_iter.next().unwrap();
@@ -598,7 +598,7 @@ impl Content {
                 //     }
                 // } else {
                 if data_id == 0 {
-                    eprintln!("Converting link to data, {} TI: {:?}", s_name, ti.is_some());
+                    // eprintln!("Converting link to data, {} TI: {:?}", s_name, ti.is_some());
                     Ok(link_to_data(
                         s_name.clone(),
                         *c_id,
@@ -762,15 +762,16 @@ impl Content {
     pub fn hash(&self) -> u64 {
         match self {
             Self::Link(s_name, c_id, description, data, ti) => {
-                let mut data = link_to_data(
+                // eprintln!("dAta: {:?}", data);
+                let mut l_data = link_to_data(
                     s_name.clone(),
                     *c_id,
                     description.clone(),
                     data.clone(),
                     ti.clone(),
                 );
-                eprintln!("data: {:?}, {}", data, data.get_hash());
-                data.hash()
+                // eprintln!("data: {:?}, {}", data, data.get_hash());
+                l_data.hash()
                 // let mut b_vec = vec![];
                 // for byte in s_name.founder.bytes() {
                 //     b_vec.push(byte);
@@ -862,16 +863,17 @@ impl Content {
 }
 
 pub fn data_to_link(data: Data) -> Result<Content, AppError> {
-    eprintln!("data_to_link: {:?}", data);
+    // eprintln!("data_to_link: {:?}", data);
     let mut bytes_iter = data.bytes().into_iter();
     let len = bytes_iter.len();
-    eprintln!("creating link from {} bytes", len);
+    // eprintln!("creating link from {} bytes", len);
     if len < 11 {
         return Err(AppError::Smthg);
     }
     let d_len = bytes_iter.next().unwrap();
+    // eprintln!("d_len: {}", d_len);
     let mut d_bytes = Vec::with_capacity(d_len as usize + 1);
-    d_bytes.push(d_len);
+    // d_bytes.push(d_len);
     for _i in 0..d_len {
         d_bytes.push(bytes_iter.next().unwrap());
     }
@@ -892,7 +894,7 @@ pub fn data_to_link(data: Data) -> Result<Content, AppError> {
     let c_id = u16::from_be_bytes(next_two);
 
     let descr_len = bytes_iter.next().unwrap();
-    eprintln!("Descr len: {}", descr_len);
+    // eprintln!("Descr len: {}", descr_len);
     let mut descr_vec = Vec::with_capacity(descr_len as usize);
     for _i in 0..descr_len {
         descr_vec.push(bytes_iter.next().unwrap());
@@ -908,12 +910,17 @@ pub fn data_to_link(data: Data) -> Result<Content, AppError> {
     // TransformInfo (if above > 0)
     //
     let ti_len = bytes_iter.next().unwrap();
+    // eprintln!("TI len: {}", ti_len);
     let ti = if ti_len == 0 {
         None
     } else {
-        let mut ti_bytes = Vec::with_capacity(ti_len as usize);
-        for _i in 0..ti_len {
-            ti_bytes.push(bytes_iter.next().unwrap());
+        // let mut ti_bytes = Vec::with_capacity(ti_len as usize);
+        let mut ti_bytes = vec![ti_len];
+
+        // for _i in 0..ti_len {
+        while let Some(byte) = bytes_iter.next() {
+            // ti_bytes.push(bytes_iter.next().unwrap());
+            ti_bytes.push(byte);
         }
         TransformInfo::from(ti_bytes)
     };
@@ -925,7 +932,7 @@ pub fn data_to_link(data: Data) -> Result<Content, AppError> {
     // // let s_name = String::from_utf8(name_vec).unwrap();
     // let swarm_name = SwarmName::new(g_id, s_name).unwrap();
     let description = Description::new(String::from_utf8(descr_vec).unwrap()).unwrap();
-    eprintln!("Link {} {}, data: {:?}", s_name, c_id, data);
+    // eprintln!("Link {} {}, data: {:?}", s_name, c_id, data);
 
     Ok(Content::Link(s_name, c_id, description, data, ti))
 }
@@ -939,14 +946,16 @@ fn link_to_data(
     ti: Option<TransformInfo>,
 ) -> Data {
     // data_len byte
-    let mut v = data.bytes();
+    // let mut v = data.bytes();
+    // eprintln!("link_to_data: d_len: {}({:?})", data.len(), data);
+    let mut v = vec![data.len() as u8];
     // data bytes
-    // v.append(&mut data.bytes());
+    v.append(&mut data.bytes());
     // v.push(data_bytes.len() as u8);
     // for b in data_bytes {
     //     v.push(b);
     // }
-    eprintln!("S name: {},", s_name.name,);
+    // eprintln!("S name: {},", s_name.name,);
     // swarm_name len
     // swarm_name
     v.append(&mut s_name.as_bytes());
@@ -973,12 +982,15 @@ fn link_to_data(
     // TransformInfo len
     // TransformInfo (if above > 0)
     //
+    // eprintln!("link_to_data len before TI: {}", v.len());
     if let Some(ti) = ti {
-        v.append(&mut ti.bytes());
+        let mut ti_bytes = ti.bytes();
+        // eprintln!("TI bytes: {:?}", ti_bytes);
+        v.append(&mut ti_bytes);
     } else {
         v.push(0);
     }
-    eprintln!("link_to_data len: {}\n{:?}", v.len(), v);
+    // eprintln!("link_to_data len: {}\n{:?}", v.len(), v);
     Data::new(v).unwrap()
 }
 
@@ -1131,8 +1143,8 @@ impl ContentTree {
             }
             Self::Hashed(sub_tree) => sub_tree.replace(idx, new_data),
             Self::Empty(hash) => {
-                eprintln!("Existing hash: {}", hash);
-                eprintln!("New data hash: {} {}", new_data.get_hash(), new_data.hash());
+                // eprintln!("Existing hash: {}", hash);
+                // eprintln!("New data hash: {} {}", new_data.get_hash(), new_data.hash());
                 let new_hash = new_data.hash();
                 if idx == 0 && *hash == new_hash {
                     *self = Self::Filled(new_data);

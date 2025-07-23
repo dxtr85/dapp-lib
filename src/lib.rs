@@ -87,6 +87,7 @@ pub mod prelude {
     pub use crate::ToApp;
     pub use gnome::prelude::sha_hash;
     pub use gnome::prelude::CastData;
+    pub use gnome::prelude::CastID;
     pub use gnome::prelude::GnomeId;
     pub use gnome::prelude::Nat;
     pub use gnome::prelude::NetworkSettings;
@@ -128,6 +129,7 @@ pub enum ToAppMgr {
     StartUnicast,
     StartBroadcast,
     EndBroadcast,
+    SendToBCastSource(SwarmID, CastID, CastData),
     UnsubscribeBroadcast,
     ListNeighbors,
     NeighborsListing(SwarmID, Vec<GnomeId>),
@@ -198,6 +200,7 @@ pub enum ToAppData {
     StartBroadcast,
     EndBroadcast,
     UnsubscribeBroadcast,
+    SendToBCastSource(CastID, CastData),
     ListNeighbors,
     SwarmReady(SwarmName, bool), //bool indicates whether or not we are founder
     BCastData(CastID, CastData),
@@ -587,6 +590,25 @@ async fn serve_app_manager(
                         .1
                         .send(ToAppData::UnsubscribeBroadcast)
                         .await;
+                }
+                ToAppMgr::SendToBCastSource(s_id, bc_id, data) => {
+                    if app_mgr.active_app_data.0 == s_id {
+                        let res = app_mgr
+                            .active_app_data
+                            .1
+                            .send(ToAppData::SendToBCastSource(bc_id, data))
+                            .await;
+                        if res.is_err() {
+                            eprintln!("SendToBCastSource 1: {}", res.err().unwrap());
+                        }
+                    } else if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
+                        let res = sender.send(ToAppData::SendToBCastSource(bc_id, data)).await;
+                        if res.is_err() {
+                            eprintln!("SendToBCastSource 2: {}", res.err().unwrap());
+                        }
+                    } else {
+                        eprintln!("Could not find {} swarm to pass Uplink Data", s_id);
+                    }
                 }
                 ToAppMgr::ListNeighbors => {
                     let _ = app_mgr
@@ -1772,6 +1794,10 @@ async fn serve_app_data(
                     // eprintln!("None");
                 }
             }
+            ToAppData::SendToBCastSource(bc_id, data) => {
+                eprintln!("ToAppData::SendToBCastSource {:?}", bc_id);
+                let _ = to_gnome_sender.send(ToGnome::SendToBCastSource(bc_id, data));
+            }
             ToAppData::AppendShelledDatas(c_id, hash_data, data_vec) => {
                 eprintln!("evaluating AppendShelledDatas");
                 if let Ok((_d_type, pre_hash)) = app_data.content_root_hash(c_id) {
@@ -2587,10 +2613,12 @@ async fn serve_app_data(
                             Some(ti),
                         );
                         let link_hash = link.hash();
-                        eprintln!("Link hash: {}", link_hash);
+                        // eprintln!("Link hash: {}", link_hash);
                         let data = link.to_data().unwrap();
-                        eprintln!("Link data: {:?}", data);
-                        eprintln!("Data hash: {}", data.get_hash());
+                        // let link_reverse = data_to_link(data.clone()).unwrap();
+                        // eprintln!("Reverse link hash: {}", link_reverse.hash());
+                        // eprintln!("Link data: {:?}", data);
+                        // eprintln!("Data hash: {}", data.get_hash());
                         let post: Vec<(ContentID, u64)> = vec![(content_id, link_hash)];
                         let reqs = SyncRequirements { pre, post };
                         let msg = SyncMessage::new(
@@ -2770,7 +2798,7 @@ async fn serve_app_data(
                     //     }
                     // }
                     SyncMessageType::AppendContent(d_type) => {
-                        eprintln!("AppendContent {:?}", d_type);
+                        eprintln!("AppendContent {:?} dhash: {}", d_type, data.get_hash());
                         // TODO: potentially for AddContent & ChangeContent
                         // post requirements could be empty
                         // pre requirements can not be empty since we need
@@ -2786,8 +2814,9 @@ async fn serve_app_data(
                                 );
                                 continue;
                             }
+                            eprintln!("Content from: {:?} {:?}", d_type, data);
                             let content = Content::from(d_type, data).unwrap();
-                            // println!("Content: {:?}", content);
+                            eprintln!("Content hash: {}", content.hash());
                             let (recv_id, recv_hash) = requirements.post[0];
                             if recv_id == next_id && recv_hash == content.hash() {
                                 let d_type = content.data_type();
@@ -4075,6 +4104,10 @@ async fn serve_swarm(
                     // TODO: convert it to local BCastMessage
                     // and apply to app_data
                     // println!("Got data from {}", c_id.0);
+                }
+                GnomeToApp::BCastUplinkData(c_id, data) => {
+                    // TODO: send this to app
+                    eprintln!("BCUData: {:?}", data);
                 }
                 GnomeToApp::Custom(is_request, m_type, gnome_id, data) => {
                     if is_request {

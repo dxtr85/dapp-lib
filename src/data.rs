@@ -13,9 +13,11 @@ use crate::prelude::DataType;
 pub struct Data(u64, Vec<u8>);
 impl Data {
     pub fn new(contents: Vec<u8>) -> Result<Self, Vec<u8>> {
-        // println!("new data: {:?}", contents);
+        // eprintln!("new Data: {:?}", contents);
         if contents.len() > 1024 {
             return Err(contents);
+        } else if contents.is_empty() {
+            return Ok(Self::empty(0));
         }
         // // Prefix is for later storing SwarmTime value before sign/verify
         // let mut with_prefix = vec![0, 0, 0, 0];
