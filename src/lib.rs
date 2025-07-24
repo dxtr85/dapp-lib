@@ -124,13 +124,20 @@ pub enum ToAppMgr {
     CIDsForTag(SwarmID, GnomeId, u8, ContentID, Data),
     ContentLoadedFromDisk(SwarmID, ContentID, DataType, Data),
     ContentRequestedFromNeighbor(SwarmID, ContentID, DataType),
-    UploadData,
+    BroadcastSend(CastID, CastData),
+    MulticastSend(CastID, CastData),
     ChangeDiameter(SwarmID, u8),
     StartUnicast,
     StartBroadcast,
     EndBroadcast,
     SendToBCastSource(SwarmID, CastID, CastData),
+    StartMulticast,
+    EndMulticast,
+    SendToMCastSource(SwarmID, CastID, CastData),
+    // SubscribeBroadcast,
+    SubscribeMulticast,
     UnsubscribeBroadcast,
+    UnsubscribeMulticast,
     ListNeighbors,
     NeighborsListing(SwarmID, Vec<GnomeId>),
     ChangeContent(SwarmID, ContentID, DataType, Vec<Data>),
@@ -195,16 +202,25 @@ pub enum ToAppData {
     ReadData(Requestor, ContentID),
     SendFirstPage(GnomeId, ContentID, Data),
     ReadAllFirstPages(Requestor),
-    UploadData,
+    BroadcastSend(CastID, CastData),
+    MulticastSend(CastID, CastData),
     StartUnicast,
+    StartMulticast,
     StartBroadcast,
     EndBroadcast,
+    EndMulticast,
+    SubscribeBroadcast,
+    SubscribeMulticast,
     UnsubscribeBroadcast,
+    UnsubscribeMulticast,
     SendToBCastSource(CastID, CastData),
+    SendToMCastSource(CastID, CastData),
     ListNeighbors,
     SwarmReady(SwarmName, bool), //bool indicates whether or not we are founder
     BCastData(CastID, CastData),
     BCastOrigin(CastID, Sender<CastData>),
+    MCastData(CastID, CastData),
+    MCastOrigin(CastID, Sender<CastData>),
     ChangeContent(ContentID, DataType, Vec<Data>),
     ChangeDiameter(u8),
     UpdateData(ContentID, u16, Data),
@@ -427,8 +443,19 @@ async fn serve_app_manager(
                         .send(ToGnomeManager::StartListeningSwarm(ns))
                         .await;
                 }
-                ToAppMgr::UploadData => {
-                    let _ = app_mgr.active_app_data.1.send(ToAppData::UploadData).await;
+                ToAppMgr::BroadcastSend(c_id, c_data) => {
+                    let _ = app_mgr
+                        .active_app_data
+                        .1
+                        .send(ToAppData::BroadcastSend(c_id, c_data))
+                        .await;
+                }
+                ToAppMgr::MulticastSend(c_id, c_data) => {
+                    let _ = app_mgr
+                        .active_app_data
+                        .1
+                        .send(ToAppData::MulticastSend(c_id, c_data))
+                        .await;
                 }
                 ToAppMgr::FromApp(LibRequest::Search(phrase)) => {
                     to_search_enigne.send(SearchMsg::AddQuery(phrase)).await;
@@ -591,6 +618,37 @@ async fn serve_app_manager(
                         .send(ToAppData::UnsubscribeBroadcast)
                         .await;
                 }
+                ToAppMgr::StartMulticast => {
+                    let _ = app_mgr
+                        .active_app_data
+                        .1
+                        .send(ToAppData::StartMulticast)
+                        .await;
+                }
+                ToAppMgr::EndMulticast => {
+                    eprintln!("ToAppMgr::EndMulticast");
+                    let _ = app_mgr
+                        .active_app_data
+                        .1
+                        .send(ToAppData::EndMulticast)
+                        .await;
+                }
+                ToAppMgr::SubscribeMulticast => {
+                    eprintln!("ToAppMgr::SubscribeMulticast");
+                    let _ = app_mgr
+                        .active_app_data
+                        .1
+                        .send(ToAppData::SubscribeMulticast)
+                        .await;
+                }
+                ToAppMgr::UnsubscribeMulticast => {
+                    eprintln!("ToAppMgr::UnsubscribeMulticast");
+                    let _ = app_mgr
+                        .active_app_data
+                        .1
+                        .send(ToAppData::UnsubscribeMulticast)
+                        .await;
+                }
                 ToAppMgr::SendToBCastSource(s_id, bc_id, data) => {
                     if app_mgr.active_app_data.0 == s_id {
                         let res = app_mgr
@@ -605,6 +663,25 @@ async fn serve_app_manager(
                         let res = sender.send(ToAppData::SendToBCastSource(bc_id, data)).await;
                         if res.is_err() {
                             eprintln!("SendToBCastSource 2: {}", res.err().unwrap());
+                        }
+                    } else {
+                        eprintln!("Could not find {} swarm to pass Uplink Data", s_id);
+                    }
+                }
+                ToAppMgr::SendToMCastSource(s_id, mc_id, data) => {
+                    if app_mgr.active_app_data.0 == s_id {
+                        let res = app_mgr
+                            .active_app_data
+                            .1
+                            .send(ToAppData::SendToMCastSource(mc_id, data))
+                            .await;
+                        if res.is_err() {
+                            eprintln!("SendToMCastSource 1: {}", res.err().unwrap());
+                        }
+                    } else if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
+                        let res = sender.send(ToAppData::SendToMCastSource(mc_id, data)).await;
+                        if res.is_err() {
+                            eprintln!("SendToMCastSource 2: {}", res.err().unwrap());
                         }
                     } else {
                         eprintln!("Could not find {} swarm to pass Uplink Data", s_id);
@@ -1691,8 +1768,10 @@ async fn serve_app_data(
     let mut swarm_name = SwarmName::new(GnomeId::any(), "".to_string()).unwrap();
     eprintln!("Storage root app data: {:?}", storage);
     let mut b_cast_origin: Option<(CastID, Sender<CastData>)> = None;
+    let mut m_cast_origin: Option<(CastID, Sender<CastData>)> = None;
     let mut link_with_transform_info: Option<ContentID> = None;
     let mut b_req_sent = false;
+    let mut m_req_sent = false;
     let mut i_am_founder = false;
     // let mut next_val = 0;
     let mut datastore_sync: Option<(u16, HashMap<u16, Vec<(DataType, u64)>>)> =
@@ -1777,11 +1856,28 @@ async fn serve_app_data(
                 let res = to_gnome_sender.send(ToGnome::StartBroadcast);
                 b_req_sent = res.is_ok();
             }
+            ToAppData::StartMulticast => {
+                eprintln!("ToAppData::StartMulticast");
+                let res = to_gnome_sender.send(ToGnome::StartMulticast);
+                m_req_sent = res.is_ok();
+            }
             ToAppData::UnsubscribeBroadcast => {
                 // TODO: get this from app's logic
                 let c_id = CastID(0);
                 let res = to_gnome_sender.send(ToGnome::UnsubscribeBroadcast(c_id));
                 b_req_sent = res.is_ok();
+            }
+            ToAppData::SubscribeMulticast => {
+                // TODO: get this from app's logic
+                let c_id = CastID(0);
+                let res = to_gnome_sender.send(ToGnome::SubscribeMulticast(c_id));
+                m_req_sent = res.is_ok();
+            }
+            ToAppData::UnsubscribeMulticast => {
+                // TODO: get this from app's logic
+                let c_id = CastID(0);
+                let res = to_gnome_sender.send(ToGnome::UnsubscribeMulticast(c_id));
+                m_req_sent = res.is_ok();
             }
             ToAppData::EndBroadcast => {
                 eprintln!("ToAppData::EndBroadcast");
@@ -1794,9 +1890,24 @@ async fn serve_app_data(
                     // eprintln!("None");
                 }
             }
+            ToAppData::EndMulticast => {
+                eprintln!("ToAppData::EndMulticast");
+                if let Some((c_id, _sender)) = m_cast_origin {
+                    // eprintln!("Some");
+                    let res = to_gnome_sender.send(ToGnome::EndMulticast(c_id));
+                    m_req_sent = res.is_ok();
+                    m_cast_origin = None;
+                } else {
+                    // eprintln!("None");
+                }
+            }
             ToAppData::SendToBCastSource(bc_id, data) => {
                 eprintln!("ToAppData::SendToBCastSource {:?}", bc_id);
                 let _ = to_gnome_sender.send(ToGnome::SendToBCastSource(bc_id, data));
+            }
+            ToAppData::SendToMCastSource(bc_id, data) => {
+                eprintln!("ToAppData::SendToMCastSource {:?}", bc_id);
+                let _ = to_gnome_sender.send(ToGnome::SendToMCastSource(bc_id, data));
             }
             ToAppData::AppendShelledDatas(c_id, hash_data, data_vec) => {
                 eprintln!("evaluating AppendShelledDatas");
@@ -2548,7 +2659,7 @@ async fn serve_app_data(
                 let result = app_data.transform_link(c_id);
                 eprintln!("Link transformation result: {:?}", result);
             }
-            ToAppData::UploadData => {
+            ToAppData::BroadcastSend(_id, _data) => {
                 //TODO: send to AppMgr UploadData message
                 // this logic should be moved to app mgr
                 if b_cast_origin.is_none() {
@@ -2689,6 +2800,26 @@ async fn serve_app_data(
                             done_send.clone(),
                         ));
                     }
+                }
+            }
+            ToAppData::MulticastSend(c_id, c_data) => {
+                //TODO: send to AppMgr UploadData message
+                // this logic should be moved to app mgr
+                if m_cast_origin.is_none() {
+                    eprintln!("Unable to upload - no active multicast.");
+                    if !m_req_sent {
+                        eprintln!("Requesting multicast channel.");
+                        let res = to_gnome_sender.send(ToGnome::StartMulticast);
+                        m_req_sent = res.is_ok();
+                    }
+                    continue;
+                }
+                let (mcast_id, mcast_send) = m_cast_origin.clone().unwrap();
+                let send_res = mcast_send.send(c_data);
+                if send_res.is_ok() {
+                    eprintln!("Sent MCast data");
+                } else {
+                    eprintln!("FAILED to send MCast data: {}", send_res.err().unwrap());
                 }
             }
             ToAppData::Response(GnomeToApp::Neighbors(s_id, neighbors)) => {
@@ -3948,6 +4079,7 @@ async fn serve_app_data(
                 }
             }
             ToAppData::BCastOrigin(c_id, send) => b_cast_origin = Some((c_id, send)),
+            ToAppData::MCastOrigin(c_id, send) => m_cast_origin = Some((c_id, send)),
             ToAppData::BCastData(_c_id, c_data) => {
                 // TODO: serve this
                 let a_msg_res = parse_cast(c_data);
@@ -4079,6 +4211,14 @@ async fn serve_swarm(
                         to_app_data_send.clone(),
                     ));
                 }
+                GnomeToApp::Multicast(_s_id, c_id, recv_d) => {
+                    spawn(serve_multicast(
+                        c_id,
+                        Duration::from_millis(100),
+                        recv_d,
+                        to_app_data_send.clone(),
+                    ));
+                }
                 GnomeToApp::Unicast(_s_id, c_id, recv_d) => {
                     spawn(serve_unicast(c_id, Duration::from_millis(100), recv_d));
                 }
@@ -4093,6 +4233,17 @@ async fn serve_swarm(
                         .send(ToAppData::BCastOrigin(*c_id, cast_data_send))
                         .await;
                 }
+                GnomeToApp::MulticastOrigin(_s_id, ref c_id, cast_data_send, cast_data_recv) => {
+                    spawn(serve_multicast(
+                        *c_id,
+                        Duration::from_millis(100),
+                        cast_data_recv,
+                        to_app_data_send.clone(),
+                    ));
+                    let _ = to_app_data_send
+                        .send(ToAppData::MCastOrigin(*c_id, cast_data_send))
+                        .await;
+                }
                 GnomeToApp::UnicastOrigin(_s_id, c_id, send_d) => {
                     spawn(serve_unicast_origin(
                         c_id,
@@ -4103,11 +4254,20 @@ async fn serve_swarm(
                 GnomeToApp::BCastData(c_id, _data) => {
                     // TODO: convert it to local BCastMessage
                     // and apply to app_data
-                    // println!("Got data from {}", c_id.0);
+                    eprintln!("Got BCData from {}", c_id.0);
+                }
+                GnomeToApp::MCastData(c_id, _data) => {
+                    // TODO: convert it to local BCastMessage
+                    // and apply to app_data
+                    eprintln!("Got MCData from {}", c_id.0);
                 }
                 GnomeToApp::BCastUplinkData(c_id, data) => {
                     // TODO: send this to app
                     eprintln!("BCUData: {:?}", data);
+                }
+                GnomeToApp::MCastUplinkData(c_id, data) => {
+                    // TODO: send this to app
+                    eprintln!("MCUData: {:?}", data);
                 }
                 GnomeToApp::Custom(is_request, m_type, gnome_id, data) => {
                     if is_request {
@@ -4222,6 +4382,24 @@ async fn serve_broadcast(
         sleep(sleep_time).await;
     }
 }
+async fn serve_multicast(
+    c_id: CastID,
+    sleep_time: Duration,
+    cast_data_recv: Receiver<CastData>,
+    to_app_data_send: ASender<ToAppData>,
+) {
+    eprintln!("Serving multicast {:?}", c_id);
+    loop {
+        let recv_res = cast_data_recv.try_recv();
+        if let Ok(data) = recv_res {
+            eprintln!("M{:?}: {}", c_id, data);
+            let _ = to_app_data_send
+                .send(ToAppData::MCastData(c_id, data))
+                .await;
+        }
+        sleep(sleep_time).await;
+    }
+}
 
 async fn serve_unicast_origin(c_id: CastID, sleep_time: Duration, user_res: Sender<CastData>) {
     eprintln!("Originating unicast {:?}", c_id);
@@ -4329,8 +4507,8 @@ fn parse_cast(cast_data: CastData) -> Result<AppMessage, Data> {
             ))
         }
         1 => Err(Data::new(bytes_iter.collect()).unwrap()),
-        _ => {
-            panic!("TODO parse cast");
+        other => {
+            panic!("TODO parse cast: {}", other);
         }
     }
 }
