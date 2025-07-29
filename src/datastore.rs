@@ -123,8 +123,8 @@ impl Datastore {
                 // TODO: calculate how many memory slots are used as a sum of left & right
                 // contents + space taken by their bottom hashes.
 
-                let used_memory_slots = prev_content.used_memory_slots()
-                    + content.used_memory_slots()
+                let used_memory_slots = prev_content.used_memory_pages()
+                    + content.used_memory_pages()
                     + 1
                     + ((prev_content.len() + content.len()) as usize >> 7);
                 let substore = Substore {
@@ -519,8 +519,15 @@ impl Datastore {
     pub fn used_memory_pages(&self) -> usize {
         match self {
             Self::Empty => 0,
-            Self::Filled(c) => c.used_memory_slots() + 1 + (c.len() as usize >> 7),
-            Self::Hashed(s_store) => s_store.used_memory_slots(),
+            Self::Filled(c) => c.used_memory_pages() + 1 + (c.len() as usize >> 7),
+            Self::Hashed(s_store) => s_store.used_memory_pages(),
+        }
+    }
+    pub fn used_memory_pages_for(&self, c_id: ContentID) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Filled(c) => c.used_memory_pages() + 1 + (c.len() as usize >> 7),
+            Self::Hashed(s_store) => s_store.used_memory_pages_for(c_id),
         }
     }
 }
@@ -537,7 +544,7 @@ pub struct Substore {
 impl Substore {
     pub fn append(&mut self, content: Content) -> Result<u64, AppError> {
         // println!("Substore count: {}", self.data_count);
-        let mem_used = 1 + content.used_memory_slots() + (content.len() as usize >> 7);
+        let mem_used = 1 + content.used_memory_pages() + (content.len() as usize >> 7);
         // eprintln!(
         //     "Substore append content with {} pages into memory",
         //     mem_used
@@ -658,14 +665,14 @@ impl Substore {
             return Err(AppError::IndexingError);
         }
         let left_len = self.left.len();
-        let new_size = 1 + (content.len() as usize >> 7) + content.used_memory_slots();
+        let new_size = 1 + (content.len() as usize >> 7) + content.used_memory_pages();
         let result = if c_id >= left_len {
             self.right.update(c_id - left_len, content)
         } else {
             self.left.update(c_id, content)
         };
         if let Ok(old_content) = &result {
-            let old_size = 1 + (old_content.len() as usize >> 7) + old_content.used_memory_slots();
+            let old_size = 1 + (old_content.len() as usize >> 7) + old_content.used_memory_pages();
             if old_size < new_size {
                 self.used_memory_slots += new_size - old_size;
             } else {
@@ -738,8 +745,21 @@ impl Substore {
             self.left.content_bottom_hashes(c_id)
         }
     }
-    pub fn used_memory_slots(&self) -> usize {
-        self.used_memory_slots
+    pub fn used_memory_pages(&self) -> usize {
+        // self.used_memory_slots
+        self.left.used_memory_pages() + self.right.used_memory_pages()
+    }
+
+    pub fn used_memory_pages_for(&self, c_id: ContentID) -> usize {
+        if c_id >= self.content_count {
+            return 0;
+        }
+        let left_len = self.left.len();
+        if c_id >= left_len {
+            self.right.used_memory_pages_for(c_id - left_len)
+        } else {
+            self.left.used_memory_pages_for(c_id)
+        }
     }
 
     fn get_root_content_hash(&self, c_id: ContentID) -> Result<(DataType, u64), AppError> {

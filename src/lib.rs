@@ -24,9 +24,13 @@ mod storage;
 mod sync_message;
 use app_type::AppType;
 use async_std::fs::create_dir_all;
+use async_std::task::yield_now;
 use message::ChangeContentOperation;
 // use manifest::Manifest;
 use search::Hit;
+use storage::should_store_content_on_disk;
+use storage::store_content_on_disk;
+use storage::StoragePolicy;
 // use async_std::net::ToSocketAddrs;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -180,6 +184,7 @@ pub enum LibResponse {
     FirstPages(SwarmID, Vec<(ContentID, DataType, Data)>),
     ReadSuccess(SwarmID, SwarmName, ContentID, DataType, Vec<Data>),
     ReadError(SwarmID, ContentID, AppError),
+    AuditResult(SwarmID, usize, usize, u8),
 }
 #[derive(Debug)]
 pub enum TimeoutType {
@@ -188,6 +193,7 @@ pub enum TimeoutType {
     PeriodicalCheckForNewSwarms,
     AddToWaitList(SwarmName),
     HasNeighbors,
+    AuditMemoryForSwarm(SwarmID, SwarmName),
 }
 
 #[derive(Debug)]
@@ -233,6 +239,12 @@ pub enum ToAppData {
     TransformLinkRequest(SyncData),
     TransformLink(GnomeId, SyncData),
     TimeoutSyncCheck,
+    RunMemoryUseAudit(u8), //Request from Manager
+    // MemoryPagesUsed(usize),
+    // MemoryPagesFreed(usize),
+    PartialAuditResult(u8, usize, ContentID, Vec<(ContentID, usize)>), //Perform audit one Content at a time
+    // so app works uninterrupted
+    PurgePagesFromMemory(usize, Vec<(ContentID, usize)>),
     Terminate,
 }
 // TODO: We need to define a way where we can update multiple Data of a given ContentID at once
@@ -519,6 +531,35 @@ async fn serve_app_manager(
                     //             .await;
                     //     }
                     // }
+                }
+                ToAppMgr::FromDatastore(LibResponse::AuditResult(
+                    s_id,
+                    mem_used,
+                    mem_avail,
+                    time_period,
+                )) => {
+                    eprintln!("{} Memory Audit result: [{}:{}]", s_id, mem_used, mem_avail);
+                    // start a timer for next audit
+                    // If memory usage is below 50% we can keep doubling
+                    // time period until we reach max of 32 minutes
+                    // If usage is below 75% we step down by one order
+                    // if it is above 75% we step down by two orders of magnitude
+                    // but not lower than 1 minute
+                    let usage_percentage = (100 * mem_used / mem_avail) as u16;
+                    let time_until_next_audit = if usage_percentage <= 50 {
+                        u8::min(32, time_period << 1)
+                    } else if usage_percentage <= 75 {
+                        u8::max(1, time_period >> 1)
+                    } else {
+                        u8::max(1, time_period >> 2)
+                    };
+                    if let Some(s_name) = app_mgr.get_name(s_id) {
+                        spawn(start_a_timer(
+                            to_app_mgr.clone(),
+                            TimeoutType::AuditMemoryForSwarm(s_id, s_name),
+                            Duration::from_secs(time_until_next_audit as u64),
+                        ));
+                    }
                 }
                 ToAppMgr::GetCIDsForTags(swarm_id, n_id, tags, all_first_pages) => {
                     eprintln!("We are requesting tags {:?} for {:?} swarm", tags, swarm_id);
@@ -899,6 +940,18 @@ async fn serve_app_manager(
                 ToAppMgr::TimeoutOver(t_type) => match t_type {
                     TimeoutType::AddToWaitList(s_name) => {
                         app_mgr.add_swarm_to_wait_list(s_name);
+                    }
+                    TimeoutType::AuditMemoryForSwarm(s_id, s_name) => {
+                        // check if s_id & s_name match,
+                        // if so send request to_app_data_send
+                        // if not: ignore, since that swarm instance is gone
+                        if let Some(curr_id) = app_mgr.get_swarm_id(&s_name) {
+                            if curr_id == s_id {
+                                if let Some(sender) = app_mgr.app_data_store.get(&curr_id) {
+                                    let _ = sender.send(ToAppData::RunMemoryUseAudit(1)).await;
+                                }
+                            }
+                        }
                     }
                     TimeoutType::Cooldown => {
                         app_mgr.cooldown_over();
@@ -1289,6 +1342,13 @@ async fn serve_app_manager(
                             // for neighboring Gnomes so that we are not stuck forever there
                             // TODO: Check SwarmSwap if there are other NewSwarms waiting to join
                             app_mgr.swarm_joined(s_name.clone());
+                            // TODO: make sure we are not running multiple timers
+                            // for the same swarm
+                            spawn(start_a_timer(
+                                to_app_mgr.clone(),
+                                TimeoutType::AuditMemoryForSwarm(s_id, s_name.clone()),
+                                Duration::from_secs(60),
+                            ));
                             swarm_swap.not_a_candidate(&s_name);
                             // if swarm_swap.has_candidates() {
                             //     eprintln!("SwapNewSwarm 4");
@@ -1316,7 +1376,7 @@ async fn serve_app_manager(
                                 to_swarm,
                                 to_app_mgr.clone(),
                                 to_search_enigne.clone(),
-                                config.store_data_on_disk,
+                                config.store_data_on_disk.clone(),
                             ));
                             spawn(serve_swarm(
                                 Duration::from_millis(64),
@@ -1708,7 +1768,7 @@ async fn serve_app_data(
     to_gnome_sender: Sender<ToGnome>,
     to_app_mgr_send: ASender<ToAppMgr>,
     to_search_enigne: ASender<SearchMsg>,
-    store_on_disk: bool,
+    store_on_disk: StoragePolicy,
 ) {
     let mut s_storage = PathBuf::new();
     let mut missing_pages = (0, HashMap::new());
@@ -1761,9 +1821,9 @@ async fn serve_app_data(
     // cleanup process in order to free some memory slots.
     // Contents that are unloaded from memory are being stored to disk if necessary.
     //
-    // TODO: build logic to decide whether or not we should store this Swarm's data on disk
-    //       and if so, which parts of it (maybe all?)
-    //       This should be merged with application logic
+    // TODO: build logic to decide whether or not we should store
+    //  this Swarm's data on disk and if so, which parts of it (maybe all?)
+    // This should be merged with application logic
     // let mut store_on_disk = false;
     let mut swarm_name = SwarmName::new(GnomeId::any(), "".to_string()).unwrap();
     eprintln!("Storage root app data: {:?}", storage);
@@ -2080,559 +2140,17 @@ async fn serve_app_data(
             }
             // A local request from application to synchronize with swarm
             ToAppData::ChangeContent(c_id, d_type, data_vec) => {
-                if let Ok((curr_d_type, curr_content_len)) = app_data.get_type_and_len(c_id) {
-                    let curr_hash = app_data.content_root_hash(c_id).unwrap();
-                    if curr_d_type == DataType::Link && curr_content_len > 0 {
-                        // if let Ok(_hashes) = app_data.read_link_ti_data(c_id, 0, curr_d_type) {
-                        eprintln!("We can not change a link with TransformInfo");
-                        continue;
-                        // }
-                    } else if curr_d_type != d_type {
-                        eprintln!("We can not change content to different DataType");
-                        continue;
-                    }
-                    // Step #1: We take hashes of provided Data from data_vec
-                    // There can be up to 65536 of 8-byte hashes so those can fill
-                    // up to 512 of 1024-byte Data blocks.
-                    let data_count = data_vec.len();
-                    let mut bottom_hashes_as_data_blocks =
-                        Vec::with_capacity((data_count >> 7) + 1);
-                    let mut bottom_hashes = Vec::with_capacity(data_count);
-                    for data in &data_vec {
-                        bottom_hashes.push(data.get_hash());
-                    }
-                    // TODO: check if only a single Data block has changed
-                    let existing_hashes = app_data.content_bottom_hashes(c_id).unwrap();
-                    let ex_len = existing_hashes.len();
-                    if ex_len == data_count {
-                        let mut only_difference: Option<u16> = None;
-                        for i in 0..data_count {
-                            if bottom_hashes[i] != existing_hashes[i] {
-                                if only_difference.is_some() {
-                                    only_difference = None;
-                                    break;
-                                } else {
-                                    only_difference = Some(i as u16);
-                                }
-                            }
-                        }
-                        if let Some(d_id) = only_difference {
-                            eprintln!("Transforming ChangeContent -> UpdateData");
-                            let _ = app_data_send
-                                .send(ToAppData::UpdateData(
-                                    c_id,
-                                    d_id,
-                                    data_vec[d_id as usize].clone(),
-                                ))
-                                .await;
-                            continue;
-                        }
-                    }
-                    // TODO: there can also be a case where a single data has been inserted
-                    // and all other data stays the same
-                    // TODO: there can also be a case where a single data has been removed
-                    // and all other data stays the same
-                    // eprintln!("bottom hashes: {:?}", bottom_hashes);
-                    // eprintln!("pre root hash: {}", get_root_hash(&bottom_hashes));
-                    let bottom_chunks = bottom_hashes.chunks_exact(128);
-                    let bottom_remainder = bottom_chunks.remainder();
-                    for chunk in bottom_chunks {
-                        let mut bytes = Vec::with_capacity(1024);
-                        for hash in chunk {
-                            for byte in hash.to_be_bytes() {
-                                bytes.push(byte);
-                            }
-                        }
-                        bottom_hashes_as_data_blocks.push(Data::new(bytes).unwrap());
-                    }
-                    if !bottom_remainder.is_empty() {
-                        let mut bytes = Vec::with_capacity(1024);
-                        for hash in bottom_remainder {
-                            for byte in hash.to_be_bytes() {
-                                bytes.push(byte);
-                            }
-                        }
-                        bottom_hashes_as_data_blocks.push(Data::new(bytes).unwrap());
-                    }
-
-                    // If data_count <= 128 we can immediately update entire Content,
-                    // by sending a SyncMessage with all the hashes of new Data.
-                    // So in this case we go directly to Step #4, skipping Steps #2 and #3.
-                    //
-                    //
-                    // Step #2: If data_count > 128 Data blocks we need to make second
-                    // round for taking hashes from resulting HashData blocks
-                    //  - now there can be up to 4 new HashHashData blocks.
-                    if data_count > 128 {
-                        let available_data_ids = u16::MAX - curr_content_len;
-                        let blocks_to_drop_count = if available_data_ids < data_count as u16 {
-                            data_count as u16 - available_data_ids
-
-                            // TODO: we need to create a flag in swarm sync
-                            // metadata, that will
-                            // mark given Content as being in a change process,
-                            // so that other actions on this CID are blocked
-                            // until this flag is off.
-                            //
-                        } else {
-                            0
-                        };
-                        let mut hash_hash_data = Vec::with_capacity(4);
-                        let mut hash_hash_data_hashes = Vec::with_capacity(4);
-                        // panic!("THIS IS NOT FULLY IMPLEMENTED!!!");
-                        let hash_hash_chunks = bottom_hashes_as_data_blocks.chunks_exact(128);
-                        let hash_hash_remainder = hash_hash_chunks.remainder();
-
-                        let mut add_d_id = curr_content_len - blocks_to_drop_count;
-                        for chunk in hash_hash_chunks {
-                            let mut bytes = Vec::with_capacity(1024);
-                            for data in chunk {
-                                for byte in data.get_hash().to_be_bytes() {
-                                    bytes.push(byte);
-                                }
-                            }
-                            let data = Data::new(bytes).unwrap();
-                            for byte in data.get_hash().to_be_bytes() {
-                                hash_hash_data_hashes.push(byte);
-                            }
-                            hash_hash_data.push((data, add_d_id));
-                            add_d_id = add_d_id + 1;
-                        }
-                        if !hash_hash_remainder.is_empty() {
-                            let mut bytes = Vec::with_capacity(1024);
-                            for data in hash_hash_remainder {
-                                for byte in data.get_hash().to_be_bytes() {
-                                    bytes.push(byte);
-                                }
-                            }
-                            let data = Data::new(bytes).unwrap();
-                            for byte in data.get_hash().to_be_bytes() {
-                                hash_hash_data_hashes.push(byte);
-                            }
-                            hash_hash_data.push((data, add_d_id));
-                        }
-                        //
-                        //
-                        // Step #3: If we needed two rounds to fit hashes into single SyncMessage the
-                        // procedure has to be more complicated.
-                        // There can be two scenarios that can happen here:
-                        // 1. We have enough data_ids available to hold all Data blocks from
-                        // first round of counting hashes (up to 512 new Data blocks);
-                        // 2. we do not have enough data_ids.
-                        let mut content_to_work_on = app_data.clone_content(c_id).unwrap();
-                        eprintln!("orig_hsh0 {}", content_to_work_on.hash());
-                        eprintln!("bhs0 {:?}", content_to_work_on.data_hashes());
-                        // To realize scenario #2 we need to know how many
-                        // Data blocks we need to free.
-                        // TODO: We also need to know how many
-                        // existing Data blocks
-                        // are not going to stay in refreshed Content.
-                        // If blocks-to-be-purged count is not enough
-                        // to make room for incoming blocks we will also
-                        // have to drop some of other blocks that will
-                        // have to be re-synced again in next step.
-                        //
-                        // Scenario 2:
-                        // Here we need to first make enough room for as many new Data blocks as needed
-                        // (changing Content's root hash) and then proceed with scenario 1.
-                        // This Data removal can be done in a brute-force way by just removing
-                        // last N Data blocks (first implementation),
-                        // or in a more sophisticated way removing selected data_ids starting from
-                        // data_ids with greatest value and moving down.
-                        // One SyncMessage is enough for both scenarios so second one is preffered.
-                        for _i in 0..blocks_to_drop_count {
-                            eprintln!("Dropping data...");
-                            let _ = content_to_work_on.pop_data();
-                        }
-                        let mut old_hash = curr_hash.1;
-                        let hhd_len = hash_hash_data.len() as u16;
-                        for (hhd, _d_id) in &hash_hash_data {
-                            let _ = content_to_work_on.push_data(Data::empty(hhd.get_hash()));
-                        }
-                        let mut new_hash = content_to_work_on.hash();
-                        eprintln!("New hash: {}", new_hash);
-                        eprintln!("bhs0 {:?}", content_to_work_on.data_hashes());
-                        let reqs = SyncRequirements {
-                            pre: vec![(c_id, old_hash)],
-                            post: vec![(c_id, new_hash)],
-                        };
-                        let msg = SyncMessage::new(
-                            SyncMessageType::ChangeContent(
-                                c_id,
-                                d_type,
-                                message::ChangeContentOperation::DropAndAppend(
-                                    blocks_to_drop_count,
-                                ),
-                            ),
-                            reqs,
-                            Data::new(hash_hash_data_hashes).unwrap(),
-                        );
-                        let parts = msg.into_parts();
-                        for part in parts {
-                            eprintln!("ToGnome::AddData(DropAndAppend)");
-                            let _ = to_gnome_sender.send(ToGnome::AddData(part));
-                        }
-                        // now we have to send updates that do not change
-                        // hash of our Content
-                        for (hhd, d_id) in hash_hash_data {
-                            eprintln!("paac write0: {}", hhd.get_hash());
-                            let reqs = SyncRequirements {
-                                pre: vec![(c_id, new_hash)],
-                                post: vec![(c_id, new_hash)],
-                            };
-                            let msg = SyncMessage::new(
-                                SyncMessageType::UpdateData(c_id, d_id),
-                                reqs,
-                                hhd,
-                            );
-                            let parts = msg.into_parts();
-                            for part in parts {
-                                eprintln!("ToGnome::AddData (UpdateData)");
-                                let _ = to_gnome_sender.send(ToGnome::AddData(part));
-                            }
-                        }
-                        //
-                        // Scenario 1:
-                        // We send a SyncMessage requesting to append multiple Datas to current
-                        // CID with provided list of hashes - here we change root hash of
-                        // our Content.
-                        // Then we send multiple Updates with actual HashHashData corresponding
-                        // to hashes from AppendMultipleDatas SyncMessage.
-                        // Next we send one more SyncMessage that requests to
-                        // pop all recently appended HashHashDatas (there can only be up to 4 of those)
-                        // use their contents as HashData hashes and once again expand CID with as many
-                        // Data::empty(hash) as needed.
-                        // This action is a second change of Content root hash.
-
-                        // pop & append
-                        old_hash = new_hash;
-                        // eprintln!("bhsw {:?}", content_to_work_on.data_hashes());
-                        for _i in 0..hhd_len {
-                            let pop_res = content_to_work_on.pop_data();
-                            if let Ok(dta) = pop_res {
-                                // eprintln!("paac prep pop: {}", dta.get_hash());
-                            } else {
-                                // eprintln!("error poping data: {}", pop_res.err().unwrap());
-                            }
-                        }
-                        // eprintln!("bhsx {:?}", content_to_work_on.data_hashes());
-                        for blk in &bottom_hashes_as_data_blocks {
-                            eprintln!("paac write: {}", blk.get_hash());
-                            let _ = content_to_work_on.push_data(Data::empty(blk.get_hash()));
-                        }
-                        let bh_db_len = bottom_hashes_as_data_blocks.len() as u16;
-
-                        new_hash = content_to_work_on.hash();
-                        // eprintln!("new_hash: {}", new_hash);
-                        // eprintln!("bhs: {:?}", content_to_work_on.data_hashes());
-                        let reqs = SyncRequirements {
-                            pre: vec![(c_id, old_hash)],
-                            post: vec![(c_id, new_hash)],
-                        };
-                        let msg = SyncMessage::new(
-                            SyncMessageType::ChangeContent(
-                                c_id,
-                                d_type,
-                                message::ChangeContentOperation::PopAndAppendConverted(hhd_len),
-                            ),
-                            reqs,
-                            Data::empty(0),
-                        );
-                        let parts = msg.into_parts();
-                        for part in parts {
-                            eprintln!("ToGnome::AddData (PopAndAppendConverted)");
-                            let _ = to_gnome_sender.send(ToGnome::AddData(part));
-                        }
-                        // TODO: Now we need to fill those appended Data::empty(hash) slots with actual data.
-                        // This Data blocks contain all of the bottom hashes of our Content ID.
-                        // send all Data Blocks
-                        // let bottom_hashes_db_len = bottom_hashes_as_data_blocks.len() as u16;
-                        for (d_id, data) in bottom_hashes_as_data_blocks.into_iter().enumerate() {
-                            eprintln!("pushing bhadb size: {}", data.len());
-                            let reqs = SyncRequirements {
-                                pre: vec![(c_id, new_hash)],
-                                post: vec![(c_id, new_hash)],
-                            };
-                            let msg = SyncMessage::new(
-                                SyncMessageType::UpdateData(c_id, curr_content_len + d_id as u16),
-                                reqs,
-                                data,
-                            );
-                            let parts = msg.into_parts();
-                            for part in parts {
-                                eprintln!(
-                                    "ToGnome::AddData (update #2 {} len:{})",
-                                    curr_content_len + d_id as u16,
-                                    part.len()
-                                );
-                                let _ = to_gnome_sender.send(ToGnome::AddData(part));
-                            }
-                        }
-                        //
-                        //
-                        //
-                        old_hash = new_hash;
-                        //TODO: pop & rebuild
-                        let mut rebuilt_content = Content::from(d_type, Data::empty(0)).unwrap();
-                        for data in &data_vec {
-                            let _ = rebuilt_content.push_data(data.clone());
-                        }
-                        new_hash = rebuilt_content.hash();
-                        eprintln!("rnew_hash: {}", new_hash);
-                        eprintln!("rbhs: {:?}", rebuilt_content.data_hashes());
-                        let reqs = SyncRequirements {
-                            pre: vec![(c_id, old_hash)],
-                            post: vec![(c_id, new_hash)],
-                        };
-                        let msg = SyncMessage::new(
-                            SyncMessageType::ChangeContent(
-                                c_id,
-                                d_type,
-                                message::ChangeContentOperation::PopAndCTreeRebuild(bh_db_len),
-                            ),
-                            reqs,
-                            Data::empty(0),
-                        );
-                        let parts = msg.into_parts();
-                        for part in parts {
-                            eprintln!("ToGnome::AddData (PopAndCTreeRebuild)");
-                            let _ = to_gnome_sender.send(ToGnome::AddData(part));
-                        }
-
-                        // send all Data Blocks
-                        for (d_id, data) in data_vec.into_iter().enumerate() {
-                            let reqs = SyncRequirements {
-                                pre: vec![(c_id, new_hash)],
-                                post: vec![(c_id, new_hash)],
-                            };
-                            let msg = SyncMessage::new(
-                                SyncMessageType::UpdateData(c_id, d_id as u16),
-                                reqs,
-                                data,
-                            );
-                            let parts = msg.into_parts();
-                            for part in parts {
-                                eprintln!("ToGnome::AddData (update #2)");
-                                let _ = to_gnome_sender.send(ToGnome::AddData(part));
-                            }
-                        }
-                        // TODO: we can not send that many messages to Gnome
-                        // at once, so there has to be a mechanism
-                        // that sends those only after previous message
-                        // was synced in Swarm.
-
-                        // So Step #3 requires at least two additional changes to Content root hash.
-                        // But right now we do not have any mechanism preventing other Data changes
-                        // in between. If there are any and we have precalculated pre- and post- hashes
-                        // then those values become obsolete and entire procedure fails with some
-                        // invalid Data blocks somewhere in ContentTree.
-                        // On the other hand if we calculate every pre- and post- hash just before
-                        // sending a SyncMessage those other changes that happened in between will get
-                        // wiped out.
-                        // So for now it is recommended to first make sure that there is no other
-                        // change being submitted to given swarm that modifies given Content
-                        // that is undergoing extended change content process.
-                        // A solution involving a Reconfigure message comes to mind but for now
-                        // this entire procedure is complicated enough to give one a headache.
-
-                        //TODO: implement above
-                    } else {
-                        // Step #4: A SyncMessage requesting change of entire Content is issued.
-                        // In this step Content root hash is updated with final hash value.
-                        // We move all existing Data blocks aside into a HashMap<Hash, Data>
-                        // and starting from scratch push Data::empty(hash) one by one into CID.
-                        // If there happens to be a match for given hash in a hashmap we've just
-                        // created we take that Data and put it in place.
-                        //
-                        // Additionally we can send all remaining Data blocks in an UpdateData
-                        // sync message that does not change Content's root hash.
-                        //
-                        // All of above means entire Swarm is always synchronized,
-                        // so even if a Gnome joins in the middle of this procedure,
-                        //  he will stay synced (will just need to ask his Neighbors for
-                        // Data to catch up).
-                        // TODO: implement above
-                        let new_hash = get_root_hash(&bottom_hashes);
-                        // eprintln!("New hash: {}", new_hash);
-                        let reqs = SyncRequirements {
-                            pre: vec![(c_id, curr_hash.1)],
-                            post: vec![(c_id, new_hash)],
-                        };
-                        let msg = SyncMessage::new(
-                            SyncMessageType::ChangeContent(
-                                c_id,
-                                d_type,
-                                message::ChangeContentOperation::DirectCTreeRebuild,
-                            ),
-                            reqs,
-                            bottom_hashes_as_data_blocks[0].clone(),
-                        );
-                        let parts = msg.into_parts();
-                        for part in parts {
-                            eprintln!("ToGnome::AddData(DirectCTreeRebuild)");
-                            let _ = to_gnome_sender.send(ToGnome::AddData(part));
-                        }
-
-                        //TODO: now we need to send actual Data as well
-                        // TODO: we should only send Data blocks that did not exist before CC
-                        let reqs = SyncRequirements {
-                            pre: vec![(c_id, new_hash)],
-                            post: vec![(c_id, new_hash)],
-                        };
-                        let existing_bottom_hashes = app_data.content_bottom_hashes(c_id).unwrap();
-                        for (d_id, data) in data_vec.iter().enumerate() {
-                            if existing_bottom_hashes.contains(&data.get_hash()) {
-                                eprintln!(
-                                    "Not sending Page {}-{} as it was not changed",
-                                    c_id, d_id
-                                );
-                                continue;
-                            }
-                            let msg = SyncMessage::new(
-                                SyncMessageType::UpdateData(c_id, d_id as u16),
-                                reqs.clone(),
-                                data.clone(),
-                            );
-                            let parts = msg.into_parts();
-                            for part in parts {
-                                eprintln!("ToGnome::AddData(Update after Direct)");
-                                let _ = to_gnome_sender.send(ToGnome::AddData(part));
-                            }
-                        }
-                    }
-                    //
-                    //
-                    // Following is old solution
-                    // eprintln!(
-                    //     "app data received CC request… for {} with {} data blocks",
-                    //     c_id,
-                    //     data_vec.len()
-                    // );
-                    // let mut content_to_work_on = app_data.clone_content(c_id).unwrap();
-                    // for data in &data_vec {
-                    //     eprintln!("Hash of data to add: {:?}", data.get_hash().to_be_bytes());
-                    // }
-                    // let pre_hash = content_to_work_on.hash();
-                    // let existing_d_type = content_to_work_on.data_type();
-                    // // OK, so in order to apply multiple changes we need to:
-                    // // - verify if d_type allows for this change
-                    // if existing_d_type == DataType::Link {
-                    //     if let Ok(_hashes) = content_to_work_on.link_ti_hashes() {
-                    //         eprintln!("We can not change a link with TransformInfo");
-                    //         continue;
-                    //     }
-                    // } else if existing_d_type != d_type {
-                    //     eprintln!("We can not change content to different DataType");
-                    //     continue;
-                    // }
-                    // // - make sure there is multiple data blocks that need to change
-                    // //   and not just one, or even zero
-                    // let existing_hashes = content_to_work_on.data_hashes();
-                    // let mut new_hashes = Vec::with_capacity(data_vec.len());
-                    // for data in &data_vec {
-                    //     new_hashes.push(data.get_hash());
-                    // }
-                    // let existing_len = existing_hashes.len();
-                    // let new_len = new_hashes.len();
-                    // let mut diff_indices = vec![];
-                    // let mut append_indices = vec![];
-                    // let mut shrink_indices = vec![];
-                    // if existing_len <= new_len {
-                    //     eprintln!("existing <= new");
-                    //     for i in 0..existing_len {
-                    //         if existing_hashes[i] != new_hashes[i] {
-                    //             diff_indices.push(i);
-                    //         }
-                    //     }
-                    //     for i in existing_len..new_len {
-                    //         append_indices.push(i);
-                    //     }
-                    // } else {
-                    //     eprintln!("existing > new");
-                    //     //We are shrinking content
-                    //     for i in new_len..existing_len {
-                    //         shrink_indices.push(i);
-                    //     }
-                    //     for i in 0..new_len {
-                    //         if existing_hashes[i] != new_hashes[i] {
-                    //             diff_indices.push(i);
-                    //         }
-                    //     }
-                    // }
-                    // //TODO: send request to pop shrinking data blocks
-                    // // TODO: this can be a 3-step procedure on a swarm,
-                    // // and other users might perform changes in between those
-                    // // steps, so it is not guaranteed to succeed completely.
-                    // // Probably we should find a better way
-                    // // Maybe enqueue subsequent changes from diff_indices?
-                    // if !shrink_indices.is_empty() {
-                    //     eprintln!("We should pop some Data blocks from CID: {}", c_id);
-                    //     //TODO: new we need to update pre_hash for subsequent requests
-                    // } else if new_len - existing_len > 1 {
-                    //     //TODO: send request to reserve new data blocks
-                    //     eprintln!("We should reserve some new Data blocks for CID: {}", c_id);
-                    //     //TODO: new we need to update pre_hash for subsequent requests
-                    //     let mut new_hashes = vec![];
-                    //     let mut new_datas = vec![];
-                    //     for idx in &append_indices {
-                    //         new_datas.push(data_vec[*idx].clone());
-                    //     }
-                    //     for index in &append_indices {
-                    //         for byte in data_vec[*index].get_hash().to_be_bytes() {
-                    //             new_hashes.push(byte);
-                    //         }
-                    //     }
-                    //     let _ = app_data_send
-                    //         .send(ToAppData::AppendShelledDatas(
-                    //             c_id,
-                    //             Data::new(new_hashes).unwrap(),
-                    //             new_datas,
-                    //         ))
-                    //         .await;
-                    // } else if new_len - existing_len == 1 {
-                    //     eprintln!(
-                    //         "New len {} - existing len {} = {}",
-                    //         new_len,
-                    //         existing_len,
-                    //         new_len - existing_len
-                    //     );
-                    //     eprintln!("Append indices: {:?}", append_indices);
-                    //     let _ = app_data_send
-                    //         .send(ToAppData::AppendData(
-                    //             c_id,
-                    //             data_vec[append_indices[0]].clone(),
-                    //         ))
-                    //         .await;
-                    // }
-
-                    // //TODO: for every changed block apply changes one by one
-                    // // We assume no data was appended nor removed!!!
-                    // for index in diff_indices {
-                    //     eprintln!("we should do something with idx: {}", index);
-                    //     let hash_bundle = app_data.content_root_hash(c_id).unwrap();
-                    //     let old_data = app_data
-                    //         .update_data(c_id, index as u16, data_vec[index].clone())
-                    //         .unwrap();
-                    //     let new_hash_bundle = app_data.content_root_hash(c_id).unwrap();
-                    //     let reqs = SyncRequirements {
-                    //         pre: vec![(c_id, hash_bundle.1)],
-                    //         post: vec![(c_id, new_hash_bundle.1)],
-                    //     };
-                    //     let _data = app_data.update_data(c_id, index as u16, old_data);
-                    //     let msg = SyncMessage::new(
-                    //         SyncMessageType::UpdateData(c_id, index as u16),
-                    //         reqs,
-                    //         data_vec[index].clone(),
-                    //     );
-                    //     let parts = msg.into_parts();
-                    //     for part in parts {
-                    //         let _ = to_gnome_sender.send(ToGnome::AddData(part));
-                    //     }
-                    // }
-                } else {
-                    eprintln!("Unable to change non existing content");
-                }
+                change_content_task(
+                    c_id,
+                    d_type,
+                    data_vec,
+                    &mut app_data,
+                    &app_data_send,
+                    &to_gnome_sender,
+                )
+                .await
             }
+
             ToAppData::ChangeDiameter(new_diameter) => {
                 eprintln!("Requesting gnome to change diameter to:{}", new_diameter);
                 let _ = to_gnome_sender.send(ToGnome::ChangeDiameter(new_diameter));
@@ -2881,1202 +2399,63 @@ async fn serve_app_data(
                 }
             }
             ToAppData::Response(GnomeToApp::Block(_id, data)) => {
-                // println!("Processing data...");
-                let process_result = app_data.process(data);
-                if process_result.is_none() {
-                    continue;
-                }
-                // println!("Process response: {:?}", process_result);
-                let SyncMessage {
-                    m_type,
-                    requirements,
+                response_task(
+                    // id,
                     data,
-                } = process_result.unwrap();
-
-                // println!("Received m_type: {:?}", m_type);
-                match m_type {
-                    // SyncMessageType::SetManifest => {
-                    //     let old_manifest = app_data.get_all_data(0);
-                    //     if !requirements.pre_validate(0, &app_data) {
-                    //         eprintln!("PRE validation failed");
-                    //     } else {
-                    //         let content = Content::Data(0, ContentTree::Filled(data));
-                    //         let next_id = app_data.next_c_id().unwrap();
-                    //         let res = if next_id == 0 {
-                    //             app_data.append(content).is_ok()
-                    //         } else {
-                    //             app_data.update(0, content).is_ok()
-                    //         };
-                    //         // println!("Manifest result: {:?}", res);
-                    //         if !requirements.post_validate(0, &app_data) {
-                    //             eprintln!("POST validation failed");
-                    //             if let Ok(data_vec) = old_manifest {
-                    //                 let c_tree = ContentTree::from(data_vec);
-                    //                 let old_content = Content::Data(0, c_tree);
-                    //                 let res = app_data.update(0, old_content);
-                    //                 eprintln!("Restored old manifest {:?}", res.is_ok());
-                    //             } else {
-                    //                 let content = Content::Data(0, ContentTree::Empty(0));
-                    //                 let _ = app_data.update(0, content);
-                    //                 eprintln!("Zeroed manifest");
-                    //             }
-                    //         }
-                    //         let hash = app_data.root_hash();
-                    //         eprintln!("Sending updated hash: {}", hash);
-                    //         let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
-                    //         eprintln!("Send res: {:?}", res);
-                    //         // println!("Root hash: {}", app_data.root_hash());
-                    //     }
-                    // }
-                    SyncMessageType::AppendContent(d_type) => {
-                        eprintln!("AppendContent {:?} dhash: {}", d_type, data.get_hash());
-                        // TODO: potentially for AddContent & ChangeContent
-                        // post requirements could be empty
-                        // pre requirements can not be empty since we need
-                        // ContentID
-                        let next_id = app_data.next_c_id().unwrap();
-                        if !requirements.pre_validate(next_id, &app_data) {
-                            eprintln!("PRE validation failed for AddContent");
-                        } else {
-                            if requirements.post.len() != 1 {
-                                eprintln!(
-                                    "POST validation failed for AddContent 1 ({:?})",
-                                    requirements.post
-                                );
-                                continue;
-                            }
-                            eprintln!("Content from: {:?} {:?}", d_type, data);
-                            let content = Content::from(d_type, data).unwrap();
-                            eprintln!("Content hash: {}", content.hash());
-                            let (recv_id, recv_hash) = requirements.post[0];
-                            if recv_id == next_id && recv_hash == content.hash() {
-                                let d_type = content.data_type();
-                                let main_page = if let Ok(d) = content.read_data(0) {
-                                    d
-                                } else {
-                                    Data::empty(0)
-                                };
-                                let _res = app_data.append(content);
-                                eprintln!("Content added: {:?}", _res);
-                                // let hash = app_data.root_hash();
-                                // eprintln!("Sending updated hash: {}", hash);
-                                // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
-                                // eprintln!("Send res: {:?}", res);
-                                let _to_mgr_res = to_app_mgr_send
-                                    .send(ToAppMgr::ContentAdded(
-                                        swarm_id, recv_id, d_type, main_page,
-                                    ))
-                                    .await;
-                            } else {
-                                eprintln!("Recv id: {}, next id: {}", recv_id, next_id);
-                                eprintln!(
-                                    "Recv hash: {}, next hash: {}",
-                                    recv_hash,
-                                    content.hash()
-                                );
-                                eprintln!("POST validation failed for AddContent two");
-                            }
-                            // println!("Root hash: {}", app_data.root_hash());
-                        }
-                    }
-                    SyncMessageType::ChangeContent(c_id, d_type, operation) => {
-                        app_data
-                            .process_change_content(
-                                c_id,
-                                d_type,
-                                operation,
-                                requirements,
-                                data,
-                                &mut missing_pages,
-                                swarm_id,
-                                to_app_mgr_send.clone(),
-                            )
-                            .await;
-                    }
-                    SyncMessageType::AppendShelledDatas(c_id) => {
-                        eprintln!("SyncMessageType::AppendShelledDatas");
-                        if !requirements.pre_validate(c_id, &app_data) {
-                            eprintln!("PRE validation failed for AppendShelledDatas");
-                            continue;
-                        }
-                        //TODO: we unpack hashes from received data, and for each
-                        // hash we create an Data::empty(hash) that we append to
-                        // given c_id in order received
-                        // let mut bytes = data.bytes().into_iter();
-                        let bytes = data.bytes();
-                        let mut hashes = vec![];
-                        for hash_bytes in bytes.chunks_exact(8) {
-                            let hash = u64::from_be_bytes(hash_bytes.try_into().unwrap());
-                            hashes.push(hash);
-                        }
-                        let to_add_total = hashes.len();
-                        let hash_iter = hashes.iter();
-                        // let mut all_res_ok = true;
-                        let mut added_count = 0;
-                        for hash in hash_iter {
-                            let res = app_data.append_data(c_id, Data::empty(*hash));
-                            if res.is_ok() {
-                                added_count += 1;
-                            } else {
-                                eprintln!("Failure adding shelled data: {:?}", res.err().unwrap());
-                                break;
-                            }
-                        }
-                        if added_count == to_add_total {
-                            if !requirements.post_validate(c_id, &app_data) {
-                                eprintln!("POST validation failed for AppendShelledDatas");
-                                // TODO: restore previous order
-                                for i in 0..added_count {
-                                    let res = app_data.pop_data(c_id);
-                                    eprintln!("Pop {} result: {:?}", i, res);
-                                }
-                            } else {
-                                let hash = app_data.root_hash();
-                                // eprintln!("Sending updated hash: {}", hash);
-                                // let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
-                                // eprintln!("Send res: {:?}", res);
-                                eprintln!(
-                                    "Data shells appended successfully ({}, added: {})",
-                                    hash, added_count
-                                );
-                            }
-                        } else {
-                            for i in 0..added_count {
-                                let res = app_data.pop_data(c_id);
-                                eprintln!("Pop {} result: {:?}", i, res);
-                            }
-                        }
-                    }
-                    SyncMessageType::AppendData(c_id) => {
-                        //TODO
-                        eprintln!("SyncMessageType::AppendData ");
-                        // eprintln!(
-                        //     "Sync Append bottom hashes before: {:?}",
-                        //     app_data.content_bottom_hashes(c_id).unwrap()
-                        // );
-                        if !requirements.pre_validate(c_id, &app_data) {
-                            eprintln!("PRE validation failed for AppendData");
-                            continue;
-                        }
-                        // TODO
-                        let res = app_data.append_data(c_id, data);
-                        if res.is_ok() {
-                            if !requirements.post_validate(c_id, &app_data) {
-                                eprintln!("POST validation failed for AppendData");
-                                // TODO: restore previous order
-                                let res = app_data.pop_data(c_id);
-                                eprintln!("Restore result: {:?}", res);
-                            } else {
-                                let hash = app_data.root_hash();
-                                // eprintln!("Sending updated hash: {}", hash);
-                                // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
-                                // eprintln!("Send res: {:?}", res);
-                                eprintln!("Data appended successfully ({})", hash);
-                            }
-                        }
-                    }
-                    SyncMessageType::RemoveData(c_id, d_id) => {
-                        //TODO
-                        eprintln!("SyncMessageType::RemoveData ");
-                        if !requirements.pre_validate(c_id, &app_data) {
-                            eprintln!("PRE validation failed for RemoveData");
-                            continue;
-                        }
-                        // TODO
-                        // eprintln!(
-                        //     "CID-{} root hash befor remove: {}",
-                        //     c_id,
-                        //     app_data.content_root_hash(c_id).unwrap().1
-                        // );
-                        let res = app_data.remove_data(c_id, d_id);
-                        if let Ok(removed_data) = res {
-                            if !requirements.post_validate(c_id, &app_data) {
-                                eprintln!("POST validation failed for RemoveData");
-                                // TODO: restore previous order
-                                // TODO: make sure hash after insert_data is equal to
-                                //       that before removal!!!
-                                let res = app_data.insert_data(c_id, d_id, removed_data);
-                                // eprintln!(
-                                //     "CID-{} root hash after restoration: {}",
-                                //     c_id,
-                                //     app_data.content_root_hash(c_id).unwrap().1
-                                // );
-                                eprintln!("Restore result: {:?}", res);
-                            } else {
-                                eprintln!("Data removed successfully ({})", app_data.root_hash());
-                            }
-                        }
-                    }
-                    SyncMessageType::UpdateData(c_id, d_id) => {
-                        //TODO
-                        eprintln!(
-                            "SyncMessageType::UpdateData {}-{}(size: {})",
-                            c_id,
-                            d_id,
-                            data.len()
-                        );
-                        let (d_type, len) = app_data.get_type_and_len(c_id).unwrap();
-                        // eprintln!("Len: {}", len);
-                        // let bot_hashes = app_data.content_bottom_hashes(c_id).unwrap();
-                        // for bot in bot_hashes {
-                        //     eprintln!("hash: {}", bot);
-                        // }
-                        if !requirements.pre_validate(c_id, &app_data) {
-                            eprintln!("PRE validation failed for UpdateData");
-                            continue;
-                        }
-                        // TODO
-                        // let (_t, len) = app_data.get_type_and_len(c_id).unwrap();
-                        // eprintln!("Before update len: {}", len);
-                        // eprintln!("all current hashes: {}", c_id);
-                        // let bottoms = app_data.get_all_page_hashes(c_id).unwrap();
-                        // for bot in bottoms {
-                        //     eprintln!("hash2: {}", bot);
-                        // }
-                        let main_page_option = if d_id == 0 { Some(data.clone()) } else { None };
-                        let data_hash = data.get_hash();
-                        let res = app_data.update_data(c_id, d_id, data);
-                        if let Ok(updated_data) = res {
-                            if !requirements.post_validate(c_id, &app_data) {
-                                eprintln!("POST validation failed for UpdateData");
-                                // TODO: restore previous order
-                                let res = app_data.update_data(c_id, d_id, updated_data);
-                                eprintln!("Restore result: {:?}", res);
-                            } else {
-                                let hash = app_data.root_hash();
-                                if missing_pages.0 == c_id {
-                                    missing_pages.1.remove(&data_hash);
-                                    if missing_pages.1.is_empty() {
-                                        let _to_mgr_res = to_app_mgr_send
-                                            .send(ToAppMgr::ContentChanged(
-                                                swarm_id,
-                                                c_id,
-                                                d_type,
-                                                main_page_option,
-                                            ))
-                                            .await;
-                                    }
-                                } else {
-                                    let _to_mgr_res = to_app_mgr_send
-                                        .send(ToAppMgr::ContentChanged(
-                                            swarm_id,
-                                            c_id,
-                                            d_type,
-                                            main_page_option,
-                                        ))
-                                        .await;
-                                }
-                                // eprintln!("Sending updated hash: {}", hash);
-                                // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
-                                // eprintln!("Send res: {:?}", res);
-                                eprintln!("Data updated successfully ({})", hash);
-                            }
-                        } else {
-                            eprintln!("UpdateData failed: {}", res.err().unwrap());
-                        }
-                    }
-                    SyncMessageType::InsertData(c_id, d_id) => {
-                        //TODO
-                        eprintln!("SyncMessageType::InsertData ");
-                    }
-                    SyncMessageType::ExtendData(c_id, d_id) => {
-                        //TODO
-                        eprintln!("SyncMessageType::ExtendData ");
-                    }
-                    SyncMessageType::UserDefined(_value) => {
-                        //TODO
-                        eprintln!("SyncMessageType::UserDefined({})", _value);
-                    }
-                }
+                    &mut app_data,
+                    &to_app_mgr_send,
+                    swarm_id,
+                    &mut missing_pages,
+                )
+                .await
             }
-            ToAppData::CustomRequest(m_type, neighbor_id, cast_data) => {
-                //TODO: Cases not cover here should be allowed to be served by dapp-lib's user
-                // We need to cover different bootstrap sync requests:
-                // - root hashes only of all Contents
-                // - data/page hashes of specified ContentIDs
-                //  In future we could define a generic sync request to send
-                //   back Contents that have been tagged with specific tags.
-                // - actual Content Data (aka future: Pages) for specified ContentIDs
-                //   Here we should distinguish between sending all pages or only specific
-                //   ones like only first page that usually consists of description of a
-                //   content.
-                // In order to do so, we should only take a single m_type value,
-                // following bytes should be used to further specify our request
-                //
-                // When sending Response we should also cover the same cases as above,
-                // also by using a single m_type value.
-                // Special case to consider is when we are sending main Page of a Link.
-                // Link has optional TransformInfo attribute, and it is necessary
-                // when sideloading Pages via broadcast or other means than SyncMessages.
-                match m_type {
-                    0 => {
-                        let sync_requests = deserialize_requests(cast_data.bytes());
-                        // eprintln!("Got Sync Request: {:?}", sync_requests);
-                        // println!("Got AppSync inquiry");
-                        // TODO: we have to unconditionally sync partial_data!!!
-                        let sync_type = 0;
-                        let partial_hashes = app_data.get_partial_hashes();
-                        for hdata in partial_hashes.into_iter() {
-                            let sync_response = SyncResponse::Partial(true, hdata);
-                            let _ = to_gnome_sender.send(ToGnome::SendData(
-                                neighbor_id,
-                                NeighborResponse::Custom(
-                                    sync_type,
-                                    CastData::new(sync_response.serialize()).unwrap(),
-                                ),
-                            ));
-                        }
-                        let partial_datas = app_data.get_partial_data();
-                        for hdata in partial_datas.into_iter() {
-                            let sync_response = SyncResponse::Partial(false, hdata);
-                            let _ = to_gnome_sender.send(ToGnome::SendData(
-                                neighbor_id,
-                                NeighborResponse::Custom(
-                                    sync_type,
-                                    CastData::new(sync_response.serialize()).unwrap(),
-                                ),
-                            ));
-                        }
-                        eprintln!("Sent Partial response");
-                        let mut sync_req_iter = sync_requests.into_iter();
-                        while let Some(req) = sync_req_iter.next() {
-                            match req {
-                                SyncRequest::Datastore => {
-                                    eprintln!("{} Got SyncRequest::Datastore", swarm_id);
-                                    // TODO: here we should trigger a separate task for sending
-                                    // all root hashes to specified Neighbor
-                                    // let sync_type = 0;
-                                    let hashes = app_data.all_content_typed_root_hashes();
-                                    let hashes_len = hashes.len() as u16;
-                                    for (part_no, group) in hashes.into_iter().enumerate() {
-                                        let sync_response = SyncResponse::Datastore(
-                                            part_no as u16,
-                                            hashes_len - 1,
-                                            group,
-                                        );
-                                        let _ = to_gnome_sender.send(ToGnome::SendData(
-                                            neighbor_id,
-                                            NeighborResponse::Custom(
-                                                sync_type,
-                                                CastData::new(sync_response.serialize()).unwrap(),
-                                            ),
-                                        ));
-                                    }
-                                    eprintln!("{} Sent Datastore response", swarm_id);
-                                }
-                                SyncRequest::AllFirstPages(tags_opt) => {
-                                    // TODO: here we should trigger a separate task for sending
-                                    // all Content's main pages to specified Neighbor
-                                    eprintln!(
-                                        "We are requested to send all first pages to neighbor."
-                                    );
-                                    if let Some(tags) = tags_opt {
-                                        //TODO: we send tags and all first pages to App and wait
-                                        // when we get response we send first pages to Neighbor
-                                        // (Different apps may implement different tagging strategies)
-                                        eprintln!("Only first pages of select Contents");
-
-                                        let next_c_id = app_data.next_c_id().unwrap();
-                                        let mut all_first_pages =
-                                            Vec::with_capacity(next_c_id as usize);
-                                        for c_id in 1..next_c_id {
-                                            if let Ok(data) = app_data.read_data(c_id, 0) {
-                                                all_first_pages.push((c_id, data));
-                                                // let (data_type, len) =
-                                                //     app_data.get_type_and_len(c_id).unwrap();
-                                                // let sync_response = SyncResponse::Page(
-                                                //     c_id, data_type, 0, len, data,
-                                                // );
-                                            }
-                                        }
-                                        let _ = to_app_mgr_send
-                                            .send(ToAppMgr::GetCIDsForTags(
-                                                swarm_id,
-                                                neighbor_id,
-                                                tags,
-                                                all_first_pages,
-                                            ))
-                                            .await;
-                                    } else {
-                                        let sync_type = 0;
-                                        for c_id in 1..app_data.next_c_id().unwrap() {
-                                            eprintln!(
-                                                "We need to send main page of ContentID-{}",
-                                                c_id
-                                            );
-                                            if let Ok(data) = app_data.read_data(c_id, 0) {
-                                                let (data_type, len) =
-                                                    app_data.get_type_and_len(c_id).unwrap();
-                                                let sync_response = SyncResponse::Page(
-                                                    c_id, data_type, 0, len, data,
-                                                );
-                                                // println!("Sending bytes: {:?}", bytes);
-                                                let res = to_gnome_sender.send(ToGnome::SendData(
-                                                    neighbor_id,
-                                                    NeighborResponse::Custom(
-                                                        sync_type,
-                                                        CastData::new(sync_response.serialize())
-                                                            .unwrap(),
-                                                    ),
-                                                ));
-                                                if res.is_ok() {
-                                                    eprintln!(
-                                                        "Main page of {} sent successfully.",
-                                                        c_id,
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                // SyncRequest::Hashes(c_id, d_type, h_ids) => {
-                                SyncRequest::Hashes(c_id, h_ids) => {
-                                    //TODO
-                                    eprintln!(
-                                        "We should send some page hashes of Contents: {:?}",
-                                        c_id
-                                    );
-                                    let hash_res = if let Ok((data_type, _len)) =
-                                        app_data.get_type_and_len(c_id)
-                                    {
-                                        // if data_type == d_type {
-                                        if data_type == DataType::Link {
-                                            app_data.get_all_transform_info_hashes(c_id)
-                                        } else {
-                                            // Err(AppError::DatatypeMismatch)
-                                            app_data.get_all_page_hashes(c_id)
-                                        }
-                                    } else {
-                                        Err(AppError::IndexingError)
-                                    };
-                                    if let Ok(mut hashes) = hash_res {
-                                        if !hashes.is_empty() {
-                                            let sync_type = 0;
-                                            let hashes_len = hashes.len() as u16 - 1;
-                                            if h_ids.is_empty() {
-                                                // eprintln!("We send all hashes of CID {}", c_id);
-                                                for i in 0..=hashes_len {
-                                                    let hash_data = std::mem::replace(
-                                                        &mut hashes[i as usize],
-                                                        Data::empty(0),
-                                                    );
-                                                    let sync_response = SyncResponse::Hashes(
-                                                        c_id, i, hashes_len, hash_data,
-                                                    );
-                                                    let res =
-                                                        to_gnome_sender.send(ToGnome::SendData(
-                                                            neighbor_id,
-                                                            NeighborResponse::Custom(
-                                                                sync_type,
-                                                                CastData::new(
-                                                                    sync_response.serialize(),
-                                                                )
-                                                                .unwrap(),
-                                                            ),
-                                                        ));
-                                                    if res.is_ok() {
-                                                        eprintln!(
-                                                            "Hashes [{}/{}] of {} sent",
-                                                            i, hashes_len, c_id
-                                                        );
-                                                    }
-                                                }
-                                            } else {
-                                                for h_id in h_ids {
-                                                    if h_id <= hashes_len {
-                                                        let hash_data = std::mem::replace(
-                                                            &mut hashes[h_id as usize],
-                                                            Data::empty(0),
-                                                        );
-                                                        let sync_response = SyncResponse::Hashes(
-                                                            c_id, h_id, hashes_len, hash_data,
-                                                        );
-                                                        let res = to_gnome_sender.send(
-                                                            ToGnome::SendData(
-                                                                neighbor_id,
-                                                                NeighborResponse::Custom(
-                                                                    sync_type,
-                                                                    CastData::new(
-                                                                        sync_response.serialize(),
-                                                                    )
-                                                                    .unwrap(),
-                                                                ),
-                                                            ),
-                                                        );
-                                                        if res.is_ok() {
-                                                            eprintln!(
-                                                                "Hashes [{}/{}] of {} sent",
-                                                                h_id, hashes_len, c_id
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                SyncRequest::Pages(c_id, d_type, _p_ids) => {
-                                    //TODO
-                                    eprintln!(
-                                        "We are requested to send some pages to neighbor ({:?}: {:?}).",c_id,
-                                        _p_ids
-                                    );
-                                    if let Ok((data_type, len)) = app_data.get_type_and_len(c_id) {
-                                        if data_type == d_type {
-                                            if len > 0 {
-                                                let total = len as u16 - 1;
-                                                let sync_type = 0;
-                                                for p_id in _p_ids {
-                                                    if let Ok(data) = app_data.read_data(c_id, p_id)
-                                                    {
-                                                        let sync_response = SyncResponse::Page(
-                                                            c_id, data_type, p_id, total, data,
-                                                        );
-                                                        let r = to_gnome_sender.send(
-                                                            ToGnome::SendData(
-                                                                neighbor_id,
-                                                                NeighborResponse::Custom(
-                                                                    sync_type,
-                                                                    CastData::new(
-                                                                        sync_response.serialize(),
-                                                                    )
-                                                                    .unwrap(),
-                                                                ),
-                                                            ),
-                                                        );
-                                                        if r.is_ok() {
-                                                            eprintln!(
-                                                                "Sent {}[{}/{}]",
-                                                                c_id, p_id, total
-                                                            );
-                                                        }
-                                                    } else {
-                                                        eprintln!("No Data read.");
-                                                    }
-                                                }
-                                            }
-                                        } else if data_type == DataType::Link {
-                                            eprintln!("Link len: {}", len);
-                                            if len > 0 {
-                                                let total = len as u16 - 1;
-                                                let sync_type = 0;
-                                                for p_id in _p_ids {
-                                                    if let Ok((data, size)) = app_data
-                                                        .read_link_ti_data(c_id, p_id, d_type)
-                                                    {
-                                                        let sync_response = SyncResponse::Page(
-                                                            c_id, d_type, p_id, size, data,
-                                                        );
-                                                        let r = to_gnome_sender.send(
-                                                            ToGnome::SendData(
-                                                                neighbor_id,
-                                                                NeighborResponse::Custom(
-                                                                    sync_type,
-                                                                    CastData::new(
-                                                                        sync_response.serialize(),
-                                                                    )
-                                                                    .unwrap(),
-                                                                ),
-                                                            ),
-                                                        );
-                                                        if r.is_ok() {
-                                                            eprintln!(
-                                                                "Sent {}[{}/{}]",
-                                                                c_id, p_id, total
-                                                            );
-                                                        }
-                                                    } else {
-                                                        eprintln!("No Data read.");
-                                                    }
-                                                }
-                                            }
-                                        } else {
-                                            // Err(AppError::DatatypeMismatch)
-                                        };
-                                    }
-                                }
-                                SyncRequest::AllPages(c_ids) => {
-                                    // TODO: here we should trigger a separate task for
-                                    // each ContentID received in order to send
-                                    // all Content's pages to specified Neighbor
-                                    eprintln!(
-                                        "We are requested to send all pages of Contents: {:?}.",
-                                        c_ids
-                                    );
-                                    let sync_type = 0;
-                                    for c_id in c_ids {
-                                        eprintln!("Sending {} CID-{}", swarm_id, c_id);
-                                        //TODO: first we send all page hashes
-                                        //      second we send pages
-                                        if let Ok(data_vec) = app_data.get_all_data(c_id) {
-                                            if data_vec.is_empty() {
-                                                eprintln!(
-                                                    "Get all data returned empty vector for CID-{}",
-                                                    c_id
-                                                );
-                                                continue;
-                                            }
-                                            let (data_type, len) =
-                                                app_data.get_type_and_len(c_id).unwrap();
-                                            let total = if len > 0 { len - 1 } else { 0 };
-
-                                            for (part_no, data) in data_vec.into_iter().enumerate()
-                                            {
-                                                let sync_response = SyncResponse::Page(
-                                                    c_id,
-                                                    data_type,
-                                                    part_no as u16,
-                                                    total,
-                                                    data,
-                                                );
-                                                let _ = to_gnome_sender.send(ToGnome::SendData(
-                                                    neighbor_id,
-                                                    NeighborResponse::Custom(
-                                                        sync_type,
-                                                        CastData::new(sync_response.serialize())
-                                                            .unwrap(),
-                                                    ),
-                                                ));
-                                            }
-                                        } else {
-                                            //TODO
-                                            eprintln!("Get all data failed for CID-{}", c_id);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    other => {
-                        eprintln!("Request {}", other);
-                    }
-                }
-            }
-            //TODO: CustomResponse & CustomRequest should be handled externally by App
+            //TODO: CustomResponse & CustomRequest
+            // should be handled externally by App
             // or they should not be called Custom
-            ToAppData::CustomResponse(m_type, _neighbor_id, cast_data) => {
-                match m_type {
-                    0 => {
-                        if let Ok(response) = SyncResponse::deserialize(cast_data.bytes()) {
-                            //TODO:
-                            // eprintln!("Deserialized response!: {:?}", response);
-                            match response {
-                                SyncResponse::Partial(is_hash_data, data) => {
-                                    app_data.update_partial(is_hash_data, data);
-                                }
-                                SyncResponse::Datastore(part_no, total, mut hashes) => {
-                                    eprintln!("{} Got SyncResponse::Datastore", swarm_id);
-                                    let prev_dstore_sync =
-                                        std::mem::replace(&mut datastore_sync, None);
-                                    // eprintln!(
-                                    //     "{} PrevDSync: {:?}",
-                                    //     swarm_id, prev_dstore_sync
-                                    // );
-                                    if let Some((next_awaited_part_no, mut missing_hashes)) =
-                                        prev_dstore_sync
-                                    {
-                                        // eprintln!(
-                                        //     "next_awaited_part_no: {}, part_no : {}, total: {}",
-                                        //     next_awaited_part_no, part_no, total
-                                        // );
-                                        if next_awaited_part_no != part_no {
-                                            missing_hashes.insert(part_no, hashes);
-                                            eprintln!("datastore_sync is Some again");
-                                            datastore_sync =
-                                                Some((next_awaited_part_no, missing_hashes));
-                                            continue;
-                                        }
-                                        //TODO: append all existing hashes
-                                        //    we have cached until now to hashes
-                                        //    and then decide value of datastore_sync
-                                        let mut last_processed = part_no;
-                                        for i in part_no + 1..=total {
-                                            if let Some(mut append_hashes) =
-                                                missing_hashes.remove(&i)
-                                            {
-                                                hashes.append(&mut append_hashes);
-                                                last_processed = i;
-                                            } else {
-                                                break;
-                                            }
-                                        }
-                                        if last_processed != total {
-                                            datastore_sync =
-                                                Some((last_processed + 1, missing_hashes));
-                                            eprintln!(
-                                                "Waiting for SyncResponse::Datastore [{}/{}]…",
-                                                last_processed + 1,
-                                                total,
-                                            );
-                                            continue;
-                                        }
-
-                                        // TODO: from now on, we have a complete snapshot
-                                        // of Swarm's datastore, we need to compare it against
-                                        // our own, and request missing data from neighbors
-                                        // and load valid data from disk
-                                        // let c_id = app_data.next_c_id().unwrap();
-                                        let mut curr_cid = 0;
-
-                                        for (data_type, hash) in hashes {
-                                            if let Ok((dtype, dhash)) =
-                                                app_data.content_root_hash(curr_cid)
-                                            {
-                                                if data_type == dtype {
-                                                    if hash == dhash {
-                                                        if let Some(content) =
-                                                            load_content_from_disk(
-                                                                s_storage.clone(),
-                                                                curr_cid,
-                                                                dtype,
-                                                                dhash,
-                                                            )
-                                                            .await
-                                                        {
-                                                            let main_page = if let Ok(d) =
-                                                                content.read_data(0)
-                                                            {
-                                                                d
-                                                            } else {
-                                                                Data::empty(0)
-                                                            };
-                                                            let _res =
-                                                                app_data.update(curr_cid, content);
-                                                            eprintln!(
-                                                                "Load {} CID-{} from disk ok: {}",
-                                                                swarm_id,
-                                                                curr_cid,
-                                                                _res.is_ok()
-                                                            );
-                                                            let _ = to_app_mgr_send
-                                                                .send(
-                                                                    ToAppMgr::ContentLoadedFromDisk(
-                                                                        swarm_id, curr_cid, dtype,
-                                                                        main_page,
-                                                                    ),
-                                                                )
-                                                                .await;
-                                                        } else {
-                                                            eprintln!(
-                                                                "Load {:?} CID-{} from disk failed",
-                                                                swarm_id, curr_cid,
-                                                            );
-                                                            request_content_from_any_neighbor(
-                                                                curr_cid,
-                                                                true,
-                                                                true,
-                                                                to_gnome_sender.clone(),
-                                                            );
-                                                            let _ = to_app_mgr_send.send(
-                                                                ToAppMgr::ContentRequestedFromNeighbor(
-                                                                    swarm_id, curr_cid, data_type,
-                                                                ),
-                                                            ).await;
-                                                        }
-                                                    } else {
-                                                        if i_am_founder && curr_cid > 0 {
-                                                            //TODO: we need to distinguish
-                                                            // between joining a running swarm
-                                                            // and two neighbors starting it
-                                                            eprintln!(
-                                                                "{:?} CID-{} Hashes mismatch(my: {}, his: {}), but I am founder",swarm_id,curr_cid,dhash,hash
-                                                            );
-                                                            curr_cid += 1;
-                                                            // We have to assume someone has
-                                                            // priority over others, in case
-                                                            // everyone else disagrees with
-                                                            // founder,
-                                                            // he can just delete conflicting
-                                                            // file
-                                                            // we continue, because our
-                                                            // neighbor will go the other way
-                                                            continue;
-                                                        }
-                                                        //TODO: hashes differ
-                                                        let _res = app_data.update(
-                                                            curr_cid,
-                                                            Content::Data(
-                                                                data_type,
-                                                                0,
-                                                                ContentTree::Empty(hash),
-                                                            ),
-                                                        );
-                                                        eprintln!(
-                                                            "Update hash for CID-{}: {:?}",
-                                                            curr_cid, _res
-                                                        );
-                                                        request_content_from_any_neighbor(
-                                                            curr_cid,
-                                                            true,
-                                                            true,
-                                                            to_gnome_sender.clone(),
-                                                        );
-                                                        let _ = to_app_mgr_send.send(
-                                                            ToAppMgr::ContentRequestedFromNeighbor(
-                                                                swarm_id, curr_cid, data_type,
-                                                            ),
-                                                        ).await;
-                                                        eprintln!("{:?} CID-{} Hash mismatch(disk: {} != {} swarm)",swarm_id, curr_cid,dhash,hash);
-                                                    }
-                                                } else {
-                                                    //TODO: mismatching data types
-                                                    // only valid scenario is when
-                                                    // Link got transposed into Data
-                                                    let _ = app_data.update(
-                                                        curr_cid,
-                                                        Content::Data(
-                                                            data_type,
-                                                            0,
-                                                            ContentTree::Empty(hash),
-                                                        ),
-                                                    );
-                                                    request_content_from_any_neighbor(
-                                                        curr_cid,
-                                                        true,
-                                                        true,
-                                                        to_gnome_sender.clone(),
-                                                    );
-                                                    let _ = to_app_mgr_send
-                                                        .send(
-                                                            ToAppMgr::ContentRequestedFromNeighbor(
-                                                                swarm_id, curr_cid, data_type,
-                                                            ),
-                                                        )
-                                                        .await;
-                                                    eprintln!("CID-{} DType mismatch", curr_cid);
-                                                }
-                                            } else {
-                                                eprintln!(
-                                                    "Add CID-{} with hash: {}",
-                                                    curr_cid, hash
-                                                );
-                                                let _ = app_data.append(Content::Data(
-                                                    data_type,
-                                                    0,
-                                                    ContentTree::Empty(hash),
-                                                ));
-                                                //TODO: we do not have this on disk
-                                                request_content_from_any_neighbor(
-                                                    curr_cid,
-                                                    true,
-                                                    true,
-                                                    to_gnome_sender.clone(),
-                                                );
-                                                let _ = to_app_mgr_send
-                                                    .send(ToAppMgr::ContentRequestedFromNeighbor(
-                                                        swarm_id, curr_cid, data_type,
-                                                    ))
-                                                    .await;
-                                                eprintln!("CID-{} not found on disk", curr_cid);
-                                            }
-                                            curr_cid += 1;
-                                        }
-                                        eprintln!(
-                                            "{} Memory: {}/{} Pages (not fully implemented)",
-                                            swarm_id,
-                                            app_data.contents.used_memory_pages(),
-                                            max_pages_in_memory
-                                        );
-                                        let _ = to_app_mgr_send
-                                            .send(ToAppMgr::FromDatastore(
-                                                // Requestor::App,
-                                                LibResponse::SwarmSynced(swarm_id),
-                                            ))
-                                            .await;
-                                        if app_data.app_type.is_catalog() {
-                                            let max_cid = if let Some(c_id) = app_data.next_c_id() {
-                                                c_id - 1
-                                            } else {
-                                                u16::MAX
-                                            };
-                                            let s_link = SwarmLink {
-                                                s_name: swarm_name.clone(),
-                                                max_cid,
-                                                sender: app_data_send.clone(),
-                                                root_hash: app_data.root_hash(),
-                                                s_descr: String::new(),
-                                                s_tags: HashMap::new(),
-                                            };
-                                            to_search_enigne
-                                                .send(SearchMsg::SwarmSynced(swarm_id, s_link))
-                                                .await;
-                                        }
-                                    } else {
-                                        eprintln!("Datastore is synced, why sent this?");
-                                    }
-                                }
-                                SyncResponse::Hashes(c_id, part_no, total, hashes) => {
-                                    eprintln!(
-                                        "Received hashes [{}/{}] of {} (len: {})!",
-                                        part_no,
-                                        total,
-                                        c_id,
-                                        hashes.len()
-                                    );
-                                    if let Ok((d_type, _len)) = app_data.get_type_and_len(c_id) {
-                                        if matches!(d_type, DataType::Link) {
-                                            let upd_res = app_data.update_transformative_link(
-                                                true, c_id, part_no, total, hashes,
-                                            );
-                                            // eprintln!("Update res: {:?}", upd_res);
-                                        } else {
-                                            //TODO: not yet implemented
-                                            if part_no == 0 && part_no == total {
-                                                let mut data_vec =
-                                                    Vec::with_capacity(hashes.len() >> 3);
-                                                let bytes = hashes.bytes();
-                                                for chunk in bytes.chunks_exact(8) {
-                                                    let hash = u64::from_be_bytes(
-                                                        chunk.try_into().unwrap(),
-                                                    );
-                                                    // eprintln!("Hash from Neighbor: {}", hash);
-                                                    data_vec.push(Data::empty(hash));
-                                                }
-
-                                                let mem_size = data_vec.len() as u16;
-                                                let ct = ContentTree::from(data_vec);
-                                                let c = Content::Data(d_type, mem_size, ct);
-                                                // eprintln!(
-                                                //     "New bottom hashes: {:?}",
-                                                //     c.data_hashes()
-                                                // );
-                                                let new_hash = c.hash();
-                                                let (_type, old_hash) =
-                                                    app_data.content_root_hash(c_id).unwrap();
-                                                if old_hash == new_hash {
-                                                    let _old_c = app_data.update(c_id, c).unwrap();
-                                                    // eprintln!(
-                                                    //     "Updated Content {} with hashes",
-                                                    //     c_id
-                                                    // );
-                                                } else {
-                                                    eprintln!("Can not update CID {} since old {} != {} new",c_id,old_hash,new_hash);
-                                                }
-                                            } else {
-                                                todo!("dapp-lib/lib.rs:1981 implement me!");
-                                            }
-                                        }
-                                    }
-                                }
-                                SyncResponse::Page(c_id, data_type, page_no, total, data) => {
-                                    eprintln!("CID-{} Page #{}/{}", c_id, page_no, total);
-                                    //TODO: make it proper
-                                    if page_no == 0 {
-                                        eprintln!(
-                                            "We've got main page of {}, data type: {:?}",
-                                            c_id, data_type
-                                        );
-                                        if let Ok((d_type, len)) = app_data.get_type_and_len(c_id) {
-                                            eprintln!("CID {} already exists, len: {}", c_id, len);
-                                            if d_type == DataType::Link {
-                                                if len > 0 {
-                                                    // eprintln!("Update existing Link");
-                                                    let _ = app_data.update_transformative_link(
-                                                        false, c_id, page_no, total, data,
-                                                    );
-                                                } else {
-                                                    // eprintln!("Create new Link");
-                                                    let res = app_data
-                                                        .update(c_id, data_to_link(data).unwrap());
-                                                    // eprintln!("Update result: {:?}", res);
-                                                }
-                                            } else {
-                                                // eprintln!("Inserting page 0 of non-Link content");
-
-                                                eprintln!("New page #0 hash: {}", data.get_hash());
-                                                let res = app_data.update_data(
-                                                    c_id,
-                                                    page_no,
-                                                    data.clone(),
-                                                );
-                                                if res.is_ok() {
-                                                    // We send an update to print content
-                                                    // on screen
-                                                    let _ = to_app_mgr_send
-                                                        .send(ToAppMgr::ContentChanged(
-                                                            swarm_id,
-                                                            c_id,
-                                                            d_type,
-                                                            Some(data),
-                                                        ))
-                                                        .await;
-                                                    eprintln!(
-                                                        "C-{} Page #{} update result: ok",
-                                                        c_id, page_no,
-                                                    );
-                                                } else {
-                                                    eprintln!(
-                                                        "CID-{} hashes: {:?}",
-                                                        c_id,
-                                                        app_data.content_bottom_hashes(c_id)
-                                                    );
-                                                    eprintln!(
-                                                        "{:?} C-{} Page #{} update failed: {:?}",
-                                                        swarm_id,
-                                                        c_id,
-                                                        page_no,
-                                                        res.err().unwrap()
-                                                    );
-                                                }
-                                            }
-                                        } else if data_type < DataType::Link {
-                                            // eprintln!("Create new Data");
-                                            if c_id > 0 {
-                                                let _ = to_app_mgr_send
-                                                    .send(ToAppMgr::ContentAdded(
-                                                        swarm_id,
-                                                        c_id,
-                                                        data_type,
-                                                        data.clone(),
-                                                    ))
-                                                    .await;
-                                            }
-                                            let _res = app_data.update(
-                                                c_id,
-                                                Content::Data(
-                                                    data_type,
-                                                    1,
-                                                    ContentTree::Filled(data),
-                                                ),
-                                            );
-                                        } else {
-                                            eprintln!("Create new Link 2");
-                                            let _ = to_app_mgr_send
-                                                .send(ToAppMgr::ContentAdded(
-                                                    swarm_id,
-                                                    c_id,
-                                                    data_type,
-                                                    data.clone(),
-                                                ))
-                                                .await;
-                                            let link_result = data_to_link(data);
-                                            if let Ok(link) = link_result {
-                                                let _res = app_data.update(c_id, link);
-                                            // eprintln!("Update result: {:?}", res);
-                                            } else {
-                                                eprintln!(
-                                                    "Failed to create a link: {:?}",
-                                                    link_result.err().unwrap()
-                                                );
-                                            }
-                                        }
-                                    } else if let Ok((d_type, len)) =
-                                        app_data.get_type_and_len(c_id)
-                                    {
-                                        if d_type == data_type {
-                                            // let res = app_data.append_data(c_id, data);
-                                            let res = app_data.update_data(c_id, page_no, data);
-                                            if res.is_ok() {
-                                                eprintln!(
-                                                    "C-{} Page #{} update result: ok",
-                                                    c_id, page_no,
-                                                );
-                                            } else {
-                                                eprintln!(
-                                                    "{:?} C-{} Page #{} update error: {:?}",
-                                                    swarm_id,
-                                                    c_id,
-                                                    page_no,
-                                                    res.err().unwrap()
-                                                );
-                                            }
-                                        } else if d_type == DataType::Link {
-                                            let res = app_data.update_transformative_link(
-                                                false, c_id, page_no, total, data,
-                                            );
-                                            // println!("Update TI result: {:?}", res);
-                                        } else {
-                                            eprintln!(
-                                                "Error: Stored:{:?} len:{}\nreceived:{:?} len:{}",
-                                                d_type, len, data_type, total
-                                            );
-                                        }
-                                    } else {
-                                        eprintln!("Datastore couldn't find ContentID {}", c_id);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    other => {
-                        eprintln!("Unhandled response {}", other);
-                    }
-                }
+            ToAppData::CustomRequest(m_type, neighbor_id, cast_data) => {
+                custom_request_task(
+                    m_type,
+                    neighbor_id,
+                    cast_data,
+                    &mut app_data,
+                    &to_app_mgr_send,
+                    &to_gnome_sender,
+                    swarm_id,
+                )
+                .await
             }
-            ToAppData::ReadData(requestor, c_id) => {
-                eprintln!(
-                    "ToAppData::ReadData({}) when DStore synced: {}",
+            ToAppData::CustomResponse(m_type, _neighbor_id, cast_data) => {
+                custom_response_task(
+                    m_type,
+                    _neighbor_id,
+                    cast_data,
+                    &mut datastore_sync,
+                    &to_app_mgr_send,
+                    swarm_id,
+                    &mut app_data,
+                    &swarm_name,
+                    &to_gnome_sender,
+                    &s_storage,
+                    i_am_founder,
+                    max_pages_in_memory,
+                    &app_data_send,
+                    &to_search_enigne,
+                )
+                .await
+            }
+
+            ToAppData::ReadData(_requestor, c_id) => {
+                read_data_task(
+                    &storage,
                     c_id,
-                    datastore_sync.is_none()
-                );
-                //TODO: find a way to decide if we are completely synced with swarm, or not
-                //      if not request to sync from any Neighbor
-                if datastore_sync.is_some() {
-                    eprintln!("Not synced");
-                    let _ = to_app_mgr_send
-                        .send(ToAppMgr::FromDatastore(
-                            // requestor,
-                            LibResponse::ReadError(swarm_id, c_id, AppError::AppDataNotSynced),
-                        ))
-                        .await;
-                    continue;
-                }
-                let type_and_len_result = app_data.get_type_and_len(c_id);
-                if type_and_len_result.is_err() {
-                    eprintln!("Unable to get type and len");
-                    let error = type_and_len_result.err().unwrap();
-                    let _ = to_app_mgr_send
-                        .send(ToAppMgr::FromDatastore(
-                            // requestor,
-                            LibResponse::ReadError(swarm_id, c_id, error),
-                        ))
-                        .await;
-                    continue;
-                }
-                let (_t, len) = type_and_len_result.unwrap();
-                let (t, root_hash) = app_data.content_root_hash(c_id).unwrap();
-                // eprintln!("Read {}, data len: {}", c_id, len);
-                let all_data_result = app_data.get_all_data(c_id);
-                if let Ok(data_vec) = all_data_result {
-                    eprintln!("AppData Sending back contents of {}", c_id);
-                    // let calculated_hash =
-                    // if c_id == 0 {
-                    //     eprintln!("Sending read result with {} data blocks", data_vec.len());
-                    // }
-                    let _ = to_app_mgr_send
-                        .send(ToAppMgr::FromDatastore(
-                            // requestor,
-                            LibResponse::ReadSuccess(
-                                swarm_id,
-                                swarm_name.clone(),
-                                c_id,
-                                t,
-                                data_vec,
-                            ),
-                        ))
-                        .await;
-                } else {
-                    eprintln!("AppData error when reading contents of {}", c_id);
-                    let error = all_data_result.err().unwrap();
-                    if matches!(error, AppError::ContentEmpty) {
-                        eprintln!("got ContentEmpty");
-                        let sync_requests: Vec<SyncRequest> =
-                            vec![SyncRequest::AllPages(vec![c_id])];
-                        let _ = to_gnome_sender.send(ToGnome::AskData(
-                            GnomeId::any(),
-                            NeighborRequest::Custom(
-                                0,
-                                CastData::new(serialize_requests(sync_requests)).unwrap(),
-                            ),
-                        ));
-                    }
-                    let _ = to_app_mgr_send
-                        .send(ToAppMgr::FromDatastore(
-                            // requestor,
-                            LibResponse::ReadError(swarm_id, c_id, error),
-                        ))
-                        .await;
-                }
+                    &datastore_sync,
+                    &to_app_mgr_send,
+                    swarm_id,
+                    &mut app_data,
+                    &swarm_name,
+                    &to_gnome_sender,
+                )
+                .await
             }
             ToAppData::BCastOrigin(c_id, send) => b_cast_origin = Some((c_id, send)),
             ToAppData::MCastOrigin(c_id, send) => m_cast_origin = Some((c_id, send)),
@@ -4148,13 +2527,91 @@ async fn serve_app_data(
                     ));
                 }
             }
+            // ToAppData::MemoryPagesUsed(additional_used_pages_count) => {
+            //     used_pages = used_pages + additional_used_pages_count;
+            // }
+            // ToAppData::MemoryPagesFreed(freed_pages_count) => {
+            //     used_pages = used_pages - freed_pages_count;
+            // }
+            ToAppData::RunMemoryUseAudit(time_period) => {
+                // gradually ask each content for it’s memory usage
+                let used_pages = app_data.contents.used_memory_pages_for(0);
+                eprintln!("CID-0 mem pages used: {}", used_pages);
+                let _ = app_data_send
+                    .send(ToAppData::PartialAuditResult(
+                        time_period,
+                        used_pages,
+                        0,
+                        vec![(0, used_pages)],
+                    ))
+                    .await;
+            }
+            ToAppData::PartialAuditResult(
+                time_period,
+                mem_used_so_far,
+                last_c_id_checked,
+                mut usage,
+            ) => {
+                // check next ContentID & if all have been checked send
+                // results back to ApplicationManager
+                let next_c_id = last_c_id_checked + 1;
+                if let Some(n_c_id) = app_data.next_c_id() {
+                    if n_c_id == next_c_id {
+                        // we’ve checked all Contents
+                        if mem_used_so_far > max_pages_in_memory {
+                            // sort usage vector
+                            usage.sort_by(|a, b| b.1.cmp(&a.1));
+                            let _ = app_data_send
+                                .send(ToAppData::PurgePagesFromMemory(
+                                    mem_used_so_far - max_pages_in_memory,
+                                    usage,
+                                ))
+                                .await;
+                        }
+                        let _ = to_app_mgr_send
+                            .send(ToAppMgr::FromDatastore(LibResponse::AuditResult(
+                                swarm_id,
+                                mem_used_so_far,
+                                max_pages_in_memory,
+                                time_period,
+                            )))
+                            .await;
+                        continue;
+                    }
+                }
+                let used_pages = app_data.contents.used_memory_pages_for(next_c_id);
+                eprintln!(
+                    "CID-{} mem pages used: {}",
+                    next_c_id,
+                    used_pages,
+                    // app_data.contents.content_bottom_hashes(next_c_id).unwrap()
+                );
+                usage.push((next_c_id, used_pages));
+                let _ = app_data_send
+                    .send(ToAppData::PartialAuditResult(
+                        time_period,
+                        used_pages + mem_used_so_far,
+                        next_c_id,
+                        usage,
+                    ))
+                    .await;
+            }
+            ToAppData::PurgePagesFromMemory(purge_count, usage) => {
+                eprintln!(
+                    "{} We should free {} pages from memory",
+                    swarm_id, purge_count
+                );
+                let purged = app_data
+                    .unload_from_memory(&storage, &store_on_disk, purge_count, usage)
+                    .await;
+                eprintln!("{} Freed {} pages from memory", swarm_id, purged);
+            }
             ToAppData::Terminate => {
                 // TODO: determine whether or not we want to store this Swarm on disk
-                if store_on_disk {
-                    // TODO: pass parameters indicating what data to store
-                    store_data_on_disk(s_storage, app_data, storage::StoragePolicy::Everything)
-                        .await;
-                }
+                // if store_on_disk {
+                // TODO: pass parameters indicating what data to store
+                store_data_on_disk(s_storage, app_data, store_on_disk).await;
+                // }
 
                 eprintln!("Done serving AppData");
                 break;
@@ -4163,26 +2620,9 @@ async fn serve_app_data(
                 eprintln!("Unserved by app: {:?}", resp);
             }
         }
-        let used_pages = app_data.contents.used_memory_pages();
-        // if used  > max_pages_in_memory{
-        if used_pages > 30 {
-            if store_on_disk {
-                // eprintln!(
-                //     "{:?} We need to clean up {} pages from memory onto disk!",
-                //     // used_pages - max_pages_in_memory
-                //     swarm_id,
-                //     used_pages - 30
-                // );
-            } else {
-                eprintln!(
-                    "We need to purge {} pages from memory!",
-                    // used_pages - max_pages_in_memory
-                    used_pages - 30
-                );
-            }
-        }
+        // let used_pages = app_data.contents.used_memory_pages();
     }
-    to_search_enigne
+    let _ = to_search_enigne
         .send(SearchMsg::AppDataTerminated(swarm_id))
         .await;
 }
@@ -4522,15 +2962,71 @@ pub struct ApplicationData {
 }
 
 impl ApplicationData {
-    // pub fn empty() -> Self {
-    //     ApplicationData {
-    //         change_reg: ChangeRegistry::new(),
-    //         contents: Datastore::Empty,
-    //         hash_to_temp_idx: HashMap::new(),
-    //         partial_data: HashMap::new(),
-    //     }
-    // }
-    // pub fn new(manifest: Manifest) -> Self {
+    pub async fn unload_from_memory(
+        &mut self,
+        storage: &PathBuf,
+        policy: &StoragePolicy,
+        to_purge_count: usize,
+        mut usage: Vec<(u16, usize)>,
+    ) -> usize {
+        // CIDs that were not recently used should be moved out
+        // of memory first, later those least recently used and so on.
+        let mut unloaded_so_far = 0;
+        let recently_used = self.registry();
+        let mut unload_candidates: Vec<(u16, usize)> = usage
+            .clone()
+            .into_iter()
+            .filter(|&(c_id, _mem)| !recently_used.contains(&c_id))
+            .collect();
+        if unload_candidates.is_empty() {
+            return unloaded_so_far;
+        }
+
+        while !unload_candidates.is_empty() {
+            let (c_id, pages_used) = unload_candidates.remove(0);
+            if pages_used > 0 {
+                if let Ok(cloned_c) = self.clone_content(c_id) {
+                    let p_use_before = cloned_c.used_memory_pages();
+                    let cloned_shell = cloned_c.shell();
+                    let p_use_after = cloned_shell.used_memory_pages();
+                    if p_use_before - p_use_after > 0 {
+                        let _ = self.update(c_id, cloned_shell);
+                        unloaded_so_far = unloaded_so_far + p_use_before - p_use_after;
+                        if unloaded_so_far >= to_purge_count {
+                            break;
+                        }
+                    }
+                    // TODO: respect storage policy
+                    let (should_store, max_page) = should_store_content_on_disk(&policy, c_id);
+                    if should_store {
+                        store_content_on_disk(c_id, storage, &cloned_c, max_page).await;
+                    }
+                }
+            }
+        }
+
+        if unloaded_so_far < to_purge_count {
+            eprintln!("We should do a better cleanup");
+            while !usage.is_empty() {
+                let (c_id, _p_used) = usage.remove(0);
+                if let Ok((d_type, r_hash)) = self.content_root_hash(c_id) {
+                    if d_type.is_link() {
+                        continue;
+                    }
+                    let p_use_before = self.contents.used_memory_pages_for(c_id);
+                    let c_empty = Content::Data(d_type, 1, ContentTree::Empty(r_hash));
+                    self.contents.update(c_id, c_empty);
+                    unloaded_so_far = unloaded_so_far + p_use_before - 1;
+                    if unloaded_so_far >= to_purge_count {
+                        break;
+                    }
+                    yield_now().await;
+                }
+            }
+        }
+        unloaded_so_far
+    }
+
     pub fn new(app_type: AppType) -> Self {
         ApplicationData {
             app_type,
@@ -4694,7 +3190,8 @@ impl ApplicationData {
     pub fn shell(&self, c_id: ContentID) -> Result<Content, AppError> {
         self.contents.shell(c_id)
     }
-    pub fn clone_content(&self, c_id: ContentID) -> Result<Content, AppError> {
+    pub fn clone_content(&mut self, c_id: ContentID) -> Result<Content, AppError> {
+        self.change_reg.insert(c_id);
         self.contents.clone_content(c_id)
     }
     pub fn content_root_hash(&self, c_id: ContentID) -> Result<(DataType, u64), AppError> {
@@ -4713,7 +3210,7 @@ impl ApplicationData {
         self.contents.all_typed_root_hashes()
     }
     pub fn transform_link(&mut self, content_id: ContentID) -> Result<Content, AppError> {
-        //TODO
+        self.change_reg.insert(content_id);
         let ti = self.contents.take_transform_info(content_id)?;
         let d_type = ti.d_type;
         let mem_size = ti.data.len() as u16;
@@ -4729,7 +3226,7 @@ impl ApplicationData {
         total_parts: u16,
         data: Data,
     ) -> Result<(DataType, Vec<u16>, Vec<u16>), AppError> {
-        // println!("Call update_transformative_link");
+        self.change_reg.insert(content_id);
         self.contents
             .update_transformative_link(is_hash, content_id, part_no, total_parts, data)
     }
@@ -4738,6 +3235,7 @@ impl ApplicationData {
         if index_to_add == u16::MAX {
             return Err(AppError::DatastoreFull);
         }
+        self.change_reg.insert(index_to_add);
         self.contents.append(content)
     }
     pub fn get_type_and_len(&self, c_id: ContentID) -> Result<(DataType, u16), AppError> {
@@ -4752,15 +3250,19 @@ impl ApplicationData {
         data_id: u16,
         d_type: DataType,
     ) -> Result<(Data, u16), AppError> {
+        // self.change_reg.insert(c_id);
         self.contents.read_link_data((c_id, data_id), d_type)
     }
     pub fn insert_data(&mut self, c_id: ContentID, d_id: u16, data: Data) -> Result<u64, AppError> {
+        self.change_reg.insert(c_id);
         self.contents.insert_data(c_id, d_id, data)
     }
     pub fn append_data(&mut self, c_id: ContentID, data: Data) -> Result<u64, AppError> {
+        self.change_reg.insert(c_id);
         self.contents.append_data(c_id, data)
     }
     pub fn pop_data(&mut self, c_id: ContentID) -> Result<Data, AppError> {
+        self.change_reg.insert(c_id);
         self.contents.pop_data(c_id)
     }
     pub fn update_data(
@@ -4769,15 +3271,19 @@ impl ApplicationData {
         d_id: u16,
         data: Data,
     ) -> Result<Data, AppError> {
+        self.change_reg.insert(c_id);
         self.contents.update_data((c_id, d_id), data)
     }
     pub fn remove_data(&mut self, c_id: ContentID, d_id: u16) -> Result<Data, AppError> {
+        self.change_reg.insert(c_id);
         self.contents.remove_data(c_id, d_id)
     }
     pub fn update(&mut self, c_id: ContentID, content: Content) -> Result<Content, AppError> {
+        self.change_reg.insert(c_id);
         self.contents.update(c_id, content)
     }
-    pub fn get_all_data(&self, c_id: ContentID) -> Result<Vec<Data>, AppError> {
+    pub fn get_all_data(&mut self, c_id: ContentID) -> Result<Vec<Data>, AppError> {
+        self.change_reg.insert(c_id);
         let read_result = self.contents.read_data((c_id, 0));
         let mut data_vec = vec![];
         if let Ok(data) = read_result {
@@ -5135,6 +3641,1723 @@ async fn sync_timeout(sender: ASender<ToAppData>) {
     let timeout = Duration::from_secs(5);
     sleep(timeout).await;
     let _ = sender.send(ToAppData::TimeoutSyncCheck).await;
+}
+async fn change_content_task(
+    c_id: ContentID,
+    d_type: DataType,
+    data_vec: Vec<Data>,
+    app_data: &mut ApplicationData,
+    app_data_send: &ASender<ToAppData>,
+    to_gnome_sender: &Sender<ToGnome>,
+) {
+    if let Ok((curr_d_type, curr_content_len)) = app_data.get_type_and_len(c_id) {
+        let curr_hash = app_data.content_root_hash(c_id).unwrap();
+        if curr_d_type == DataType::Link && curr_content_len > 0 {
+            // if let Ok(_hashes) = app_data.read_link_ti_data(c_id, 0, curr_d_type) {
+            eprintln!("We can not change a link with TransformInfo");
+            return;
+            // }
+        } else if curr_d_type != d_type {
+            eprintln!("We can not change content to different DataType");
+            return;
+        }
+        // Step #1: We take hashes of provided Data from data_vec
+        // There can be up to 65536 of 8-byte hashes so those can fill
+        // up to 512 of 1024-byte Data blocks.
+        let data_count = data_vec.len();
+        let mut bottom_hashes_as_data_blocks = Vec::with_capacity((data_count >> 7) + 1);
+        let mut bottom_hashes = Vec::with_capacity(data_count);
+        for data in &data_vec {
+            bottom_hashes.push(data.get_hash());
+        }
+        // TODO: check if only a single Data block has changed
+        let existing_hashes = app_data.content_bottom_hashes(c_id).unwrap();
+        let ex_len = existing_hashes.len();
+        if ex_len == data_count {
+            let mut only_difference: Option<u16> = None;
+            for i in 0..data_count {
+                if bottom_hashes[i] != existing_hashes[i] {
+                    if only_difference.is_some() {
+                        only_difference = None;
+                        break;
+                    } else {
+                        only_difference = Some(i as u16);
+                    }
+                }
+            }
+            if let Some(d_id) = only_difference {
+                eprintln!("Transforming ChangeContent -> UpdateData");
+                let _ = app_data_send
+                    .send(ToAppData::UpdateData(
+                        c_id,
+                        d_id,
+                        data_vec[d_id as usize].clone(),
+                    ))
+                    .await;
+                return;
+            }
+        }
+        // TODO: there can also be a case where a single data has been inserted
+        // and all other data stays the same
+        // TODO: there can also be a case where a single data has been removed
+        // and all other data stays the same
+        // eprintln!("bottom hashes: {:?}", bottom_hashes);
+        // eprintln!("pre root hash: {}", get_root_hash(&bottom_hashes));
+        let bottom_chunks = bottom_hashes.chunks_exact(128);
+        let bottom_remainder = bottom_chunks.remainder();
+        for chunk in bottom_chunks {
+            let mut bytes = Vec::with_capacity(1024);
+            for hash in chunk {
+                for byte in hash.to_be_bytes() {
+                    bytes.push(byte);
+                }
+            }
+            bottom_hashes_as_data_blocks.push(Data::new(bytes).unwrap());
+        }
+        if !bottom_remainder.is_empty() {
+            let mut bytes = Vec::with_capacity(1024);
+            for hash in bottom_remainder {
+                for byte in hash.to_be_bytes() {
+                    bytes.push(byte);
+                }
+            }
+            bottom_hashes_as_data_blocks.push(Data::new(bytes).unwrap());
+        }
+
+        // If data_count <= 128 we can immediately update entire Content,
+        // by sending a SyncMessage with all the hashes of new Data.
+        // So in this case we go directly to Step #4, skipping Steps #2 and #3.
+        //
+        //
+        // Step #2: If data_count > 128 Data blocks we need to make second
+        // round for taking hashes from resulting HashData blocks
+        //  - now there can be up to 4 new HashHashData blocks.
+        if data_count > 128 {
+            let available_data_ids = u16::MAX - curr_content_len;
+            let blocks_to_drop_count = if available_data_ids < data_count as u16 {
+                data_count as u16 - available_data_ids
+
+                // TODO: we need to create a flag in swarm sync
+                // metadata, that will
+                // mark given Content as being in a change process,
+                // so that other actions on this CID are blocked
+                // until this flag is off.
+                //
+            } else {
+                0
+            };
+            let mut hash_hash_data = Vec::with_capacity(4);
+            let mut hash_hash_data_hashes = Vec::with_capacity(4);
+            // panic!("THIS IS NOT FULLY IMPLEMENTED!!!");
+            let hash_hash_chunks = bottom_hashes_as_data_blocks.chunks_exact(128);
+            let hash_hash_remainder = hash_hash_chunks.remainder();
+
+            let mut add_d_id = curr_content_len - blocks_to_drop_count;
+            for chunk in hash_hash_chunks {
+                let mut bytes = Vec::with_capacity(1024);
+                for data in chunk {
+                    for byte in data.get_hash().to_be_bytes() {
+                        bytes.push(byte);
+                    }
+                }
+                let data = Data::new(bytes).unwrap();
+                for byte in data.get_hash().to_be_bytes() {
+                    hash_hash_data_hashes.push(byte);
+                }
+                hash_hash_data.push((data, add_d_id));
+                add_d_id = add_d_id + 1;
+            }
+            if !hash_hash_remainder.is_empty() {
+                let mut bytes = Vec::with_capacity(1024);
+                for data in hash_hash_remainder {
+                    for byte in data.get_hash().to_be_bytes() {
+                        bytes.push(byte);
+                    }
+                }
+                let data = Data::new(bytes).unwrap();
+                for byte in data.get_hash().to_be_bytes() {
+                    hash_hash_data_hashes.push(byte);
+                }
+                hash_hash_data.push((data, add_d_id));
+            }
+            //
+            //
+            // Step #3: If we needed two rounds to fit hashes into single SyncMessage the
+            // procedure has to be more complicated.
+            // There can be two scenarios that can happen here:
+            // 1. We have enough data_ids available to hold all Data blocks from
+            // first round of counting hashes (up to 512 new Data blocks);
+            // 2. we do not have enough data_ids.
+            let mut content_to_work_on = app_data.clone_content(c_id).unwrap();
+            eprintln!("orig_hsh0 {}", content_to_work_on.hash());
+            eprintln!("bhs0 {:?}", content_to_work_on.data_hashes());
+            // To realize scenario #2 we need to know how many
+            // Data blocks we need to free.
+            // TODO: We also need to know how many
+            // existing Data blocks
+            // are not going to stay in refreshed Content.
+            // If blocks-to-be-purged count is not enough
+            // to make room for incoming blocks we will also
+            // have to drop some of other blocks that will
+            // have to be re-synced again in next step.
+            //
+            // Scenario 2:
+            // Here we need to first make enough room for as many new Data blocks as needed
+            // (changing Content's root hash) and then proceed with scenario 1.
+            // This Data removal can be done in a brute-force way by just removing
+            // last N Data blocks (first implementation),
+            // or in a more sophisticated way removing selected data_ids starting from
+            // data_ids with greatest value and moving down.
+            // One SyncMessage is enough for both scenarios so second one is preffered.
+            for _i in 0..blocks_to_drop_count {
+                eprintln!("Dropping data...");
+                let _ = content_to_work_on.pop_data();
+            }
+            let mut old_hash = curr_hash.1;
+            let hhd_len = hash_hash_data.len() as u16;
+            for (hhd, _d_id) in &hash_hash_data {
+                let _ = content_to_work_on.push_data(Data::empty(hhd.get_hash()));
+            }
+            let mut new_hash = content_to_work_on.hash();
+            eprintln!("New hash: {}", new_hash);
+            eprintln!("bhs0 {:?}", content_to_work_on.data_hashes());
+            let reqs = SyncRequirements {
+                pre: vec![(c_id, old_hash)],
+                post: vec![(c_id, new_hash)],
+            };
+            let msg = SyncMessage::new(
+                SyncMessageType::ChangeContent(
+                    c_id,
+                    d_type,
+                    message::ChangeContentOperation::DropAndAppend(blocks_to_drop_count),
+                ),
+                reqs,
+                Data::new(hash_hash_data_hashes).unwrap(),
+            );
+            let parts = msg.into_parts();
+            for part in parts {
+                eprintln!("ToGnome::AddData(DropAndAppend)");
+                let _ = to_gnome_sender.send(ToGnome::AddData(part));
+            }
+            // now we have to send updates that do not change
+            // hash of our Content
+            for (hhd, d_id) in hash_hash_data {
+                eprintln!("paac write0: {}", hhd.get_hash());
+                let reqs = SyncRequirements {
+                    pre: vec![(c_id, new_hash)],
+                    post: vec![(c_id, new_hash)],
+                };
+                let msg = SyncMessage::new(SyncMessageType::UpdateData(c_id, d_id), reqs, hhd);
+                let parts = msg.into_parts();
+                for part in parts {
+                    eprintln!("ToGnome::AddData (UpdateData)");
+                    let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                }
+            }
+            //
+            // Scenario 1:
+            // We send a SyncMessage requesting to append multiple Datas to current
+            // CID with provided list of hashes - here we change root hash of
+            // our Content.
+            // Then we send multiple Updates with actual HashHashData corresponding
+            // to hashes from AppendMultipleDatas SyncMessage.
+            // Next we send one more SyncMessage that requests to
+            // pop all recently appended HashHashDatas (there can only be up to 4 of those)
+            // use their contents as HashData hashes and once again expand CID with as many
+            // Data::empty(hash) as needed.
+            // This action is a second change of Content root hash.
+
+            // pop & append
+            old_hash = new_hash;
+            // eprintln!("bhsw {:?}", content_to_work_on.data_hashes());
+            for _i in 0..hhd_len {
+                let pop_res = content_to_work_on.pop_data();
+                if let Ok(dta) = pop_res {
+                    // eprintln!("paac prep pop: {}", dta.get_hash());
+                } else {
+                    // eprintln!("error poping data: {}", pop_res.err().unwrap());
+                }
+            }
+            // eprintln!("bhsx {:?}", content_to_work_on.data_hashes());
+            for blk in &bottom_hashes_as_data_blocks {
+                eprintln!("paac write: {}", blk.get_hash());
+                let _ = content_to_work_on.push_data(Data::empty(blk.get_hash()));
+            }
+            let bh_db_len = bottom_hashes_as_data_blocks.len() as u16;
+
+            new_hash = content_to_work_on.hash();
+            // eprintln!("new_hash: {}", new_hash);
+            // eprintln!("bhs: {:?}", content_to_work_on.data_hashes());
+            let reqs = SyncRequirements {
+                pre: vec![(c_id, old_hash)],
+                post: vec![(c_id, new_hash)],
+            };
+            let msg = SyncMessage::new(
+                SyncMessageType::ChangeContent(
+                    c_id,
+                    d_type,
+                    message::ChangeContentOperation::PopAndAppendConverted(hhd_len),
+                ),
+                reqs,
+                Data::empty(0),
+            );
+            let parts = msg.into_parts();
+            for part in parts {
+                eprintln!("ToGnome::AddData (PopAndAppendConverted)");
+                let _ = to_gnome_sender.send(ToGnome::AddData(part));
+            }
+            // TODO: Now we need to fill those appended Data::empty(hash) slots with actual data.
+            // This Data blocks contain all of the bottom hashes of our Content ID.
+            // send all Data Blocks
+            // let bottom_hashes_db_len = bottom_hashes_as_data_blocks.len() as u16;
+            for (d_id, data) in bottom_hashes_as_data_blocks.into_iter().enumerate() {
+                eprintln!("pushing bhadb size: {}", data.len());
+                let reqs = SyncRequirements {
+                    pre: vec![(c_id, new_hash)],
+                    post: vec![(c_id, new_hash)],
+                };
+                let msg = SyncMessage::new(
+                    SyncMessageType::UpdateData(c_id, curr_content_len + d_id as u16),
+                    reqs,
+                    data,
+                );
+                let parts = msg.into_parts();
+                for part in parts {
+                    eprintln!(
+                        "ToGnome::AddData (update #2 {} len:{})",
+                        curr_content_len + d_id as u16,
+                        part.len()
+                    );
+                    let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                }
+            }
+            //
+            //
+            //
+            old_hash = new_hash;
+            //TODO: pop & rebuild
+            let mut rebuilt_content = Content::from(d_type, Data::empty(0)).unwrap();
+            for data in &data_vec {
+                let _ = rebuilt_content.push_data(data.clone());
+            }
+            new_hash = rebuilt_content.hash();
+            eprintln!("rnew_hash: {}", new_hash);
+            eprintln!("rbhs: {:?}", rebuilt_content.data_hashes());
+            let reqs = SyncRequirements {
+                pre: vec![(c_id, old_hash)],
+                post: vec![(c_id, new_hash)],
+            };
+            let msg = SyncMessage::new(
+                SyncMessageType::ChangeContent(
+                    c_id,
+                    d_type,
+                    message::ChangeContentOperation::PopAndCTreeRebuild(bh_db_len),
+                ),
+                reqs,
+                Data::empty(0),
+            );
+            let parts = msg.into_parts();
+            for part in parts {
+                eprintln!("ToGnome::AddData (PopAndCTreeRebuild)");
+                let _ = to_gnome_sender.send(ToGnome::AddData(part));
+            }
+
+            // send all Data Blocks
+            for (d_id, data) in data_vec.into_iter().enumerate() {
+                let reqs = SyncRequirements {
+                    pre: vec![(c_id, new_hash)],
+                    post: vec![(c_id, new_hash)],
+                };
+                let msg =
+                    SyncMessage::new(SyncMessageType::UpdateData(c_id, d_id as u16), reqs, data);
+                let parts = msg.into_parts();
+                for part in parts {
+                    eprintln!("ToGnome::AddData (update #2)");
+                    let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                }
+            }
+            // TODO: we can not send that many messages to Gnome
+            // at once, so there has to be a mechanism
+            // that sends those only after previous message
+            // was synced in Swarm.
+
+            // So Step #3 requires at least two additional changes to Content root hash.
+            // But right now we do not have any mechanism preventing other Data changes
+            // in between. If there are any and we have precalculated pre- and post- hashes
+            // then those values become obsolete and entire procedure fails with some
+            // invalid Data blocks somewhere in ContentTree.
+            // On the other hand if we calculate every pre- and post- hash just before
+            // sending a SyncMessage those other changes that happened in between will get
+            // wiped out.
+            // So for now it is recommended to first make sure that there is no other
+            // change being submitted to given swarm that modifies given Content
+            // that is undergoing extended change content process.
+            // A solution involving a Reconfigure message comes to mind but for now
+            // this entire procedure is complicated enough to give one a headache.
+
+            //TODO: implement above
+        } else {
+            // Step #4: A SyncMessage requesting change of entire Content is issued.
+            // In this step Content root hash is updated with final hash value.
+            // We move all existing Data blocks aside into a HashMap<Hash, Data>
+            // and starting from scratch push Data::empty(hash) one by one into CID.
+            // If there happens to be a match for given hash in a hashmap we've just
+            // created we take that Data and put it in place.
+            //
+            // Additionally we can send all remaining Data blocks in an UpdateData
+            // sync message that does not change Content's root hash.
+            //
+            // All of above means entire Swarm is always synchronized,
+            // so even if a Gnome joins in the middle of this procedure,
+            //  he will stay synced (will just need to ask his Neighbors for
+            // Data to catch up).
+            // TODO: implement above
+            let new_hash = get_root_hash(&bottom_hashes);
+            // eprintln!("New hash: {}", new_hash);
+            let reqs = SyncRequirements {
+                pre: vec![(c_id, curr_hash.1)],
+                post: vec![(c_id, new_hash)],
+            };
+            let msg = SyncMessage::new(
+                SyncMessageType::ChangeContent(
+                    c_id,
+                    d_type,
+                    message::ChangeContentOperation::DirectCTreeRebuild,
+                ),
+                reqs,
+                bottom_hashes_as_data_blocks[0].clone(),
+            );
+            let parts = msg.into_parts();
+            for part in parts {
+                eprintln!("ToGnome::AddData(DirectCTreeRebuild)");
+                let _ = to_gnome_sender.send(ToGnome::AddData(part));
+            }
+
+            //TODO: now we need to send actual Data as well
+            // TODO: we should only send Data blocks that did not exist before CC
+            let reqs = SyncRequirements {
+                pre: vec![(c_id, new_hash)],
+                post: vec![(c_id, new_hash)],
+            };
+            let existing_bottom_hashes = app_data.content_bottom_hashes(c_id).unwrap();
+            for (d_id, data) in data_vec.iter().enumerate() {
+                if existing_bottom_hashes.contains(&data.get_hash()) {
+                    eprintln!("Not sending Page {}-{} as it was not changed", c_id, d_id);
+                    return;
+                }
+                let msg = SyncMessage::new(
+                    SyncMessageType::UpdateData(c_id, d_id as u16),
+                    reqs.clone(),
+                    data.clone(),
+                );
+                let parts = msg.into_parts();
+                for part in parts {
+                    eprintln!("ToGnome::AddData(Update after Direct)");
+                    let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                }
+            }
+        }
+        //
+        //
+        // Following is old solution
+        // eprintln!(
+        //     "app data received CC request… for {} with {} data blocks",
+        //     c_id,
+        //     data_vec.len()
+        // );
+        // let mut content_to_work_on = app_data.clone_content(c_id).unwrap();
+        // for data in &data_vec {
+        //     eprintln!("Hash of data to add: {:?}", data.get_hash().to_be_bytes());
+        // }
+        // let pre_hash = content_to_work_on.hash();
+        // let existing_d_type = content_to_work_on.data_type();
+        // // OK, so in order to apply multiple changes we need to:
+        // // - verify if d_type allows for this change
+        // if existing_d_type == DataType::Link {
+        //     if let Ok(_hashes) = content_to_work_on.link_ti_hashes() {
+        //         eprintln!("We can not change a link with TransformInfo");
+        //         return;
+        //     }
+        // } else if existing_d_type != d_type {
+        //     eprintln!("We can not change content to different DataType");
+        //     return;
+        // }
+        // // - make sure there is multiple data blocks that need to change
+        // //   and not just one, or even zero
+        // let existing_hashes = content_to_work_on.data_hashes();
+        // let mut new_hashes = Vec::with_capacity(data_vec.len());
+        // for data in &data_vec {
+        //     new_hashes.push(data.get_hash());
+        // }
+        // let existing_len = existing_hashes.len();
+        // let new_len = new_hashes.len();
+        // let mut diff_indices = vec![];
+        // let mut append_indices = vec![];
+        // let mut shrink_indices = vec![];
+        // if existing_len <= new_len {
+        //     eprintln!("existing <= new");
+        //     for i in 0..existing_len {
+        //         if existing_hashes[i] != new_hashes[i] {
+        //             diff_indices.push(i);
+        //         }
+        //     }
+        //     for i in existing_len..new_len {
+        //         append_indices.push(i);
+        //     }
+        // } else {
+        //     eprintln!("existing > new");
+        //     //We are shrinking content
+        //     for i in new_len..existing_len {
+        //         shrink_indices.push(i);
+        //     }
+        //     for i in 0..new_len {
+        //         if existing_hashes[i] != new_hashes[i] {
+        //             diff_indices.push(i);
+        //         }
+        //     }
+        // }
+        // //TODO: send request to pop shrinking data blocks
+        // // TODO: this can be a 3-step procedure on a swarm,
+        // // and other users might perform changes in between those
+        // // steps, so it is not guaranteed to succeed completely.
+        // // Probably we should find a better way
+        // // Maybe enqueue subsequent changes from diff_indices?
+        // if !shrink_indices.is_empty() {
+        //     eprintln!("We should pop some Data blocks from CID: {}", c_id);
+        //     //TODO: new we need to update pre_hash for subsequent requests
+        // } else if new_len - existing_len > 1 {
+        //     //TODO: send request to reserve new data blocks
+        //     eprintln!("We should reserve some new Data blocks for CID: {}", c_id);
+        //     //TODO: new we need to update pre_hash for subsequent requests
+        //     let mut new_hashes = vec![];
+        //     let mut new_datas = vec![];
+        //     for idx in &append_indices {
+        //         new_datas.push(data_vec[*idx].clone());
+        //     }
+        //     for index in &append_indices {
+        //         for byte in data_vec[*index].get_hash().to_be_bytes() {
+        //             new_hashes.push(byte);
+        //         }
+        //     }
+        //     let _ = app_data_send
+        //         .send(ToAppData::AppendShelledDatas(
+        //             c_id,
+        //             Data::new(new_hashes).unwrap(),
+        //             new_datas,
+        //         ))
+        //         .await;
+        // } else if new_len - existing_len == 1 {
+        //     eprintln!(
+        //         "New len {} - existing len {} = {}",
+        //         new_len,
+        //         existing_len,
+        //         new_len - existing_len
+        //     );
+        //     eprintln!("Append indices: {:?}", append_indices);
+        //     let _ = app_data_send
+        //         .send(ToAppData::AppendData(
+        //             c_id,
+        //             data_vec[append_indices[0]].clone(),
+        //         ))
+        //         .await;
+        // }
+
+        // //TODO: for every changed block apply changes one by one
+        // // We assume no data was appended nor removed!!!
+        // for index in diff_indices {
+        //     eprintln!("we should do something with idx: {}", index);
+        //     let hash_bundle = app_data.content_root_hash(c_id).unwrap();
+        //     let old_data = app_data
+        //         .update_data(c_id, index as u16, data_vec[index].clone())
+        //         .unwrap();
+        //     let new_hash_bundle = app_data.content_root_hash(c_id).unwrap();
+        //     let reqs = SyncRequirements {
+        //         pre: vec![(c_id, hash_bundle.1)],
+        //         post: vec![(c_id, new_hash_bundle.1)],
+        //     };
+        //     let _data = app_data.update_data(c_id, index as u16, old_data);
+        //     let msg = SyncMessage::new(
+        //         SyncMessageType::UpdateData(c_id, index as u16),
+        //         reqs,
+        //         data_vec[index].clone(),
+        //     );
+        //     let parts = msg.into_parts();
+        //     for part in parts {
+        //         let _ = to_gnome_sender.send(ToGnome::AddData(part));
+        //     }
+        // }
+    } else {
+        eprintln!("Unable to change non existing content");
+    }
+}
+async fn response_task(
+    // _id: BlockID,
+    data: SyncData,
+    app_data: &mut ApplicationData,
+    to_app_mgr_send: &ASender<ToAppMgr>,
+    swarm_id: SwarmID,
+    missing_pages: &mut (u16, HashMap<u64, usize>),
+) {
+    // println!("Processing data...");
+    let process_result = app_data.process(data);
+    if process_result.is_none() {
+        return;
+    }
+    // println!("Process response: {:?}", process_result);
+    let SyncMessage {
+        m_type,
+        requirements,
+        data,
+    } = process_result.unwrap();
+
+    // println!("Received m_type: {:?}", m_type);
+    match m_type {
+        // SyncMessageType::SetManifest => {
+        //     let old_manifest = app_data.get_all_data(0);
+        //     if !requirements.pre_validate(0, &app_data) {
+        //         eprintln!("PRE validation failed");
+        //     } else {
+        //         let content = Content::Data(0, ContentTree::Filled(data));
+        //         let next_id = app_data.next_c_id().unwrap();
+        //         let res = if next_id == 0 {
+        //             app_data.append(content).is_ok()
+        //         } else {
+        //             app_data.update(0, content).is_ok()
+        //         };
+        //         // println!("Manifest result: {:?}", res);
+        //         if !requirements.post_validate(0, &app_data) {
+        //             eprintln!("POST validation failed");
+        //             if let Ok(data_vec) = old_manifest {
+        //                 let c_tree = ContentTree::from(data_vec);
+        //                 let old_content = Content::Data(0, c_tree);
+        //                 let res = app_data.update(0, old_content);
+        //                 eprintln!("Restored old manifest {:?}", res.is_ok());
+        //             } else {
+        //                 let content = Content::Data(0, ContentTree::Empty(0));
+        //                 let _ = app_data.update(0, content);
+        //                 eprintln!("Zeroed manifest");
+        //             }
+        //         }
+        //         let hash = app_data.root_hash();
+        //         eprintln!("Sending updated hash: {}", hash);
+        //         let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
+        //         eprintln!("Send res: {:?}", res);
+        //         // println!("Root hash: {}", app_data.root_hash());
+        //     }
+        // }
+        SyncMessageType::AppendContent(d_type) => {
+            eprintln!("AppendContent {:?} dhash: {}", d_type, data.get_hash());
+            // TODO: potentially for AddContent & ChangeContent
+            // post requirements could be empty
+            // pre requirements can not be empty since we need
+            // ContentID
+            let next_id = app_data.next_c_id().unwrap();
+            if !requirements.pre_validate(next_id, &app_data) {
+                eprintln!("PRE validation failed for AddContent");
+            } else {
+                if requirements.post.len() != 1 {
+                    eprintln!(
+                        "POST validation failed for AddContent 1 ({:?})",
+                        requirements.post
+                    );
+                    return;
+                }
+                eprintln!("Content from: {:?} {:?}", d_type, data);
+                let content = Content::from(d_type, data).unwrap();
+                eprintln!("Content hash: {}", content.hash());
+                let (recv_id, recv_hash) = requirements.post[0];
+                if recv_id == next_id && recv_hash == content.hash() {
+                    let d_type = content.data_type();
+                    let main_page = if let Ok(d) = content.read_data(0) {
+                        d
+                    } else {
+                        Data::empty(0)
+                    };
+                    let _res = app_data.append(content);
+                    eprintln!("Content added: {:?}", _res);
+                    // let hash = app_data.root_hash();
+                    // eprintln!("Sending updated hash: {}", hash);
+                    // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
+                    // eprintln!("Send res: {:?}", res);
+                    let _to_mgr_res = to_app_mgr_send
+                        .send(ToAppMgr::ContentAdded(swarm_id, recv_id, d_type, main_page))
+                        .await;
+                } else {
+                    eprintln!("Recv id: {}, next id: {}", recv_id, next_id);
+                    eprintln!("Recv hash: {}, next hash: {}", recv_hash, content.hash());
+                    eprintln!("POST validation failed for AddContent two");
+                }
+                // println!("Root hash: {}", app_data.root_hash());
+            }
+        }
+        SyncMessageType::ChangeContent(c_id, d_type, operation) => {
+            app_data
+                .process_change_content(
+                    c_id,
+                    d_type,
+                    operation,
+                    requirements,
+                    data,
+                    missing_pages,
+                    swarm_id,
+                    to_app_mgr_send.clone(),
+                )
+                .await;
+        }
+        SyncMessageType::AppendShelledDatas(c_id) => {
+            eprintln!("SyncMessageType::AppendShelledDatas");
+            if !requirements.pre_validate(c_id, &app_data) {
+                eprintln!("PRE validation failed for AppendShelledDatas");
+                return;
+            }
+            //TODO: we unpack hashes from received data, and for each
+            // hash we create an Data::empty(hash) that we append to
+            // given c_id in order received
+            // let mut bytes = data.bytes().into_iter();
+            let bytes = data.bytes();
+            let mut hashes = vec![];
+            for hash_bytes in bytes.chunks_exact(8) {
+                let hash = u64::from_be_bytes(hash_bytes.try_into().unwrap());
+                hashes.push(hash);
+            }
+            let to_add_total = hashes.len();
+            let hash_iter = hashes.iter();
+            // let mut all_res_ok = true;
+            let mut added_count = 0;
+            for hash in hash_iter {
+                let res = app_data.append_data(c_id, Data::empty(*hash));
+                if res.is_ok() {
+                    added_count += 1;
+                } else {
+                    eprintln!("Failure adding shelled data: {:?}", res.err().unwrap());
+                    break;
+                }
+            }
+            if added_count == to_add_total {
+                if !requirements.post_validate(c_id, &app_data) {
+                    eprintln!("POST validation failed for AppendShelledDatas");
+                    // TODO: restore previous order
+                    for i in 0..added_count {
+                        let res = app_data.pop_data(c_id);
+                        eprintln!("Pop {} result: {:?}", i, res);
+                    }
+                } else {
+                    let hash = app_data.root_hash();
+                    // eprintln!("Sending updated hash: {}", hash);
+                    // let res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
+                    // eprintln!("Send res: {:?}", res);
+                    eprintln!(
+                        "Data shells appended successfully ({}, added: {})",
+                        hash, added_count
+                    );
+                }
+            } else {
+                for i in 0..added_count {
+                    let res = app_data.pop_data(c_id);
+                    eprintln!("Pop {} result: {:?}", i, res);
+                }
+            }
+        }
+        SyncMessageType::AppendData(c_id) => {
+            //TODO
+            eprintln!("SyncMessageType::AppendData ");
+            // eprintln!(
+            //     "Sync Append bottom hashes before: {:?}",
+            //     app_data.content_bottom_hashes(c_id).unwrap()
+            // );
+            if !requirements.pre_validate(c_id, &app_data) {
+                eprintln!("PRE validation failed for AppendData");
+                return;
+            }
+            // TODO
+            let res = app_data.append_data(c_id, data);
+            if res.is_ok() {
+                if !requirements.post_validate(c_id, &app_data) {
+                    eprintln!("POST validation failed for AppendData");
+                    // TODO: restore previous order
+                    let res = app_data.pop_data(c_id);
+                    eprintln!("Restore result: {:?}", res);
+                } else {
+                    let hash = app_data.root_hash();
+                    // eprintln!("Sending updated hash: {}", hash);
+                    // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
+                    // eprintln!("Send res: {:?}", res);
+                    eprintln!("Data appended successfully ({})", hash);
+                }
+            }
+        }
+        SyncMessageType::RemoveData(c_id, d_id) => {
+            //TODO
+            eprintln!("SyncMessageType::RemoveData ");
+            if !requirements.pre_validate(c_id, &app_data) {
+                eprintln!("PRE validation failed for RemoveData");
+                return;
+            }
+            // TODO
+            // eprintln!(
+            //     "CID-{} root hash befor remove: {}",
+            //     c_id,
+            //     app_data.content_root_hash(c_id).unwrap().1
+            // );
+            let res = app_data.remove_data(c_id, d_id);
+            if let Ok(removed_data) = res {
+                if !requirements.post_validate(c_id, &app_data) {
+                    eprintln!("POST validation failed for RemoveData");
+                    // TODO: restore previous order
+                    // TODO: make sure hash after insert_data is equal to
+                    //       that before removal!!!
+                    let res = app_data.insert_data(c_id, d_id, removed_data);
+                    // eprintln!(
+                    //     "CID-{} root hash after restoration: {}",
+                    //     c_id,
+                    //     app_data.content_root_hash(c_id).unwrap().1
+                    // );
+                    eprintln!("Restore result: {:?}", res);
+                } else {
+                    eprintln!("Data removed successfully ({})", app_data.root_hash());
+                }
+            }
+        }
+        SyncMessageType::UpdateData(c_id, d_id) => {
+            //TODO
+            eprintln!(
+                "SyncMessageType::UpdateData {}-{}(size: {})",
+                c_id,
+                d_id,
+                data.len()
+            );
+            let (d_type, len) = app_data.get_type_and_len(c_id).unwrap();
+            // eprintln!("Len: {}", len);
+            // let bot_hashes = app_data.content_bottom_hashes(c_id).unwrap();
+            // for bot in bot_hashes {
+            //     eprintln!("hash: {}", bot);
+            // }
+            if !requirements.pre_validate(c_id, &app_data) {
+                eprintln!("PRE validation failed for UpdateData");
+                return;
+            }
+            // TODO
+            // let (_t, len) = app_data.get_type_and_len(c_id).unwrap();
+            // eprintln!("Before update len: {}", len);
+            // eprintln!("all current hashes: {}", c_id);
+            // let bottoms = app_data.get_all_page_hashes(c_id).unwrap();
+            // for bot in bottoms {
+            //     eprintln!("hash2: {}", bot);
+            // }
+            let main_page_option = if d_id == 0 { Some(data.clone()) } else { None };
+            let data_hash = data.get_hash();
+            let res = app_data.update_data(c_id, d_id, data);
+            if let Ok(updated_data) = res {
+                if !requirements.post_validate(c_id, &app_data) {
+                    eprintln!("POST validation failed for UpdateData");
+                    // TODO: restore previous order
+                    let res = app_data.update_data(c_id, d_id, updated_data);
+                    eprintln!("Restore result: {:?}", res);
+                } else {
+                    let hash = app_data.root_hash();
+                    if missing_pages.0 == c_id {
+                        missing_pages.1.remove(&data_hash);
+                        if missing_pages.1.is_empty() {
+                            let _to_mgr_res = to_app_mgr_send
+                                .send(ToAppMgr::ContentChanged(
+                                    swarm_id,
+                                    c_id,
+                                    d_type,
+                                    main_page_option,
+                                ))
+                                .await;
+                        }
+                    } else {
+                        let _to_mgr_res = to_app_mgr_send
+                            .send(ToAppMgr::ContentChanged(
+                                swarm_id,
+                                c_id,
+                                d_type,
+                                main_page_option,
+                            ))
+                            .await;
+                    }
+                    // eprintln!("Sending updated hash: {}", hash);
+                    // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
+                    // eprintln!("Send res: {:?}", res);
+                    eprintln!("Data updated successfully ({})", hash);
+                }
+            } else {
+                eprintln!("UpdateData failed: {}", res.err().unwrap());
+            }
+        }
+        SyncMessageType::InsertData(c_id, d_id) => {
+            //TODO
+            eprintln!("SyncMessageType::InsertData ");
+        }
+        SyncMessageType::ExtendData(c_id, d_id) => {
+            //TODO
+            eprintln!("SyncMessageType::ExtendData ");
+        }
+        SyncMessageType::UserDefined(_value) => {
+            //TODO
+            eprintln!("SyncMessageType::UserDefined({})", _value);
+        }
+    }
+}
+async fn custom_request_task(
+    m_type: u8,
+    neighbor_id: GnomeId,
+    cast_data: CastData,
+    app_data: &mut ApplicationData,
+    to_app_mgr_send: &ASender<ToAppMgr>,
+    to_gnome_sender: &Sender<ToGnome>,
+    swarm_id: SwarmID,
+) {
+    //TODO: Cases not cover here should be allowed to be served by dapp-lib's user
+    // We need to cover different bootstrap sync requests:
+    // - root hashes only of all Contents
+    // - data/page hashes of specified ContentIDs
+    //  In future we could define a generic sync request to send
+    //   back Contents that have been tagged with specific tags.
+    // - actual Content Data (aka future: Pages) for specified ContentIDs
+    //   Here we should distinguish between sending all pages or only specific
+    //   ones like only first page that usually consists of description of a
+    //   content.
+    // In order to do so, we should only take a single m_type value,
+    // following bytes should be used to further specify our request
+    //
+    // When sending Response we should also cover the same cases as above,
+    // also by using a single m_type value.
+    // Special case to consider is when we are sending main Page of a Link.
+    // Link has optional TransformInfo attribute, and it is necessary
+    // when sideloading Pages via broadcast or other means than SyncMessages.
+    if m_type != 0 {
+        eprintln!("Unhandled request {}", m_type);
+        return;
+    }
+    // match m_type {
+    //     0 => {
+    let sync_requests = deserialize_requests(cast_data.bytes());
+    // eprintln!("Got Sync Request: {:?}", sync_requests);
+    // println!("Got AppSync inquiry");
+    // TODO: we have to unconditionally sync partial_data!!!
+    let sync_type = 0;
+    let partial_hashes = app_data.get_partial_hashes();
+    for hdata in partial_hashes.into_iter() {
+        let sync_response = SyncResponse::Partial(true, hdata);
+        let _ = to_gnome_sender.send(ToGnome::SendData(
+            neighbor_id,
+            NeighborResponse::Custom(sync_type, CastData::new(sync_response.serialize()).unwrap()),
+        ));
+    }
+    let partial_datas = app_data.get_partial_data();
+    for hdata in partial_datas.into_iter() {
+        let sync_response = SyncResponse::Partial(false, hdata);
+        let _ = to_gnome_sender.send(ToGnome::SendData(
+            neighbor_id,
+            NeighborResponse::Custom(sync_type, CastData::new(sync_response.serialize()).unwrap()),
+        ));
+    }
+    eprintln!("Sent Partial response");
+    let mut sync_req_iter = sync_requests.into_iter();
+    while let Some(req) = sync_req_iter.next() {
+        match req {
+            SyncRequest::Datastore => {
+                eprintln!("{} Got SyncRequest::Datastore", swarm_id);
+                // TODO: here we should trigger a separate task for sending
+                // all root hashes to specified Neighbor
+                // let sync_type = 0;
+                let hashes = app_data.all_content_typed_root_hashes();
+                let hashes_len = hashes.len() as u16;
+                for (part_no, group) in hashes.into_iter().enumerate() {
+                    let sync_response =
+                        SyncResponse::Datastore(part_no as u16, hashes_len - 1, group);
+                    let _ = to_gnome_sender.send(ToGnome::SendData(
+                        neighbor_id,
+                        NeighborResponse::Custom(
+                            sync_type,
+                            CastData::new(sync_response.serialize()).unwrap(),
+                        ),
+                    ));
+                }
+                eprintln!("{} Sent Datastore response", swarm_id);
+            }
+            SyncRequest::AllFirstPages(tags_opt) => {
+                // TODO: here we should trigger a separate task for sending
+                // all Content's main pages to specified Neighbor
+                eprintln!("We are requested to send all first pages to neighbor.");
+                if let Some(tags) = tags_opt {
+                    //TODO: we send tags and all first pages to App and wait
+                    // when we get response we send first pages to Neighbor
+                    // (Different apps may implement different tagging strategies)
+                    eprintln!("Only first pages of select Contents");
+
+                    let next_c_id = app_data.next_c_id().unwrap();
+                    let mut all_first_pages = Vec::with_capacity(next_c_id as usize);
+                    for c_id in 1..next_c_id {
+                        if let Ok(data) = app_data.read_data(c_id, 0) {
+                            all_first_pages.push((c_id, data));
+                            // let (data_type, len) =
+                            //     app_data.get_type_and_len(c_id).unwrap();
+                            // let sync_response = SyncResponse::Page(
+                            //     c_id, data_type, 0, len, data,
+                            // );
+                        }
+                    }
+                    let _ = to_app_mgr_send
+                        .send(ToAppMgr::GetCIDsForTags(
+                            swarm_id,
+                            neighbor_id,
+                            tags,
+                            all_first_pages,
+                        ))
+                        .await;
+                } else {
+                    let sync_type = 0;
+                    for c_id in 1..app_data.next_c_id().unwrap() {
+                        eprintln!("We need to send main page of ContentID-{}", c_id);
+                        if let Ok(data) = app_data.read_data(c_id, 0) {
+                            let (data_type, len) = app_data.get_type_and_len(c_id).unwrap();
+                            let sync_response = SyncResponse::Page(c_id, data_type, 0, len, data);
+                            // println!("Sending bytes: {:?}", bytes);
+                            let res = to_gnome_sender.send(ToGnome::SendData(
+                                neighbor_id,
+                                NeighborResponse::Custom(
+                                    sync_type,
+                                    CastData::new(sync_response.serialize()).unwrap(),
+                                ),
+                            ));
+                            if res.is_ok() {
+                                eprintln!("Main page of {} sent successfully.", c_id,);
+                            }
+                        }
+                    }
+                }
+            }
+            // SyncRequest::Hashes(c_id, d_type, h_ids) => {
+            SyncRequest::Hashes(c_id, h_ids) => {
+                //TODO
+                eprintln!("We should send some page hashes of Contents: {:?}", c_id);
+                let hash_res = if let Ok((data_type, _len)) = app_data.get_type_and_len(c_id) {
+                    // if data_type == d_type {
+                    if data_type == DataType::Link {
+                        app_data.get_all_transform_info_hashes(c_id)
+                    } else {
+                        // Err(AppError::DatatypeMismatch)
+                        app_data.get_all_page_hashes(c_id)
+                    }
+                } else {
+                    Err(AppError::IndexingError)
+                };
+                if let Ok(mut hashes) = hash_res {
+                    if !hashes.is_empty() {
+                        let sync_type = 0;
+                        let hashes_len = hashes.len() as u16 - 1;
+                        if h_ids.is_empty() {
+                            // eprintln!("We send all hashes of CID {}", c_id);
+                            for i in 0..=hashes_len {
+                                let hash_data =
+                                    std::mem::replace(&mut hashes[i as usize], Data::empty(0));
+                                let sync_response =
+                                    SyncResponse::Hashes(c_id, i, hashes_len, hash_data);
+                                let res = to_gnome_sender.send(ToGnome::SendData(
+                                    neighbor_id,
+                                    NeighborResponse::Custom(
+                                        sync_type,
+                                        CastData::new(sync_response.serialize()).unwrap(),
+                                    ),
+                                ));
+                                if res.is_ok() {
+                                    eprintln!("Hashes [{}/{}] of {} sent", i, hashes_len, c_id);
+                                }
+                            }
+                        } else {
+                            for h_id in h_ids {
+                                if h_id <= hashes_len {
+                                    let hash_data = std::mem::replace(
+                                        &mut hashes[h_id as usize],
+                                        Data::empty(0),
+                                    );
+                                    let sync_response =
+                                        SyncResponse::Hashes(c_id, h_id, hashes_len, hash_data);
+                                    let res = to_gnome_sender.send(ToGnome::SendData(
+                                        neighbor_id,
+                                        NeighborResponse::Custom(
+                                            sync_type,
+                                            CastData::new(sync_response.serialize()).unwrap(),
+                                        ),
+                                    ));
+                                    if res.is_ok() {
+                                        eprintln!(
+                                            "Hashes [{}/{}] of {} sent",
+                                            h_id, hashes_len, c_id
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            SyncRequest::Pages(c_id, d_type, _p_ids) => {
+                //TODO
+                eprintln!(
+                    "We are requested to send some pages to neighbor ({:?}: {:?}).",
+                    c_id, _p_ids
+                );
+                if let Ok((data_type, len)) = app_data.get_type_and_len(c_id) {
+                    if data_type == d_type {
+                        if len > 0 {
+                            let total = len as u16 - 1;
+                            let sync_type = 0;
+                            for p_id in _p_ids {
+                                if let Ok(data) = app_data.read_data(c_id, p_id) {
+                                    let sync_response =
+                                        SyncResponse::Page(c_id, data_type, p_id, total, data);
+                                    let r = to_gnome_sender.send(ToGnome::SendData(
+                                        neighbor_id,
+                                        NeighborResponse::Custom(
+                                            sync_type,
+                                            CastData::new(sync_response.serialize()).unwrap(),
+                                        ),
+                                    ));
+                                    if r.is_ok() {
+                                        eprintln!("Sent {}[{}/{}]", c_id, p_id, total);
+                                    }
+                                } else {
+                                    eprintln!("No Data read.");
+                                }
+                            }
+                        }
+                    } else if data_type == DataType::Link {
+                        eprintln!("Link len: {}", len);
+                        if len > 0 {
+                            let total = len as u16 - 1;
+                            let sync_type = 0;
+                            for p_id in _p_ids {
+                                if let Ok((data, size)) =
+                                    app_data.read_link_ti_data(c_id, p_id, d_type)
+                                {
+                                    let sync_response =
+                                        SyncResponse::Page(c_id, d_type, p_id, size, data);
+                                    let r = to_gnome_sender.send(ToGnome::SendData(
+                                        neighbor_id,
+                                        NeighborResponse::Custom(
+                                            sync_type,
+                                            CastData::new(sync_response.serialize()).unwrap(),
+                                        ),
+                                    ));
+                                    if r.is_ok() {
+                                        eprintln!("Sent {}[{}/{}]", c_id, p_id, total);
+                                    }
+                                } else {
+                                    eprintln!("No Data read.");
+                                }
+                            }
+                        }
+                    } else {
+                        // Err(AppError::DatatypeMismatch)
+                    };
+                }
+            }
+            SyncRequest::AllPages(c_ids) => {
+                // TODO: here we should trigger a separate task for
+                // each ContentID received in order to send
+                // all Content's pages to specified Neighbor
+                eprintln!(
+                    "We are requested to send all pages of Contents: {:?}.",
+                    c_ids
+                );
+                let sync_type = 0;
+                for c_id in c_ids {
+                    eprintln!("Sending {} CID-{}", swarm_id, c_id);
+                    //TODO: first we send all page hashes
+                    //      second we send pages
+                    if let Ok(data_vec) = app_data.get_all_data(c_id) {
+                        if data_vec.is_empty() {
+                            eprintln!("Get all data returned empty vector for CID-{}", c_id);
+                            continue;
+                        }
+                        let (data_type, len) = app_data.get_type_and_len(c_id).unwrap();
+                        let total = if len > 0 { len - 1 } else { 0 };
+
+                        for (part_no, data) in data_vec.into_iter().enumerate() {
+                            let sync_response =
+                                SyncResponse::Page(c_id, data_type, part_no as u16, total, data);
+                            let _ = to_gnome_sender.send(ToGnome::SendData(
+                                neighbor_id,
+                                NeighborResponse::Custom(
+                                    sync_type,
+                                    CastData::new(sync_response.serialize()).unwrap(),
+                                ),
+                            ));
+                        }
+                    } else {
+                        //TODO
+                        eprintln!("Get all data failed for CID-{}", c_id);
+                    }
+                }
+            }
+        }
+    }
+    //     }
+    //     other => {
+    //         eprintln!("Request {}", other);
+    //     }
+    // }
+}
+async fn custom_response_task(
+    m_type: u8,
+    _neighbor_id: GnomeId,
+    cast_data: CastData,
+    // c_id: ContentID,
+    datastore_sync: &mut Option<(u16, HashMap<u16, Vec<(DataType, u64)>>)>,
+    to_app_mgr_send: &ASender<ToAppMgr>,
+    swarm_id: SwarmID,
+    app_data: &mut ApplicationData,
+    swarm_name: &SwarmName,
+    to_gnome_sender: &Sender<ToGnome>,
+    s_storage: &PathBuf,
+    i_am_founder: bool,
+    max_pages_in_memory: usize,
+    app_data_send: &ASender<ToAppData>,
+    to_search_enigne: &ASender<SearchMsg>,
+) {
+    if m_type != 0 {
+        eprintln!("Unhandled response {}", m_type);
+        return;
+    }
+    // match m_type {
+    //     0 => {
+    if let Ok(response) = SyncResponse::deserialize(cast_data.bytes()) {
+        //TODO:
+        // eprintln!("Deserialized response!: {:?}", response);
+        match response {
+            SyncResponse::Partial(is_hash_data, data) => {
+                app_data.update_partial(is_hash_data, data);
+            }
+            SyncResponse::Datastore(part_no, total, mut hashes) => {
+                eprintln!("{} Got SyncResponse::Datastore", swarm_id);
+                let prev_dstore_sync = std::mem::replace(datastore_sync, None);
+                // eprintln!(
+                //     "{} PrevDSync: {:?}",
+                //     swarm_id, prev_dstore_sync
+                // );
+                if let Some((next_awaited_part_no, mut missing_hashes)) = prev_dstore_sync {
+                    // eprintln!(
+                    //     "next_awaited_part_no: {}, part_no : {}, total: {}",
+                    //     next_awaited_part_no, part_no, total
+                    // );
+                    if next_awaited_part_no != part_no {
+                        missing_hashes.insert(part_no, hashes);
+                        eprintln!("datastore_sync is Some again");
+                        *datastore_sync = Some((next_awaited_part_no, missing_hashes));
+                        return;
+                    }
+                    //TODO: append all existing hashes
+                    //    we have cached until now to hashes
+                    //    and then decide value of datastore_sync
+                    let mut last_processed = part_no;
+                    for i in part_no + 1..=total {
+                        if let Some(mut append_hashes) = missing_hashes.remove(&i) {
+                            hashes.append(&mut append_hashes);
+                            last_processed = i;
+                        } else {
+                            break;
+                        }
+                    }
+                    if last_processed != total {
+                        *datastore_sync = Some((last_processed + 1, missing_hashes));
+                        eprintln!(
+                            "Waiting for SyncResponse::Datastore [{}/{}]…",
+                            last_processed + 1,
+                            total,
+                        );
+                        return;
+                    }
+
+                    // TODO: from now on, we have a complete snapshot
+                    // of Swarm's datastore, we need to compare it against
+                    // our own, and request missing data from neighbors
+                    // and load valid data from disk
+                    // let c_id = app_data.next_c_id().unwrap();
+                    let mut curr_cid = 0;
+
+                    for (data_type, hash) in hashes {
+                        if let Ok((dtype, dhash)) = app_data.content_root_hash(curr_cid) {
+                            if data_type == dtype {
+                                if hash == dhash {
+                                    if let Some(content) = load_content_from_disk(
+                                        s_storage.clone(),
+                                        curr_cid,
+                                        dtype,
+                                        dhash,
+                                    )
+                                    .await
+                                    {
+                                        let main_page = if let Ok(d) = content.read_data(0) {
+                                            d
+                                        } else {
+                                            Data::empty(0)
+                                        };
+                                        let _res = app_data.update(curr_cid, content);
+                                        eprintln!(
+                                            "Load {} CID-{} from disk ok: {}",
+                                            swarm_id,
+                                            curr_cid,
+                                            _res.is_ok()
+                                        );
+                                        let _ = to_app_mgr_send
+                                            .send(ToAppMgr::ContentLoadedFromDisk(
+                                                swarm_id, curr_cid, dtype, main_page,
+                                            ))
+                                            .await;
+                                    } else {
+                                        eprintln!(
+                                            "Load {:?} CID-{} from disk failed",
+                                            swarm_id, curr_cid,
+                                        );
+                                        request_content_from_any_neighbor(
+                                            curr_cid,
+                                            true,
+                                            true,
+                                            to_gnome_sender.clone(),
+                                        );
+                                        let _ = to_app_mgr_send
+                                            .send(ToAppMgr::ContentRequestedFromNeighbor(
+                                                swarm_id, curr_cid, data_type,
+                                            ))
+                                            .await;
+                                    }
+                                } else {
+                                    if i_am_founder && curr_cid > 0 {
+                                        //TODO: we need to distinguish
+                                        // between joining a running swarm
+                                        // and two neighbors starting it
+                                        eprintln!("{:?} CID-{} Hashes mismatch(my: {}, his: {}), but I am founder", swarm_id,curr_cid,dhash,hash);
+                                        curr_cid += 1;
+                                        // We have to assume someone has
+                                        // priority over others, in case
+                                        // everyone else disagrees with
+                                        // founder,
+                                        // he can just delete conflicting
+                                        // file
+                                        // we continue, because our
+                                        // neighbor will go the other way
+                                        continue;
+                                    }
+                                    //TODO: hashes differ
+                                    let _res = app_data.update(
+                                        curr_cid,
+                                        Content::Data(data_type, 0, ContentTree::Empty(hash)),
+                                    );
+                                    eprintln!("Update hash for CID-{}: {:?}", curr_cid, _res);
+                                    request_content_from_any_neighbor(
+                                        curr_cid,
+                                        true,
+                                        true,
+                                        to_gnome_sender.clone(),
+                                    );
+                                    let _ = to_app_mgr_send
+                                        .send(ToAppMgr::ContentRequestedFromNeighbor(
+                                            swarm_id, curr_cid, data_type,
+                                        ))
+                                        .await;
+                                    eprintln!(
+                                        "{:?} CID-{} Hash mismatch(disk: {} != {} swarm)",
+                                        swarm_id, curr_cid, dhash, hash
+                                    );
+                                }
+                            } else {
+                                //TODO: mismatching data types
+                                // only valid scenario is when
+                                // Link got transposed into Data
+                                let _ = app_data.update(
+                                    curr_cid,
+                                    Content::Data(data_type, 0, ContentTree::Empty(hash)),
+                                );
+                                request_content_from_any_neighbor(
+                                    curr_cid,
+                                    true,
+                                    true,
+                                    to_gnome_sender.clone(),
+                                );
+                                let _ = to_app_mgr_send
+                                    .send(ToAppMgr::ContentRequestedFromNeighbor(
+                                        swarm_id, curr_cid, data_type,
+                                    ))
+                                    .await;
+                                eprintln!("CID-{} DType mismatch", curr_cid);
+                            }
+                        } else {
+                            eprintln!("Add CID-{} with hash: {}", curr_cid, hash);
+                            let _ = app_data.append(Content::Data(
+                                data_type,
+                                0,
+                                ContentTree::Empty(hash),
+                            ));
+                            //TODO: we do not have this on disk
+                            request_content_from_any_neighbor(
+                                curr_cid,
+                                true,
+                                true,
+                                to_gnome_sender.clone(),
+                            );
+                            let _ = to_app_mgr_send
+                                .send(ToAppMgr::ContentRequestedFromNeighbor(
+                                    swarm_id, curr_cid, data_type,
+                                ))
+                                .await;
+                            eprintln!("CID-{} not found on disk", curr_cid);
+                        }
+                        curr_cid += 1;
+                    }
+                    eprintln!(
+                        "{} Memory: {}/{} Pages (not fully implemented)",
+                        swarm_id,
+                        app_data.contents.used_memory_pages(),
+                        max_pages_in_memory
+                    );
+                    let _ = to_app_mgr_send
+                        .send(ToAppMgr::FromDatastore(
+                            // Requestor::App,
+                            LibResponse::SwarmSynced(swarm_id),
+                        ))
+                        .await;
+                    if app_data.app_type.is_catalog() {
+                        let max_cid = if let Some(c_id) = app_data.next_c_id() {
+                            c_id - 1
+                        } else {
+                            u16::MAX
+                        };
+                        let s_link = SwarmLink {
+                            s_name: swarm_name.clone(),
+                            max_cid,
+                            sender: app_data_send.clone(),
+                            root_hash: app_data.root_hash(),
+                            s_descr: String::new(),
+                            s_tags: HashMap::new(),
+                        };
+                        to_search_enigne
+                            .send(SearchMsg::SwarmSynced(swarm_id, s_link))
+                            .await;
+                    }
+                } else {
+                    eprintln!("Datastore is synced, why sent this?");
+                }
+            }
+            SyncResponse::Hashes(c_id, part_no, total, hashes) => {
+                eprintln!(
+                    "Received hashes [{}/{}] of {} (len: {})!",
+                    part_no,
+                    total,
+                    c_id,
+                    hashes.len()
+                );
+                if let Ok((d_type, _len)) = app_data.get_type_and_len(c_id) {
+                    if matches!(d_type, DataType::Link) {
+                        let upd_res =
+                            app_data.update_transformative_link(true, c_id, part_no, total, hashes);
+                        // eprintln!("Update res: {:?}", upd_res);
+                    } else {
+                        //TODO: not yet implemented
+                        if part_no == 0 && part_no == total {
+                            let mut data_vec = Vec::with_capacity(hashes.len() >> 3);
+                            let bytes = hashes.bytes();
+                            for chunk in bytes.chunks_exact(8) {
+                                let hash = u64::from_be_bytes(chunk.try_into().unwrap());
+                                // eprintln!("Hash from Neighbor: {}", hash);
+                                data_vec.push(Data::empty(hash));
+                            }
+
+                            let mem_size = data_vec.len() as u16;
+                            let ct = ContentTree::from(data_vec);
+                            let c = Content::Data(d_type, mem_size, ct);
+                            // eprintln!(
+                            //     "New bottom hashes: {:?}",
+                            //     c.data_hashes()
+                            // );
+                            let new_hash = c.hash();
+                            let (_type, old_hash) = app_data.content_root_hash(c_id).unwrap();
+                            if old_hash == new_hash {
+                                let _old_c = app_data.update(c_id, c).unwrap();
+                                // eprintln!(
+                                //     "Updated Content {} with hashes",
+                                //     c_id
+                                // );
+                            } else {
+                                eprintln!(
+                                    "Can not update CID {} since old {} != {} new",
+                                    c_id, old_hash, new_hash
+                                );
+                            }
+                        } else {
+                            todo!("dapp-lib/lib.rs:1981 implement me!");
+                        }
+                    }
+                }
+            }
+            SyncResponse::Page(c_id, data_type, page_no, total, data) => {
+                eprintln!("CID-{} Page #{}/{}", c_id, page_no, total);
+                //TODO: make it proper
+                if page_no == 0 {
+                    eprintln!(
+                        "We've got main page of {}, data type: {:?}",
+                        c_id, data_type
+                    );
+                    if let Ok((d_type, len)) = app_data.get_type_and_len(c_id) {
+                        eprintln!("CID {} already exists, len: {}", c_id, len);
+                        if d_type == DataType::Link {
+                            if len > 0 {
+                                // eprintln!("Update existing Link");
+                                let _ = app_data
+                                    .update_transformative_link(false, c_id, page_no, total, data);
+                            } else {
+                                // eprintln!("Create new Link");
+                                let res = app_data.update(c_id, data_to_link(data).unwrap());
+                                // eprintln!("Update result: {:?}", res);
+                            }
+                        } else {
+                            // eprintln!("Inserting page 0 of non-Link content");
+
+                            eprintln!("New page #0 hash: {}", data.get_hash());
+                            let res = app_data.update_data(c_id, page_no, data.clone());
+                            if res.is_ok() {
+                                // We send an update to print content
+                                // on screen
+                                let _ = to_app_mgr_send
+                                    .send(ToAppMgr::ContentChanged(
+                                        swarm_id,
+                                        c_id,
+                                        d_type,
+                                        Some(data),
+                                    ))
+                                    .await;
+                                eprintln!("C-{} Page #{} update result: ok", c_id, page_no,);
+                            } else {
+                                eprintln!(
+                                    "CID-{} hashes: {:?}",
+                                    c_id,
+                                    app_data.content_bottom_hashes(c_id)
+                                );
+                                eprintln!(
+                                    "{:?} C-{} Page #{} update failed: {:?}",
+                                    swarm_id,
+                                    c_id,
+                                    page_no,
+                                    res.err().unwrap()
+                                );
+                            }
+                        }
+                    } else if data_type < DataType::Link {
+                        // eprintln!("Create new Data");
+                        if c_id > 0 {
+                            let _ = to_app_mgr_send
+                                .send(ToAppMgr::ContentAdded(
+                                    swarm_id,
+                                    c_id,
+                                    data_type,
+                                    data.clone(),
+                                ))
+                                .await;
+                        }
+                        let _res = app_data
+                            .update(c_id, Content::Data(data_type, 1, ContentTree::Filled(data)));
+                    } else {
+                        eprintln!("Create new Link 2");
+                        let _ = to_app_mgr_send
+                            .send(ToAppMgr::ContentAdded(
+                                swarm_id,
+                                c_id,
+                                data_type,
+                                data.clone(),
+                            ))
+                            .await;
+                        let link_result = data_to_link(data);
+                        if let Ok(link) = link_result {
+                            let _res = app_data.update(c_id, link);
+                        // eprintln!("Update result: {:?}", res);
+                        } else {
+                            eprintln!("Failed to create a link: {:?}", link_result.err().unwrap());
+                        }
+                    }
+                } else if let Ok((d_type, len)) = app_data.get_type_and_len(c_id) {
+                    if d_type == data_type {
+                        // let res = app_data.append_data(c_id, data);
+                        let res = app_data.update_data(c_id, page_no, data);
+                        if res.is_ok() {
+                            eprintln!("C-{} Page #{} update result: ok", c_id, page_no,);
+                        } else {
+                            eprintln!(
+                                "{:?} C-{} Page #{} update error: {:?}",
+                                swarm_id,
+                                c_id,
+                                page_no,
+                                res.err().unwrap()
+                            );
+                        }
+                    } else if d_type == DataType::Link {
+                        let res =
+                            app_data.update_transformative_link(false, c_id, page_no, total, data);
+                        // println!("Update TI result: {:?}", res);
+                    } else {
+                        eprintln!(
+                            "Error: Stored:{:?} len:{}\nreceived:{:?} len:{}",
+                            d_type, len, data_type, total
+                        );
+                    }
+                } else {
+                    eprintln!("Datastore couldn't find ContentID {}", c_id);
+                }
+            }
+        }
+    }
+    //     }
+    //     other => {
+    //         eprintln!("Unhandled response {}", other);
+    //     }
+    // }
+}
+async fn read_data_task(
+    storage: &PathBuf,
+    c_id: ContentID,
+    datastore_sync: &Option<(u16, HashMap<u16, Vec<(DataType, u64)>>)>,
+    to_app_mgr_send: &ASender<ToAppMgr>,
+    swarm_id: SwarmID,
+    app_data: &mut ApplicationData,
+    swarm_name: &SwarmName,
+    to_gnome_sender: &Sender<ToGnome>,
+) {
+    eprintln!(
+        "ToAppData::ReadData({}) when DStore synced: {}",
+        c_id,
+        datastore_sync.is_none()
+    );
+    //TODO: find a way to decide if we are completely synced with swarm, or not
+    //      if not request to sync from any Neighbor
+    if datastore_sync.is_some() {
+        eprintln!("Not synced");
+        let _ = to_app_mgr_send
+            .send(ToAppMgr::FromDatastore(
+                // requestor,
+                LibResponse::ReadError(swarm_id, c_id, AppError::AppDataNotSynced),
+            ))
+            .await;
+        return;
+    }
+    let type_and_len_result = app_data.get_type_and_len(c_id);
+    if type_and_len_result.is_err() {
+        eprintln!("Unable to get type and len");
+        let error = type_and_len_result.err().unwrap();
+        let _ = to_app_mgr_send
+            .send(ToAppMgr::FromDatastore(
+                // requestor,
+                LibResponse::ReadError(swarm_id, c_id, error),
+            ))
+            .await;
+        return;
+    }
+    let (d_type, len) = type_and_len_result.unwrap();
+    let (t, root_hash) = app_data.content_root_hash(c_id).unwrap();
+    // eprintln!("Read {}, data len: {}", c_id, len);
+    let all_data_result = app_data.get_all_data(c_id);
+    if let Ok(mut data_vec) = all_data_result {
+        //
+        //  we scan data_vec for empty data…
+        //
+        let mut data_missing = vec![];
+        for (i, dta) in data_vec.iter().enumerate() {
+            if dta.is_empty() {
+                data_missing.push(i as u16);
+            }
+        }
+        if !data_missing.is_empty() {
+            // …and then try to load missing Data either from
+            // local storage…
+            if let Some(c_from_store) =
+                load_content_from_disk(storage.to_path_buf(), c_id, d_type, root_hash).await
+            {
+                let mut data_filled_from_storage = vec![];
+                for d_id in &data_missing {
+                    if let Ok(data) = c_from_store.read_data(*d_id) {
+                        if !data.is_empty()
+                            && data_vec[*d_id as usize].get_hash() == data.get_hash()
+                        {
+                            data_vec[*d_id as usize] = data;
+                            data_filled_from_storage.push(*d_id);
+                        }
+                    }
+                }
+                data_missing.retain(|&el| !data_filled_from_storage.contains(&el));
+            }
+
+            if !data_missing.is_empty() {
+                //  …or from neighbors.
+                //
+                // TODO: we need to store internaly existing pages
+                // so that when we get response from storage/network
+                // we can fill in missing pages and send back complete
+                // Content to user.
+                // Or we could immediately send what we have and later
+                // send some additional Data as it comes.
+                //
+                let dmall = data_missing.chunks_exact(680);
+                let rmd = dmall.remainder();
+                for dmc in dmall {
+                    let sync_requests: Vec<SyncRequest> =
+                        vec![SyncRequest::Pages(c_id, d_type, dmc.to_vec())];
+                    let _ = to_gnome_sender.send(ToGnome::AskData(
+                        GnomeId::any(),
+                        NeighborRequest::Custom(
+                            0,
+                            CastData::new(serialize_requests(sync_requests)).unwrap(),
+                        ),
+                    ));
+                }
+                if !rmd.is_empty() {
+                    let sync_requests: Vec<SyncRequest> =
+                        vec![SyncRequest::Pages(c_id, d_type, rmd.to_vec())];
+                    let _ = to_gnome_sender.send(ToGnome::AskData(
+                        GnomeId::any(),
+                        NeighborRequest::Custom(
+                            0,
+                            CastData::new(serialize_requests(sync_requests)).unwrap(),
+                        ),
+                    ));
+                }
+            }
+        }
+        eprintln!("AppData Sending back contents of {}", c_id);
+        // let calculated_hash =
+        // if c_id == 0 {
+        //     eprintln!("Sending read result with {} data blocks", data_vec.len());
+        // }
+        let _ = to_app_mgr_send
+            .send(ToAppMgr::FromDatastore(
+                // requestor,
+                LibResponse::ReadSuccess(swarm_id, swarm_name.clone(), c_id, t, data_vec),
+            ))
+            .await;
+    } else {
+        // TODO: we should check all_data_result error type
+        // and if possible try to load missing Data either from
+        // local storage or from neighbors.
+        eprintln!("AppData error when reading contents of {}", c_id);
+        let error = all_data_result.err().unwrap();
+        if matches!(error, AppError::ContentEmpty) {
+            eprintln!("got ContentEmpty");
+            let sync_requests: Vec<SyncRequest> = vec![SyncRequest::AllPages(vec![c_id])];
+            let _ = to_gnome_sender.send(ToGnome::AskData(
+                GnomeId::any(),
+                NeighborRequest::Custom(
+                    0,
+                    CastData::new(serialize_requests(sync_requests)).unwrap(),
+                ),
+            ));
+        }
+        let _ = to_app_mgr_send
+            .send(ToAppMgr::FromDatastore(
+                // requestor,
+                LibResponse::ReadError(swarm_id, c_id, error),
+            ))
+            .await;
+    }
 }
 // An entire application data consists of a structure called Datastore.
 // There is also a helper change_reg useful for syncing.

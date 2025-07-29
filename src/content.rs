@@ -583,6 +583,7 @@ impl Content {
             Content::Link(s_name, c_id, descr, data, ti_opt) => {
                 Ok(link_to_data(s_name, c_id, descr, data, ti_opt))
             }
+            // TODO: here we drop existing Content when it is not a Link!
             other => Err(other),
         }
     }
@@ -638,15 +639,28 @@ impl Content {
             _other => Err(AppError::DatatypeMismatch),
         }
     }
+    // memusechange 1of5
     pub fn update(&mut self, content: Content) -> Content {
         std::mem::replace(self, content)
     }
+    // memusechange 2of5
     pub fn push_data(&mut self, data: Data) -> Result<u64, AppError> {
         match self {
             Self::Link(_s, _c, _descr, _data, _ti) => Err(AppError::DatatypeMismatch),
-            Self::Data(_dt, _mem, tree) => tree.append(data),
+            Self::Data(_dt, _mem, tree) => {
+                if data.is_empty() {
+                    tree.append(data)
+                } else {
+                    let res = tree.append(data);
+                    if res.is_ok() {
+                        *self = Self::Data(*_dt, *_mem + 1, tree.to_owned());
+                    }
+                    res
+                }
+            }
         }
     }
+    // memusechange 3of5
     pub fn pop_data(&mut self) -> Result<Data, AppError> {
         // eprintln!("pop_data");
         match self {
@@ -657,7 +671,13 @@ impl Content {
                     Err(AppError::ContentEmpty)
                 } else {
                     // eprintln!("tree pop");
-                    tree.pop()
+                    let res = tree.pop();
+                    if let Ok(data) = &res {
+                        if !data.is_empty() {
+                            *self = Self::Data(*_dt, *_mem - 1, tree.to_owned());
+                        }
+                    }
+                    res
                 }
             }
         }
@@ -666,7 +686,43 @@ impl Content {
     pub fn insert(&mut self, d_id: u16, data: Data) -> Result<u64, AppError> {
         match self {
             Self::Link(_s, _c, _descr, _data, _ti) => Err(AppError::DatatypeMismatch),
-            Self::Data(_dt, _mem, tree) => tree.insert(d_id, data),
+            Self::Data(_dt, _mem, tree) => {
+                let tree_len_max = tree.len() == u16::MAX;
+                if tree_len_max {
+                    let last_empty = tree.read(u16::MAX).unwrap().is_empty();
+                    if data.is_empty() {
+                        // if last elem is not empty mem - 1
+                        if !last_empty {
+                            let res = tree.insert(d_id, data);
+                            if res.is_ok() {
+                                *self = Self::Data(*_dt, *_mem - 1, tree.to_owned());
+                            }
+                            res
+                        } else {
+                            tree.insert(d_id, data)
+                        }
+                    } else {
+                        // if last elem IS empty + 1
+                        if last_empty {
+                            let res = tree.insert(d_id, data);
+                            if res.is_ok() {
+                                *self = Self::Data(*_dt, *_mem + 1, tree.to_owned());
+                            }
+                            res
+                        } else {
+                            tree.insert(d_id, data)
+                        }
+                    }
+                } else if data.is_empty() {
+                    tree.insert(d_id, data)
+                } else {
+                    let res = tree.insert(d_id, data);
+                    if res.is_ok() {
+                        *self = Self::Data(*_dt, *_mem + 1, tree.to_owned());
+                    }
+                    res
+                }
+            }
         }
     }
     pub fn link_params(
@@ -689,6 +745,7 @@ impl Content {
             _ => None,
         }
     }
+    // memusechange 4of5
     pub fn update_data(&mut self, data_id: u16, data: Data) -> Result<Data, AppError> {
         let myself = std::mem::replace(
             self,
@@ -740,10 +797,20 @@ impl Content {
             }
         }
     }
+    // memusechange 5of5
     pub fn remove_data(&mut self, d_id: u16) -> Result<Data, AppError> {
         match self {
             Self::Link(_s, _c, _descr, _data, _ti) => Err(AppError::DatatypeMismatch),
-            Self::Data(_dt, _mem, tree) => tree.remove_data(d_id),
+            Self::Data(_dt, _mem, tree) => {
+                let result = tree.remove_data(d_id);
+                if let Ok(data) = result {
+                    if !data.is_empty() {
+                        *self = Self::Data(*_dt, *_mem - 1, tree.to_owned());
+                    }
+                    return Ok(data);
+                }
+                result
+            }
         }
     }
 
@@ -835,7 +902,7 @@ impl Content {
         }
         v
     }
-    pub fn used_memory_slots(&self) -> usize {
+    pub fn used_memory_pages(&self) -> usize {
         match self {
             Self::Link(_s, _c, _descr, _data, ti_opt) => {
                 if let Some(ti) = ti_opt {

@@ -6,13 +6,15 @@ use std::str::FromStr;
 
 use gnome::prelude::{Nat, NetworkSettings, PortAllocationRule, Transport};
 
+use crate::storage::StoragePolicy;
+
 pub struct Configuration {
     pub work_dir: PathBuf,
     pub storage: PathBuf,
     pub neighbors: Option<Vec<NetworkSettings>>,
     pub max_connected_swarms: u8,
     pub upload_bandwidth: u64,
-    pub store_data_on_disk: bool,
+    pub store_data_on_disk: StoragePolicy,
 }
 
 impl Configuration {
@@ -26,7 +28,7 @@ impl Configuration {
         };
         let mut max_connected_swarms = 8;
         let mut upload_bandwidth = 8192;
-        let mut store_data_on_disk = true;
+        let mut store_data_on_disk = StoragePolicy::Everything;
         if !conf_path.exists() {
             return Configuration {
                 work_dir: dir.clone(),
@@ -73,8 +75,8 @@ impl Configuration {
                         if let Some(number_str) = split.next() {
                             if let Ok(number) = u8::from_str_radix(number_str, 10) {
                                 match number {
-                                    1 => store_data_on_disk = true,
-                                    0 => store_data_on_disk = false,
+                                    1 => store_data_on_disk = StoragePolicy::Everything,
+                                    0 => store_data_on_disk = StoragePolicy::Datastore,
                                     other => {
                                         eprintln!(
                                             "Invalid config value for STORE_DATA_ON_DISK: {}",

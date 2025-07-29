@@ -19,6 +19,8 @@ use crate::{ApplicationData, Data};
 // - Everything - Datastore + MainPages + all other pages
 //
 // Depending on what storage policy we are provided with we decide what to do with data
+
+#[derive(Clone)]
 pub enum StoragePolicy {
     Discard,
     Datastore,
@@ -123,9 +125,36 @@ pub async fn read_datastore_from_disk(
     app_data
 }
 
+pub fn should_store_content_on_disk(policy: &StoragePolicy, c_id: ContentID) -> (bool, u16) {
+    let default_p_count = if c_id == 0 { 64 } else { 0 };
+    match policy {
+        StoragePolicy::Discard => (false, 0),
+        StoragePolicy::Datastore => {
+            if c_id == 0 {
+                (true, default_p_count)
+            } else {
+                (false, default_p_count)
+            }
+        }
+        StoragePolicy::MainPages => (true, default_p_count),
+        StoragePolicy::SelectMainPages(c_ids) => (c_ids.contains(&c_id), default_p_count),
+        StoragePolicy::SelectedContents(store_main_pages, c_ids) => {
+            if c_ids.contains(&c_id) {
+                (true, u16::MAX)
+            } else if *store_main_pages {
+                (true, default_p_count)
+            } else if c_id == 0 {
+                (true, default_p_count)
+            } else {
+                (false, default_p_count)
+            }
+        }
+        StoragePolicy::Everything => (true, u16::MAX),
+    }
+}
 pub async fn store_data_on_disk(
     s_storage: PathBuf,
-    app_data: ApplicationData,
+    mut app_data: ApplicationData,
     policy: StoragePolicy,
 ) {
     if matches!(policy, StoragePolicy::Discard) {
@@ -145,42 +174,87 @@ pub async fn store_data_on_disk(
     if !content_changed {
         return;
     }
-    store_content_on_disk(0, &s_storage, &app_data, 64).await;
-    if matches!(policy, StoragePolicy::Datastore) {
-        // Do nothing more
-    } else if let StoragePolicy::SelectMainPages(selection) = policy {
-        // Right now we did not implement main_pages.dat file that stores only
-        // main pages of contents.
-        // So for now we will store each in different cid.dat file
-        for c_id in selection {
-            store_content_on_disk(c_id, &s_storage, &app_data, 0).await;
-        }
-        return;
-    } else if let StoragePolicy::MainPages = policy {
-        for c_id in 1..=last_defined_c_id {
-            store_content_on_disk(c_id, &s_storage, &app_data, 0).await;
-        }
-    } else if let StoragePolicy::SelectedContents(store_main_pages, selection) = policy {
-        if store_main_pages {
-            for c_id in 0..=last_defined_c_id {
-                if selection.contains(&c_id) {
-                    store_content_on_disk(c_id, &s_storage, &app_data, u16::MAX).await;
-                } else {
-                    store_content_on_disk(c_id, &s_storage, &app_data, 0).await;
-                }
-            }
-        } else {
-            for c_id in selection {
-                store_content_on_disk(c_id, &s_storage, &app_data, u16::MAX).await;
-            }
-        }
-    } else if let StoragePolicy::Everything = policy {
-        for c_id in 0..=last_defined_c_id {
-            store_content_on_disk(c_id, &s_storage, &app_data, u16::MAX).await;
-        }
-    } else {
-        eprintln!("This is not expected to happen");
+    let (should_store, max_page) = should_store_content_on_disk(&policy, 0);
+    if should_store {
+        store_content_on_disk(0, &s_storage, &app_data.contents.take(0).unwrap(), max_page).await;
     }
+
+    if matches!(policy, StoragePolicy::Datastore) {
+        return;
+    }
+    for c_id in 1..=last_defined_c_id {
+        let (should_store, max_page) = should_store_content_on_disk(&policy, c_id);
+        if should_store {
+            store_content_on_disk(
+                c_id,
+                &s_storage,
+                &app_data.contents.take(c_id).unwrap(),
+                max_page,
+            )
+            .await;
+        }
+    }
+    // if matches!(policy, StoragePolicy::Datastore) {
+    //     // Do nothing more
+    // } else if let StoragePolicy::SelectMainPages(selection) = policy {
+    //     // Right now we did not implement main_pages.dat file that stores only
+    //     // main pages of contents.
+    //     // So for now we will store each in different cid.dat file
+    //     for c_id in selection {
+    //         store_content_on_disk(c_id, &s_storage, &app_data.contents.take(c_id).unwrap(), 0)
+    //             .await;
+    //     }
+    //     return;
+    // } else if let StoragePolicy::MainPages = policy {
+    //     for c_id in 1..=last_defined_c_id {
+    //         store_content_on_disk(c_id, &s_storage, &app_data.contents.take(c_id).unwrap(), 0)
+    //             .await;
+    //     }
+    // } else if let StoragePolicy::SelectedContents(store_main_pages, selection) = policy {
+    //     if store_main_pages {
+    //         for c_id in 0..=last_defined_c_id {
+    //             if selection.contains(&c_id) {
+    //                 store_content_on_disk(
+    //                     c_id,
+    //                     &s_storage,
+    //                     &app_data.contents.take(c_id).unwrap(),
+    //                     u16::MAX,
+    //                 )
+    //                 .await;
+    //             } else {
+    //                 store_content_on_disk(
+    //                     c_id,
+    //                     &s_storage,
+    //                     &app_data.contents.take(c_id).unwrap(),
+    //                     0,
+    //                 )
+    //                 .await;
+    //             }
+    //         }
+    //     } else {
+    //         for c_id in selection {
+    //             store_content_on_disk(
+    //                 c_id,
+    //                 &s_storage,
+    //                 &app_data.contents.take(c_id).unwrap(),
+    //                 u16::MAX,
+    //             )
+    //             .await;
+    //         }
+    //     }
+    // } else if let StoragePolicy::Everything = policy {
+    //     for c_id in 0..=last_defined_c_id {
+    //         store_content_on_disk(
+    //             c_id,
+    //             &s_storage,
+    //             &app_data.contents.take(c_id).unwrap(),
+    //             u16::MAX,
+    //         )
+    //         .await;
+    //     }
+    // } else {
+    //     eprintln!("This is not expected to happen");
+    // }
     // TODO: build logic to update file contents
     // If we have data in memory we can decide to only store data hashes, or Pages
     // Once we've decided we read existing on-disk data and only store missing parts
@@ -196,109 +270,79 @@ pub async fn store_data_on_disk(
     // TODO: In future we want to store how many "dead bytes" we are storing od disk.
     // When some threshold is exceeded, we write both files from scratch to save disk space
 }
-async fn store_content_on_disk(
+pub async fn store_content_on_disk(
     c_id: ContentID,
     s_storage: &Path,
-    app_data: &ApplicationData,
+    content: &Content,
     break_on_page: u16,
 ) {
-    if let Ok((dtype, rhash)) = app_data.content_root_hash(c_id) {
-        let mut buff_header: [u8; 16] = [0; 16];
-        // eprintln!("CID-{} hash {}", c_id, rhash);
-        // Load existing file contents into memory
-        let header_file = s_storage.join(format!("{}.hdr", c_id));
-        let data_file = s_storage.join(format!("{}.dat", c_id));
-        let mut temp_storage = HashMap::new();
-        let mut byte_pointer: u32 = 0;
-        if let Some(file_content) = load_content_from_header_file(
-            header_file.clone(),
-            dtype,
-            &mut temp_storage,
-            &mut byte_pointer,
-        )
-        .await
-        {
-            // eprintln!("Header file for CID-{} read", c_id);
-            // Calculate it's root hash
-            if file_content.hash() != rhash {
-                // Only if hashes are different append pages that differ
-                eprintln!(
-                    "CID-{} on disk {} differs from {} in memory\n(file: {:?})",
-                    c_id,
-                    file_content.hash(),
-                    rhash,
-                    header_file,
-                );
-                // eprintln!("on disk page hashes: {:?}", file_content.data_hashes());
-                // eprintln!(
-                //     "in memr page hashes: {:?}",
-                //     app_data.content_bottom_hashes(c_id).unwrap()
-                // );
-                let header_file = OpenOptions::new()
-                    .write(true)
-                    .append(true)
-                    .open(header_file)
-                    .await
-                    .unwrap();
-                let mut header_file = BufWriter::new(header_file);
-                let data_file = OpenOptions::new()
-                    .write(true)
-                    .append(true)
-                    .open(data_file)
-                    .await
-                    .unwrap();
-                let mut data_file = BufWriter::new(data_file);
-                let mem_data_hashes = app_data.content_bottom_hashes(c_id).unwrap();
-                for (i, mem_hash) in mem_data_hashes.into_iter().enumerate() {
-                    if let Some((hash, _offset, _size)) = temp_storage.get(&(i as u16)) {
-                        if *hash != mem_hash {
-                            eprintln!("PID-{} Disk: {}, mem: {} ", i, hash, mem_hash);
-                            //TODO: send updated contents to disk
-                            // hdr file format:
-                            // PID(2B)    PageHash(8B)    Offset(4B)    Size(2B)
-                            let [d0, d1] = (i as u16).to_be_bytes();
-                            let read_result = app_data.read_data(c_id, i as u16);
-                            if read_result.is_err() {
-                                eprintln!(
-                                    "Failed to read data for CID-{}/{}:\n{:?}",
-                                    c_id, i, read_result
-                                );
-                                continue;
-                            }
-                            let data = read_result.unwrap();
-                            buff_header[0] = d0;
-                            buff_header[1] = d1;
-                            let mut i = 2;
-                            for byte in mem_hash.to_be_bytes() {
-                                buff_header[i] = byte;
-                                i += 1;
-                            }
-                            if data.is_empty() {
-                                //Only write hdr file
-                                for i in 10..16 {
-                                    buff_header[i] = 0;
-                                }
-                                let _ = header_file.write(&buff_header).await;
-                            } else {
-                                let mut i = 10;
-                                for byte in byte_pointer.to_be_bytes() {
-                                    buff_header[i] = byte;
-                                    i += 1;
-                                }
-                                let data_len = data.len() as u32;
-                                for byte in (data_len as u16).to_be_bytes() {
-                                    buff_header[i] = byte;
-                                    i += 1;
-                                }
-                                let _ = header_file.write(&buff_header).await;
-                                let _ = data_file.write(&data.bytes()).await;
-                                byte_pointer += data_len;
-                            }
-                        }
-                    } else {
-                        // TODO: too much copy-pasting!!!
+    // if let Ok((dtype, rhash)) = ) {
+    let rhash = content.hash();
+    let dtype = content.data_type();
+    let mut buff_header: [u8; 16] = [0; 16];
+    // eprintln!("CID-{} hash {}", c_id, rhash);
+    // Load existing file contents into memory
+    let header_file = s_storage.join(format!("{}.hdr", c_id));
+    let data_file = s_storage.join(format!("{}.dat", c_id));
+    let mut temp_storage = HashMap::new();
+    let mut byte_pointer: u32 = 0;
+    if let Some(file_content) = load_content_from_header_file(
+        header_file.clone(),
+        dtype,
+        &mut temp_storage,
+        &mut byte_pointer,
+    )
+    .await
+    {
+        // eprintln!("Header file for CID-{} read", c_id);
+        // Calculate it's root hash
+        if file_content.hash() != rhash {
+            // Only if hashes are different append pages that differ
+            eprintln!(
+                "CID-{} on disk {} differs from {} in memory\n(file: {:?})",
+                c_id,
+                file_content.hash(),
+                rhash,
+                header_file,
+            );
+            // eprintln!("on disk page hashes: {:?}", file_content.data_hashes());
+            // eprintln!(
+            //     "in memr page hashes: {:?}",
+            //     app_data.content_bottom_hashes(c_id).unwrap()
+            // );
+            let header_file = OpenOptions::new()
+                .write(true)
+                .append(true)
+                .open(header_file)
+                .await
+                .unwrap();
+            let mut header_file = BufWriter::new(header_file);
+            let data_file = OpenOptions::new()
+                .write(true)
+                .append(true)
+                .open(data_file)
+                .await
+                .unwrap();
+            let mut data_file = BufWriter::new(data_file);
+            // let mem_data_hashes = content.content_bottom_hashes(c_id).unwrap();
+            let mem_data_hashes = content.data_hashes();
+            for (i, mem_hash) in mem_data_hashes.into_iter().enumerate() {
+                if let Some((hash, _offset, _size)) = temp_storage.get(&(i as u16)) {
+                    if *hash != mem_hash {
+                        eprintln!("PID-{} Disk: {}, mem: {} ", i, hash, mem_hash);
+                        //TODO: send updated contents to disk
+                        // hdr file format:
+                        // PID(2B)    PageHash(8B)    Offset(4B)    Size(2B)
                         let [d0, d1] = (i as u16).to_be_bytes();
-                        let data = app_data.read_data(c_id, i as u16).unwrap();
+                        let read_result = content.read_data(i as u16);
+                        if read_result.is_err() {
+                            eprintln!(
+                                "Failed to read data for CID-{}/{}:\n{:?}",
+                                c_id, i, read_result
+                            );
+                            continue;
+                        }
+                        let data = read_result.unwrap();
                         buff_header[0] = d0;
                         buff_header[1] = d1;
                         let mut i = 2;
@@ -328,64 +372,97 @@ async fn store_content_on_disk(
                             byte_pointer += data_len;
                         }
                     }
-                    if i as u16 >= break_on_page {
-                        break;
+                } else {
+                    // TODO: too much copy-pasting!!!
+                    let [d0, d1] = (i as u16).to_be_bytes();
+                    let data = content.read_data(i as u16).unwrap();
+                    buff_header[0] = d0;
+                    buff_header[1] = d1;
+                    let mut i = 2;
+                    for byte in mem_hash.to_be_bytes() {
+                        buff_header[i] = byte;
+                        i += 1;
+                    }
+                    if data.is_empty() {
+                        //Only write hdr file
+                        for i in 10..16 {
+                            buff_header[i] = 0;
+                        }
+                        let _ = header_file.write(&buff_header).await;
+                    } else {
+                        let mut i = 10;
+                        for byte in byte_pointer.to_be_bytes() {
+                            buff_header[i] = byte;
+                            i += 1;
+                        }
+                        let data_len = data.len() as u32;
+                        for byte in (data_len as u16).to_be_bytes() {
+                            buff_header[i] = byte;
+                            i += 1;
+                        }
+                        let _ = header_file.write(&buff_header).await;
+                        let _ = data_file.write(&data.bytes()).await;
+                        byte_pointer += data_len;
                     }
                 }
-                let _ = header_file.flush().await;
-                let _ = data_file.flush().await;
-                // TODO: we need to update what has changed into disk
+                if i as u16 >= break_on_page {
+                    break;
+                }
             }
-        } else {
-            eprintln!("Creating new header and data for CID-{}", c_id);
-            let mut header_file = BufWriter::new(File::create(header_file).await.unwrap());
-            let mut data_file = BufWriter::new(File::create(data_file).await.unwrap());
-            let mut byte_pointer: u32 = 0;
-            let mut data_id = 0;
-            // TODO: write both hdr & dat from scratch
-            while let Ok(data) = app_data.read_data(c_id, data_id) {
-                let [d0, d1] = data_id.to_be_bytes();
-                buff_header[0] = d0;
-                buff_header[1] = d1;
-                let mut i = 2;
-                for byte in data.get_hash().to_be_bytes() {
+            let _ = header_file.flush().await;
+            let _ = data_file.flush().await;
+            // TODO: we need to update what has changed into disk
+        }
+    } else {
+        eprintln!("Creating new header and data for CID-{}", c_id);
+        let mut header_file = BufWriter::new(File::create(header_file).await.unwrap());
+        let mut data_file = BufWriter::new(File::create(data_file).await.unwrap());
+        let mut byte_pointer: u32 = 0;
+        let mut data_id = 0;
+        // TODO: write both hdr & dat from scratch
+        while let Ok(data) = content.read_data(data_id) {
+            let [d0, d1] = data_id.to_be_bytes();
+            buff_header[0] = d0;
+            buff_header[1] = d1;
+            let mut i = 2;
+            for byte in data.get_hash().to_be_bytes() {
+                buff_header[i] = byte;
+                i += 1;
+            }
+            if data.is_empty() {
+                //Only write hdr file
+                for i in 10..16 {
+                    buff_header[i] = 0;
+                }
+                let _ = header_file.write(&buff_header).await;
+            } else {
+                let mut i = 10;
+                for byte in byte_pointer.to_be_bytes() {
                     buff_header[i] = byte;
                     i += 1;
                 }
-                if data.is_empty() {
-                    //Only write hdr file
-                    for i in 10..16 {
-                        buff_header[i] = 0;
-                    }
-                    let _ = header_file.write(&buff_header).await;
-                } else {
-                    let mut i = 10;
-                    for byte in byte_pointer.to_be_bytes() {
-                        buff_header[i] = byte;
-                        i += 1;
-                    }
-                    let data_len = data.len() as u32;
-                    for byte in (data_len as u16).to_be_bytes() {
-                        buff_header[i] = byte;
-                        i += 1;
-                    }
-                    let _ = header_file.write(&buff_header).await;
-                    let _ = data_file.write(&data.bytes()).await;
-                    byte_pointer += data_len;
+                let data_len = data.len() as u32;
+                for byte in (data_len as u16).to_be_bytes() {
+                    buff_header[i] = byte;
+                    i += 1;
                 }
-                if data_id >= break_on_page {
-                    break;
-                }
-                data_id += 1;
+                let _ = header_file.write(&buff_header).await;
+                let _ = data_file.write(&data.bytes()).await;
+                byte_pointer += data_len;
             }
-
-            let _ = header_file.flush().await;
-            let _ = data_file.flush().await;
+            if data_id >= break_on_page {
+                break;
+            }
+            data_id += 1;
         }
-        // } else {
-        //     // eprintln!("Unable to read root hash for {}, breaking", c_id);
-        //     break;
+
+        let _ = header_file.flush().await;
+        let _ = data_file.flush().await;
     }
+    // } else {
+    //     // eprintln!("Unable to read root hash for {}, breaking", c_id);
+    //     break;
+    // }
 }
 
 pub async fn load_content_from_disk(
