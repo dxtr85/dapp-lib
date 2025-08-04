@@ -1188,11 +1188,17 @@ impl ContentTree {
                 if idx == 0 {
                     Ok(data.clone())
                 } else {
-                    Err(AppError::Smthg)
+                    Err(AppError::IndexingError)
                 }
             }
             Self::Hashed(sub_tree) => sub_tree.read(idx),
-            Self::Empty(_h) => Err(AppError::ContentEmpty),
+            Self::Empty(_h) => {
+                if idx == 0 {
+                    Ok(Data::empty(*_h))
+                } else {
+                    Err(AppError::IndexingError)
+                }
+            }
         }
     }
 

@@ -226,11 +226,17 @@ impl Manifest {
                 d_types: HashMap::new(),
             };
         }
-        let app_type = if let Some(byte) = iter.next() {
-            AppType::from(byte)
-        } else {
-            AppType::Other(0)
-        };
+        let app_type_byte = iter.next();
+        if app_type_byte.is_none() {
+            return Manifest {
+                app_type: AppType::Other(0),
+                pub_ips: CombinedNetworkSettings::new(),
+                description: String::new(),
+                tags: HashMap::new(),
+                d_types: HashMap::new(),
+            };
+        }
+        let app_type = AppType::from(app_type_byte.unwrap());
         // let tags_count = if let Some(byte) = iter.next() {
         //     byte as usize
         // } else {

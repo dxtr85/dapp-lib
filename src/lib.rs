@@ -111,6 +111,7 @@ pub enum ToApp {
     ContentChanged(SwarmID, ContentID, DataType, Option<Data>),
     ReadSuccess(SwarmID, SwarmName, ContentID, DataType, Vec<Data>),
     ReadError(SwarmID, ContentID, AppError),
+    ReadInProgress(SwarmID, ContentID),
     GetCIDsForTags(SwarmID, GnomeId, Vec<u8>, Vec<(ContentID, Data)>),
     FirstPages(SwarmID, Vec<(ContentID, DataType, Data)>),
     // MyPublicIPs(Vec<(IpAddr, u16, Nat, (PortAllocationRule, i8))>),
@@ -167,7 +168,9 @@ pub enum ToAppMgr {
 
 #[derive(Debug)]
 pub enum LibRequest {
-    ReadData(SwarmID, ContentID),
+    ReadAllPages(SwarmID, ContentID),
+    ReadPagesRange(SwarmID, ContentID, u16, u16),
+    CancelRead(SwarmID, ContentID, DataType),
     ReadDataGlobal(SwarmName, ContentID),
     ReadAllFirstPages(SwarmID),
     Search(String),
@@ -182,11 +185,20 @@ pub enum LibResponse {
     SwarmSynced(SwarmID),
     SwarmSyncedExt(SwarmID, SwarmName, u64, ASender<ToAppData>),
     FirstPages(SwarmID, Vec<(ContentID, DataType, Data)>),
-    ReadSuccess(SwarmID, SwarmName, ContentID, DataType, Vec<Data>),
+    ReadSuccess(
+        SwarmID,
+        SwarmName,
+        ContentID,
+        DataType,
+        u16,
+        bool,
+        Vec<Data>,
+    ),
     ReadError(SwarmID, ContentID, AppError),
+    DownloadingPages(SwarmID, ContentID, DataType),
     AuditResult(SwarmID, usize, usize, u8),
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum TimeoutType {
     Cooldown,
     NewSwarmsAvailable,
@@ -194,9 +206,10 @@ pub enum TimeoutType {
     AddToWaitList(SwarmName),
     HasNeighbors,
     AuditMemoryForSwarm(SwarmID, SwarmName),
+    AuditReads,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub enum Requestor {
     App,
     Search,
@@ -205,7 +218,11 @@ pub enum Requestor {
 #[derive(Debug)]
 pub enum ToAppData {
     Response(GnomeToApp),
-    ReadData(Requestor, ContentID),
+    ReadAllPages(Requestor, ContentID),
+    ReadPagesRange(Requestor, ContentID, u16, u16),
+    ReadNextChunk(Requestor, ContentID, u16),
+    ReadCancel(ContentID),
+    ReadRefresh(Vec<(ContentID, DataType)>),
     SendFirstPage(GnomeId, ContentID, Data),
     ReadAllFirstPages(Requestor),
     BroadcastSend(CastID, CastData),
@@ -240,12 +257,49 @@ pub enum ToAppData {
     TransformLink(GnomeId, SyncData),
     TimeoutSyncCheck,
     RunMemoryUseAudit(u8), //Request from Manager
-    // MemoryPagesUsed(usize),
-    // MemoryPagesFreed(usize),
-    PartialAuditResult(u8, usize, ContentID, Vec<(ContentID, usize)>), //Perform audit one Content at a time
-    // so app works uninterrupted
+    PartialAuditResult(u8, usize, ContentID, Vec<(ContentID, usize)>),
     PurgePagesFromMemory(usize, Vec<(ContentID, usize)>),
     Terminate,
+}
+
+struct ReadState {
+    c_len: u16,
+    requestor: Requestor,
+    chunk_requested: u16,
+    missing_pages: HashSet<u16>,
+}
+impl ReadState {
+    // TODO:
+    pub fn new(
+        c_len: u16,
+        requestor: Requestor,
+        chunk_requested: u16,
+        missing_pages: HashSet<u16>,
+    ) -> Self {
+        ReadState {
+            c_len,
+            requestor,
+            chunk_requested,
+            missing_pages,
+        }
+    }
+
+    pub fn page_arrived(&mut self, p_id: u16) -> bool {
+        self.missing_pages.remove(&p_id);
+        self.missing_pages.is_empty()
+    }
+
+    pub fn what_is_missing(&self) -> Vec<u16> {
+        self.missing_pages.clone().into_iter().collect()
+    }
+
+    pub fn next_chunk(&mut self, chunk_no: u16, pages_missing: HashSet<u16>) {
+        self.chunk_requested = chunk_no;
+        self.missing_pages = pages_missing;
+    }
+    pub fn is_last_chunk(&self) -> bool {
+        self.c_len <= 64 * (1 + self.chunk_requested)
+    }
 }
 // TODO: We need to define a way where we can update multiple Data of a given ContentID at once
 // I.e. in a Catalog swarm we have defined a Tag, and now Manifest that was 1 Data with single
@@ -445,6 +499,11 @@ async fn serve_app_manager(
     let mut quit_application = false;
     let mut swarm_swap = SwarmSwap::new();
     spawn(serve_gnome_mgr_requests(from_gnome_mgr, to_app_mgr.clone()));
+    spawn(start_cycling_timer(
+        to_app_mgr.clone(),
+        TimeoutType::AuditReads,
+        Duration::from_secs(20),
+    ));
     'outer: loop {
         // sleep(sleep_time).await;
 
@@ -479,13 +538,76 @@ async fn serve_app_manager(
                     to_search_enigne.send(SearchMsg::ListQueries).await;
                 }
                 ToAppMgr::FromApp(LibRequest::GetSearchResults(phrase)) => {
-                    to_search_enigne.send(SearchMsg::GetResults(phrase)).await;
+                    let _ = to_search_enigne.send(SearchMsg::GetResults(phrase)).await;
                 }
-                ToAppMgr::FromApp(LibRequest::ReadData(s_id, c_id)) => {
+                ToAppMgr::FromApp(LibRequest::ReadPagesRange(s_id, c_id, p_start, p_end)) => {
                     if let Some(to_app_data) = app_mgr.app_data_store.get(&s_id) {
                         let _ = to_app_data
-                            .send(ToAppData::ReadData(Requestor::App, c_id))
+                            .send(ToAppData::ReadPagesRange(
+                                Requestor::App,
+                                c_id,
+                                p_start,
+                                p_end,
+                            ))
                             .await;
+                    }
+                }
+                ToAppMgr::FromApp(LibRequest::CancelRead(s_id, c_id, d_type)) => {
+                    app_mgr.remove_read(s_id, c_id, d_type);
+                    if let Some(to_app_data) = app_mgr.app_data_store.get(&s_id) {
+                        let _ = to_app_data.send(ToAppData::ReadCancel(c_id)).await;
+                    }
+                }
+                ToAppMgr::FromApp(LibRequest::ReadAllPages(s_id, c_id)) => {
+                    // TODO: make use of is_volatile
+                    // For a given SwarmID there can only be one is_volatile
+                    // read request ongoing.
+                    // If a user sends second one, current one is being
+                    // replaced by this new one.
+                    // AppData should receive two mesagges:
+                    // one to cancel previous read request,
+                    // and another to start a new read.
+                    //
+                    // For non-volatile read requests there can be multiple
+                    // such requests running all at once.
+                    // Maybe we could set up a limit and in case it was
+                    // reached, user would receive a ReadError repsonse
+                    // informing him about that.
+                    //
+                    // For non-volatile requests AppMgr should store them for
+                    // book-keeping. There should always be a timeout task
+                    // running for those read requests.
+                    // When AppMgr receives a Timeout notification for NVReads,
+                    // it should ping all AppData tasks with a reminder to
+                    // provide requested Contents.
+                    //
+                    // AppData should keep a list of currently running ReadData
+                    // requests. When it receives a reminder from AppMgr,
+                    // it checks that list to see what Pages are still missing.
+                    // For those missing Pages it sends requests to Gnome.
+                    //
+                    // Pages should be sent back in chunks of 64. Once all
+                    // of those chunks are collected, that part is being sent
+                    // back to user with a flag indicating if this chunk is
+                    // the last one.
+                    //
+                    // Once AppMgr sees that flag set to true, it clears
+                    // given ContentID from currently run reads.
+                    //
+
+                    if let Some(to_app_data) = app_mgr.app_data_store.get(&s_id) {
+                        let _ = to_app_data
+                            .send(ToAppData::ReadAllPages(Requestor::App, c_id))
+                            .await;
+                        // TODO: fix this
+                        // let dtype = DataType::from(1);
+                        // if let Some((cc_sid, cc_cid, cc_dt)) =
+                        // app_mgr.add_pending_read(s_id, c_id, is_volatile)
+                        // {
+                        //     if let Some(to_app_data) = app_mgr.app_data_store.get(&cc_sid) {
+                        //         let _ = to_app_data.send(ToAppData::ReadCancel(cc_cid)).await;
+                        //     }
+                        // }
                     }
                 }
                 ToAppMgr::FromApp(LibRequest::ReadDataGlobal(s_name, c_id)) => {
@@ -493,7 +615,7 @@ async fn serve_app_manager(
                     if let Some(s_id) = app_mgr.get_swarm_id(&s_name) {
                         if let Some(to_app_data) = app_mgr.app_data_store.get(&s_id) {
                             let _ = to_app_data
-                                .send(ToAppData::ReadData(Requestor::App, c_id))
+                                .send(ToAppData::ReadAllPages(Requestor::App, c_id))
                                 .await;
                         } else {
                             eprintln!("Could not find sender for {}", s_name);
@@ -549,15 +671,15 @@ async fn serve_app_manager(
                     let time_until_next_audit = if usage_percentage <= 50 {
                         u8::min(32, time_period << 1)
                     } else if usage_percentage <= 75 {
-                        u8::max(1, time_period >> 1)
+                        u8::max(8, time_period >> 1)
                     } else {
-                        u8::max(1, time_period >> 2)
+                        u8::max(4, time_period >> 2)
                     };
                     if let Some(s_name) = app_mgr.get_name(s_id) {
                         spawn(start_a_timer(
                             to_app_mgr.clone(),
                             TimeoutType::AuditMemoryForSwarm(s_id, s_name),
-                            Duration::from_secs(time_until_next_audit as u64),
+                            Duration::from_secs(60 * time_until_next_audit as u64),
                         ));
                     }
                 }
@@ -582,10 +704,23 @@ async fn serve_app_manager(
                     s_name,
                     c_id,
                     dtype,
+                    chunk_no,
+                    is_last,
                     data_vec,
                 )) => {
-                    // match requestor {
-                    //     Requestor::App => {
+                    if chunk_no == 0 && !is_last {
+                        // if let Some((cc_sid, cc_cid, _dt)) =
+                        // app_mgr.update_pending_read(s_id, c_id, dtype)
+                        app_mgr.add_read(s_id, c_id, dtype)
+                        // {
+                        //     if let Some(to_app_data) = app_mgr.app_data_store.get(&cc_sid) {
+                        //         let _ = to_app_data.send(ToAppData::ReadCancel(cc_cid)).await;
+                        //     }
+                        // }
+                    }
+                    if is_last {
+                        app_mgr.remove_read(s_id, c_id, dtype);
+                    }
                     let _ = to_user
                         .send(ToApp::ReadSuccess(s_id, s_name, c_id, dtype, data_vec))
                         .await;
@@ -608,6 +743,19 @@ async fn serve_app_manager(
                     //             .await;
                     //     }
                     // }
+                }
+                ToAppMgr::FromDatastore(LibResponse::DownloadingPages(s_id, c_id, dtype)) => {
+                    // if chunk_no == 0 && !is_last {
+                    // if let Some((cc_sid, cc_cid, _dt)) =
+                    // app_mgr.update_pending_read(s_id, c_id, dtype)
+                    app_mgr.add_read(s_id, c_id, dtype);
+                    // {
+                    //     if let Some(to_app_data) = app_mgr.app_data_store.get(&cc_sid) {
+                    //         let _ = to_app_data.send(ToAppData::ReadCancel(cc_cid)).await;
+                    //     }
+                    // }
+                    // }
+                    let _ = to_user.send(ToApp::ReadInProgress(s_id, c_id)).await;
                 }
                 ToAppMgr::TransformLinkRequest(boxed_s_data) => {
                     let _ = app_mgr
@@ -809,7 +957,7 @@ async fn serve_app_manager(
                         // eprintln!("Not informing user about Manifest in {:?}", s_id);
                         if let Some(to_app_data) = app_mgr.app_data_store.get(&s_id) {
                             let _ = to_app_data
-                                .send(ToAppData::ReadData(Requestor::App, c_id))
+                                .send(ToAppData::ReadAllPages(Requestor::App, c_id))
                                 .await;
                         }
                     }
@@ -940,6 +1088,16 @@ async fn serve_app_manager(
                 ToAppMgr::TimeoutOver(t_type) => match t_type {
                     TimeoutType::AddToWaitList(s_name) => {
                         app_mgr.add_swarm_to_wait_list(s_name);
+                    }
+                    TimeoutType::AuditReads => {
+                        for (s_id, c_ids) in app_mgr.read_list() {
+                            if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
+                                let _ = sender.send(ToAppData::ReadRefresh(c_ids)).await;
+                            } else {
+                                // TODO: and if it doesn't exist we drop
+                                // that pair from read list
+                            }
+                        }
                     }
                     TimeoutType::AuditMemoryForSwarm(s_id, s_name) => {
                         // check if s_id & s_name match,
@@ -1837,6 +1995,7 @@ async fn serve_app_data(
     let mut datastore_sync: Option<(u16, HashMap<u16, Vec<(DataType, u64)>>)> =
         Some((0, HashMap::new()));
     let sleep_time = Duration::from_millis(32);
+    let mut active_reads: HashMap<ContentID, ReadState> = HashMap::new();
     while let Ok(resp) = app_data_recv.recv().await {
         match resp {
             // TODO: We should always assume to be out of sync
@@ -2433,6 +2592,7 @@ async fn serve_app_data(
                     &to_app_mgr_send,
                     swarm_id,
                     &mut app_data,
+                    &mut active_reads,
                     &swarm_name,
                     &to_gnome_sender,
                     &s_storage,
@@ -2444,18 +2604,86 @@ async fn serve_app_data(
                 .await
             }
 
-            ToAppData::ReadData(_requestor, c_id) => {
+            ToAppData::ReadAllPages(requestor, c_id) => {
                 read_data_task(
+                    requestor,
                     &storage,
                     c_id,
+                    0,
+                    None,
+                    &mut active_reads,
                     &datastore_sync,
                     &to_app_mgr_send,
                     swarm_id,
                     &mut app_data,
                     &swarm_name,
                     &to_gnome_sender,
+                    &app_data_send,
+                    &to_search_enigne,
                 )
                 .await
+            }
+            ToAppData::ReadPagesRange(requestor, c_id, p_start, p_end) => {
+                read_data_task(
+                    requestor,
+                    &storage,
+                    c_id,
+                    p_start,
+                    Some(p_end),
+                    &mut active_reads,
+                    &datastore_sync,
+                    &to_app_mgr_send,
+                    swarm_id,
+                    &mut app_data,
+                    &swarm_name,
+                    &to_gnome_sender,
+                    &app_data_send,
+                    &to_search_enigne,
+                )
+                .await
+            }
+            ToAppData::ReadNextChunk(requestor, c_id, starting_page) => {
+                read_data_task(
+                    requestor,
+                    &storage,
+                    c_id,
+                    starting_page,
+                    None,
+                    &mut active_reads,
+                    &datastore_sync,
+                    &to_app_mgr_send,
+                    swarm_id,
+                    &mut app_data,
+                    &swarm_name,
+                    &to_gnome_sender,
+                    &app_data_send,
+                    &to_search_enigne,
+                )
+                .await
+            }
+            ToAppData::ReadCancel(c_id) => {
+                active_reads.remove(&c_id);
+            }
+            ToAppData::ReadRefresh(mut c_ids) => {
+                let (c_id, d_type) = c_ids.remove(0);
+                if let Some(rs) = active_reads.get(&c_id) {
+                    let missing_pages = rs.what_is_missing();
+                    if !missing_pages.is_empty() {
+                        let sync_request = SyncRequest::Pages(c_id, d_type, missing_pages);
+                        to_gnome_sender
+                            .send(ToGnome::AskData(
+                                GnomeId::any(),
+                                NeighborRequest::Custom(
+                                    0,
+                                    CastData::new(serialize_requests(vec![sync_request])).unwrap(),
+                                ),
+                            ))
+                            .unwrap();
+                    }
+                }
+                if !c_ids.is_empty() {
+                    let _ = app_data_send.send(ToAppData::ReadRefresh(c_ids)).await;
+                }
             }
             ToAppData::BCastOrigin(c_id, send) => b_cast_origin = Some((c_id, send)),
             ToAppData::MCastOrigin(c_id, send) => m_cast_origin = Some((c_id, send)),
@@ -3302,6 +3530,30 @@ impl ApplicationData {
         // eprintln!("CID-{} has {} Data blocks", c_id, data_vec.len());
         Ok(data_vec)
     }
+    pub fn get_data_range(
+        &mut self,
+        c_id: ContentID,
+        page_from: u16,
+        page_to_incl: u16,
+    ) -> Result<Vec<Data>, AppError> {
+        // TODO: implement logic
+        self.change_reg.insert(c_id);
+        let mut data_vec = Vec::with_capacity(64);
+        for i in page_from..=page_to_incl {
+            let read_result = self.contents.read_data((c_id, i));
+            if let Ok(data) = read_result {
+                data_vec.push(data);
+            } else {
+                return Err(read_result.err().unwrap());
+            }
+        }
+        // if data_vec.len() as u16 == page_to_excl - page_from {
+        Ok(data_vec)
+        // } else {
+        //     Err(AppError::Smthg)
+        // }
+    }
+
     pub fn content_bottom_hashes(&self, c_id: ContentID) -> Result<Vec<u64>, AppError> {
         self.contents.content_bottom_hashes(c_id)
     }
@@ -3635,6 +3887,39 @@ pub async fn start_a_timer(
     sleep(timeout).await;
     eprintln!("Timeout for {:?} is over", timeout_type);
     let _ = sender.send(ToAppMgr::TimeoutOver(timeout_type)).await;
+}
+pub async fn start_cycling_timer(
+    sender: ASender<ToAppMgr>,
+    timeout_type: TimeoutType,
+    timeout: Duration,
+) {
+    loop {
+        sleep(timeout).await;
+        eprintln!("Timeout for {:?} is over", timeout_type);
+        let _ = sender
+            .send(ToAppMgr::TimeoutOver(timeout_type.clone()))
+            .await;
+    }
+}
+async fn update_active_reads(
+    active_reads: &mut HashMap<ContentID, ReadState>,
+    c_id: &ContentID,
+    page_no: u16,
+    app_data_send: &ASender<ToAppData>,
+) {
+    if let Some(rs) = active_reads.get_mut(&c_id) {
+        if rs.page_arrived(page_no) {
+            //TODO: send data chunk to user
+            let next_chunk = if page_no % 64 > 0 {
+                1 + page_no >> 6
+            } else {
+                page_no >> 6
+            };
+            let _ = app_data_send
+                .send(ToAppData::ReadNextChunk(rs.requestor, *c_id, next_chunk))
+                .await;
+        }
+    }
 }
 
 async fn sync_timeout(sender: ASender<ToAppData>) {
@@ -4811,6 +5096,7 @@ async fn custom_response_task(
     to_app_mgr_send: &ASender<ToAppMgr>,
     swarm_id: SwarmID,
     app_data: &mut ApplicationData,
+    active_reads: &mut HashMap<ContentID, ReadState>,
     swarm_name: &SwarmName,
     to_gnome_sender: &Sender<ToGnome>,
     s_storage: &PathBuf,
@@ -5106,12 +5392,30 @@ async fn custom_response_task(
                         if d_type == DataType::Link {
                             if len > 0 {
                                 // eprintln!("Update existing Link");
-                                let _ = app_data
+                                let res = app_data
                                     .update_transformative_link(false, c_id, page_no, total, data);
+                                if res.is_ok() {
+                                    update_active_reads(
+                                        active_reads,
+                                        &c_id,
+                                        page_no,
+                                        app_data_send,
+                                    )
+                                    .await;
+                                }
                             } else {
                                 // eprintln!("Create new Link");
                                 let res = app_data.update(c_id, data_to_link(data).unwrap());
                                 // eprintln!("Update result: {:?}", res);
+                                if res.is_ok() {
+                                    update_active_reads(
+                                        active_reads,
+                                        &c_id,
+                                        page_no,
+                                        app_data_send,
+                                    )
+                                    .await;
+                                }
                             }
                         } else {
                             // eprintln!("Inserting page 0 of non-Link content");
@@ -5119,6 +5423,8 @@ async fn custom_response_task(
                             eprintln!("New page #0 hash: {}", data.get_hash());
                             let res = app_data.update_data(c_id, page_no, data.clone());
                             if res.is_ok() {
+                                update_active_reads(active_reads, &c_id, page_no, app_data_send)
+                                    .await;
                                 // We send an update to print content
                                 // on screen
                                 let _ = to_app_mgr_send
@@ -5159,6 +5465,9 @@ async fn custom_response_task(
                         }
                         let _res = app_data
                             .update(c_id, Content::Data(data_type, 1, ContentTree::Filled(data)));
+                        if _res.is_ok() {
+                            update_active_reads(active_reads, &c_id, page_no, app_data_send).await;
+                        }
                     } else {
                         eprintln!("Create new Link 2");
                         let _ = to_app_mgr_send
@@ -5172,6 +5481,10 @@ async fn custom_response_task(
                         let link_result = data_to_link(data);
                         if let Ok(link) = link_result {
                             let _res = app_data.update(c_id, link);
+                            if _res.is_ok() {
+                                update_active_reads(active_reads, &c_id, page_no, app_data_send)
+                                    .await;
+                            }
                         // eprintln!("Update result: {:?}", res);
                         } else {
                             eprintln!("Failed to create a link: {:?}", link_result.err().unwrap());
@@ -5182,6 +5495,7 @@ async fn custom_response_task(
                         // let res = app_data.append_data(c_id, data);
                         let res = app_data.update_data(c_id, page_no, data);
                         if res.is_ok() {
+                            update_active_reads(active_reads, &c_id, page_no, app_data_send).await;
                             eprintln!("C-{} Page #{} update result: ok", c_id, page_no,);
                         } else {
                             eprintln!(
@@ -5196,6 +5510,9 @@ async fn custom_response_task(
                         let res =
                             app_data.update_transformative_link(false, c_id, page_no, total, data);
                         // println!("Update TI result: {:?}", res);
+                        if res.is_ok() {
+                            update_active_reads(active_reads, &c_id, page_no, app_data_send).await;
+                        }
                     } else {
                         eprintln!(
                             "Error: Stored:{:?} len:{}\nreceived:{:?} len:{}",
@@ -5215,15 +5532,28 @@ async fn custom_response_task(
     // }
 }
 async fn read_data_task(
+    requestor: Requestor,
     storage: &PathBuf,
     c_id: ContentID,
+    starting_page: u16,
+    last_page: Option<u16>,
+    active_reads: &mut HashMap<ContentID, ReadState>,
     datastore_sync: &Option<(u16, HashMap<u16, Vec<(DataType, u64)>>)>,
     to_app_mgr_send: &ASender<ToAppMgr>,
     swarm_id: SwarmID,
     app_data: &mut ApplicationData,
     swarm_name: &SwarmName,
     to_gnome_sender: &Sender<ToGnome>,
+    app_data_send: &ASender<ToAppData>,
+    to_search_enigne: &ASender<SearchMsg>,
 ) {
+    // TODO: make use of active_reads
+    // if c_len <= 64 we can send entire Content at once,
+    // provided we have that Data in Ram or on disk.
+    // In any other case we should request Gnome for given Page.
+    // When we receive a Page we store it in Datastore and
+    // update active_reads so that we know this piece is not missing
+    // anymore
     eprintln!(
         "ToAppData::ReadData({}) when DStore synced: {}",
         c_id,
@@ -5231,6 +5561,7 @@ async fn read_data_task(
     );
     //TODO: find a way to decide if we are completely synced with swarm, or not
     //      if not request to sync from any Neighbor
+    // send back data in chunks of 64
     if datastore_sync.is_some() {
         eprintln!("Not synced");
         let _ = to_app_mgr_send
@@ -5245,26 +5576,53 @@ async fn read_data_task(
     if type_and_len_result.is_err() {
         eprintln!("Unable to get type and len");
         let error = type_and_len_result.err().unwrap();
-        let _ = to_app_mgr_send
-            .send(ToAppMgr::FromDatastore(
-                // requestor,
-                LibResponse::ReadError(swarm_id, c_id, error),
-            ))
-            .await;
+        match requestor {
+            Requestor::App => {
+                let _ = to_app_mgr_send
+                    .send(ToAppMgr::FromDatastore(
+                        // requestor,
+                        LibResponse::ReadError(swarm_id, c_id, error),
+                    ))
+                    .await;
+            }
+            Requestor::Search => {
+                let _ = to_search_enigne
+                    .send(SearchMsg::ReadError(swarm_id, c_id, error))
+                    .await;
+            }
+        }
         return;
     }
     let (d_type, len) = type_and_len_result.unwrap();
     let (t, root_hash) = app_data.content_root_hash(c_id).unwrap();
-    // eprintln!("Read {}, data len: {}", c_id, len);
-    let all_data_result = app_data.get_all_data(c_id);
-    if let Ok(mut data_vec) = all_data_result {
+    let mut read_to_page_incl = if len < starting_page + 64 {
+        len
+    } else {
+        starting_page + 64
+    };
+    if let Some(l_p) = last_page {
+        if l_p < read_to_page_incl {
+            read_to_page_incl = l_p;
+        }
+    }
+
+    let get_data_result = if len <= 64 {
+        if read_to_page_incl > len {
+            app_data.get_all_data(c_id)
+        } else {
+            app_data.get_data_range(c_id, starting_page, read_to_page_incl)
+        }
+    } else {
+        app_data.get_data_range(c_id, starting_page, read_to_page_incl)
+    };
+    if let Ok(mut data_vec) = get_data_result {
         //
         //  we scan data_vec for empty data…
         //
         let mut data_missing = vec![];
         for (i, dta) in data_vec.iter().enumerate() {
             if dta.is_empty() {
-                data_missing.push(i as u16);
+                data_missing.push(i as u16 + starting_page);
             }
         }
         if !data_missing.is_empty() {
@@ -5277,10 +5635,11 @@ async fn read_data_task(
                 for d_id in &data_missing {
                     if let Ok(data) = c_from_store.read_data(*d_id) {
                         if !data.is_empty()
-                            && data_vec[*d_id as usize].get_hash() == data.get_hash()
+                            && data_vec[(*d_id - starting_page) as usize].get_hash()
+                                == data.get_hash()
                         {
-                            data_vec[*d_id as usize] = data;
-                            data_filled_from_storage.push(*d_id);
+                            data_vec[(*d_id - starting_page) as usize] = data;
+                            data_filled_from_storage.push(*d_id - starting_page);
                         }
                     }
                 }
@@ -5290,13 +5649,23 @@ async fn read_data_task(
             if !data_missing.is_empty() {
                 //  …or from neighbors.
                 //
-                // TODO: we need to store internaly existing pages
+                // We need to store internaly existing pages
                 // so that when we get response from storage/network
                 // we can fill in missing pages and send back complete
                 // Content to user.
                 // Or we could immediately send what we have and later
                 // send some additional Data as it comes.
-                //
+                let mut h_miss = HashSet::with_capacity(data_missing.len());
+                for p_miss in &data_missing {
+                    h_miss.insert(*p_miss);
+                }
+                active_reads.insert(
+                    c_id,
+                    ReadState::new(len, requestor, starting_page >> 6, h_miss),
+                );
+
+                // OK, so now we do not need to chunk it
+                // TODO: But maybe we could ask for up to 680 pages at once…
                 let dmall = data_missing.chunks_exact(680);
                 let rmd = dmall.remainder();
                 for dmc in dmall {
@@ -5322,24 +5691,70 @@ async fn read_data_task(
                     ));
                 }
             }
+        } else {
+            // We have all data for chunk 0, so we should iterate till
+            // we no longer have all pages required and then update active_reads
+            // if needed
+            if read_to_page_incl < len {
+                let _ = app_data_send
+                    .send(ToAppData::ReadNextChunk(
+                        requestor,
+                        c_id,
+                        64 + starting_page,
+                    ))
+                    .await;
+            }
         }
         eprintln!("AppData Sending back contents of {}", c_id);
         // let calculated_hash =
         // if c_id == 0 {
         //     eprintln!("Sending read result with {} data blocks", data_vec.len());
         // }
-        let _ = to_app_mgr_send
-            .send(ToAppMgr::FromDatastore(
-                // requestor,
-                LibResponse::ReadSuccess(swarm_id, swarm_name.clone(), c_id, t, data_vec),
-            ))
-            .await;
+
+        // ReadSuccess sends data in chunks
+        // of up to 64 pieces
+        let chunk_no: u16 = starting_page >> 6;
+        let is_last: bool = read_to_page_incl >= len; // == ?
+        if is_last {
+            active_reads.remove(&c_id);
+        }
+        match requestor {
+            Requestor::App => {
+                let _ = to_app_mgr_send
+                    .send(ToAppMgr::FromDatastore(LibResponse::ReadSuccess(
+                        swarm_id,
+                        swarm_name.clone(),
+                        c_id,
+                        t,
+                        chunk_no,
+                        is_last,
+                        data_vec,
+                    )))
+                    .await;
+            }
+            Requestor::Search => {
+                let _ = to_search_enigne
+                    // ReadSuccess(SwarmID, SwarmName, ContentID, DataType, Vec<Data>),
+                    .send(SearchMsg::ReadSuccess(
+                        swarm_id,
+                        swarm_name.clone(),
+                        c_id,
+                        t,
+                        // chunk_no,
+                        // is_last,
+                        data_vec,
+                    ))
+                    .await;
+            }
+        }
     } else {
         // TODO: we should check all_data_result error type
         // and if possible try to load missing Data either from
         // local storage or from neighbors.
+        //
+        // TODO: Build timer logic to ping AppDatas about reads
         eprintln!("AppData error when reading contents of {}", c_id);
-        let error = all_data_result.err().unwrap();
+        let error = get_data_result.err().unwrap();
         if matches!(error, AppError::ContentEmpty) {
             eprintln!("got ContentEmpty");
             let sync_requests: Vec<SyncRequest> = vec![SyncRequest::AllPages(vec![c_id])];
@@ -5350,13 +5765,28 @@ async fn read_data_task(
                     CastData::new(serialize_requests(sync_requests)).unwrap(),
                 ),
             ));
+            let mut h_miss = HashSet::with_capacity(64);
+            for p_miss in 0..64 {
+                h_miss.insert(p_miss);
+            }
+            active_reads.insert(c_id, ReadState::new(len, requestor, 0, h_miss));
+            if matches!(requestor, Requestor::App) {
+                let _ = to_app_mgr_send
+                    .send(ToAppMgr::FromDatastore(LibResponse::DownloadingPages(
+                        swarm_id, c_id, d_type,
+                    )))
+                    .await;
+            }
+        // } else if matches!(error, AppError::IndexingError) {
+        //     // TODO: content non-existent
+        } else if matches!(requestor, Requestor::App) {
+            let _ = to_app_mgr_send
+                .send(ToAppMgr::FromDatastore(
+                    // requestor,
+                    LibResponse::ReadError(swarm_id, c_id, error),
+                ))
+                .await;
         }
-        let _ = to_app_mgr_send
-            .send(ToAppMgr::FromDatastore(
-                // requestor,
-                LibResponse::ReadError(swarm_id, c_id, error),
-            ))
-            .await;
     }
 }
 // An entire application data consists of a structure called Datastore.

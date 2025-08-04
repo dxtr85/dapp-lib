@@ -375,7 +375,7 @@ impl Datastore {
         match self {
             Self::Empty => {
                 // eprintln!("EMPTY");
-                Err(AppError::IndexingError)
+                Err(AppError::ContentEmpty)
             }
             Self::Filled(content) => {
                 if c_id == 0 {

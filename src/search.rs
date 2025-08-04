@@ -1,4 +1,4 @@
-use crate::manifest;
+// use crate::manifest;
 use crate::manifest::Manifest;
 use crate::manifest::Tag;
 use crate::prelude::read_tags_and_header;
@@ -10,10 +10,10 @@ use crate::SwarmName;
 use crate::ToAppData;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::ops::Index;
+// use std::ops::Index;
 
 // use crate::LibRequest;
-pub use crate::LibResponse;
+// pub use crate::LibResponse;
 use crate::Requestor;
 pub use crate::ToApp;
 // pub use crate::ToAppMgr;
@@ -227,7 +227,7 @@ impl Engine {
                         EngineState::Processing(s_id, s_link.sender.clone(), queried_cids, vec![]);
                     // TODO: only query for some chunk of contents, not everything at once
                     eprintln!("2 Requesting all first pages for: {}", s_id);
-                    s_link
+                    let _ = s_link
                         .sender
                         .send(ToAppData::ReadAllFirstPages(Requestor::Search))
                         .await;
@@ -345,7 +345,7 @@ impl Engine {
                         );
                         // TODO: only query for some chunk of contents, not everything at once
                         eprintln!("3 Requesting all first pages for: {}", s_id);
-                        s_link
+                        let _ = s_link
                             .sender
                             .send(ToAppData::ReadAllFirstPages(Requestor::Search))
                             .await;
@@ -433,20 +433,20 @@ pub async fn serve_search_engine(
                     engine.del_query(phrase);
                 }
                 SearchMsg::ListQueries => {
-                    to_user.send(ToApp::SearchQueries(engine.summary())).await;
+                    let _ = to_user.send(ToApp::SearchQueries(engine.summary())).await;
                 }
                 SearchMsg::GetResults(phrase) => {
                     let (phrase, results) = engine.get_query(phrase);
-                    to_user.send(ToApp::SearchResults(phrase, results)).await;
+                    let _ = to_user.send(ToApp::SearchResults(phrase, results)).await;
                 }
                 SearchMsg::SwarmSynced(s_id, s_link) => {
                     // TODO: check if root_hash changed
                     // TODO: create a mechanism to enqueue subsequent swarms
                     //       until we are done with current one,
                     //       or something with that flavor
-                    s_link
+                    let _ = s_link
                         .sender
-                        .send(ToAppData::ReadData(Requestor::Search, 0))
+                        .send(ToAppData::ReadPagesRange(Requestor::Search, 0, 0, 63))
                         .await;
                     engine.swarm_links.insert(s_id, s_link);
                 }
@@ -461,7 +461,9 @@ pub async fn serve_search_engine(
                 }
                 SearchMsg::ReadSuccess(s_id, s_name, c_id, d_type, data_vec) => {
                     // if engine.has_queries() {
-                    engine.parse_content(s_id, s_name, c_id, d_type, data_vec);
+                    engine
+                        .parse_content(s_id, s_name, c_id, d_type, data_vec)
+                        .await;
                     // }
                 }
                 SearchMsg::ReadError(s_id, c_id, _err) => {

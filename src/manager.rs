@@ -1,3 +1,5 @@
+use crate::content::ContentID;
+use crate::content::DataType;
 use crate::ToApp;
 use crate::ToAppMgr;
 use crate::{start_a_timer, TimeoutType};
@@ -69,6 +71,111 @@ impl Display for SwapProcess {
     }
 }
 
+struct ReadState {
+    // pending_read: (SwarmID, ContentID, bool),
+    // volatile: Option<(SwarmID, ContentID, DataType)>,
+    permenent: HashMap<SwarmID, HashSet<(ContentID, DataType)>>,
+}
+impl ReadState {
+    pub fn new() -> Self {
+        ReadState {
+            // pending_read: (SwarmID(255), u16::MAX, false),
+            // volatile: None,
+            permenent: HashMap::new(),
+        }
+    }
+    // pub fn add_pending(&mut self, s_id: SwarmID, c_id: ContentID, volatile: bool) {
+    //     self.pending_read = (s_id, c_id, volatile);
+    // }
+    // pub fn update_pending(
+    //     &mut self,
+    //     s_id: SwarmID,
+    //     c_id: ContentID,
+    //     d_type: DataType,
+    // ) -> Option<(SwarmID, ContentID, DataType)> {
+    //     let (ps_id, pc_id, is_volatile) = self.pending_read;
+    //     if ps_id == s_id && pc_id == c_id {
+    //         self.add(is_volatile, s_id, c_id, d_type)
+    //     } else {
+    //         eprintln!("TODO: Extend add/update pending reads in dapp-lib/manager");
+    //         None
+    //     }
+    // }
+    pub fn add(
+        &mut self,
+        // is_volatile: bool,
+        s_id: SwarmID,
+        c_id: ContentID,
+        d_type: DataType,
+    ) {
+        // ) -> Option<(SwarmID, ContentID, DataType)> {
+        // if is_volatile {
+        //     let to_return = if let Some((es_id, ec_id, ec_dt)) = self.volatile.take() {
+        //         Some((es_id, ec_id, ec_dt))
+        //     } else {
+        //         None
+        //     };
+        //     self.volatile = Some((s_id, c_id, d_type));
+        //     to_return
+        // } else {
+        if let Some(h_set) = self.permenent.get_mut(&s_id) {
+            h_set.insert((c_id, d_type));
+        } else {
+            let mut new_hset = HashSet::new();
+            new_hset.insert((c_id, d_type));
+            self.permenent.insert(s_id, new_hset);
+        }
+        // None
+        // }
+    }
+
+    pub fn remove(&mut self, s_id: SwarmID, c_id: ContentID, d_type: DataType) {
+        // if is_volatile {
+        // if let Some((vs_id, vc_id, vc_dt)) = self.volatile.take() {
+        //     if vs_id == s_id {
+        //         if vc_id == c_id {
+        //             // All good
+        //         } else {
+        //             eprintln!("Volatile ReadRequest remove fail: {}!={}", c_id, vc_id);
+        //             self.volatile = Some((vs_id, vc_id, vc_dt));
+        //         }
+        //     } else {
+        //         eprintln!("Volatile ReadRequest remove fail: {}!={}", s_id, vs_id);
+        //         self.volatile = Some((vs_id, vc_id, vc_dt));
+        //     }
+        // }
+        // } else {
+        if let Some(h_set) = self.permenent.get_mut(&s_id) {
+            h_set.remove(&(c_id, d_type));
+        }
+        // }
+    }
+
+    pub fn remove_all(&mut self, s_id: SwarmID) {
+        // if let Some((vs_id, vc_id, vc_dt)) = self.volatile.take() {
+        //     if vs_id != s_id {
+        //         self.volatile = Some((vs_id, vc_id, vc_dt));
+        //     }
+        // }
+        self.permenent.remove(&s_id);
+    }
+    pub fn read_list(&self) -> Vec<(SwarmID, Vec<(ContentID, DataType)>)> {
+        let mut res_list = Vec::with_capacity(self.permenent.len() + 1);
+        // if let Some((vs_id, vc_id, vc_dt)) = &self.volatile {
+        //     res_list.push((*vs_id, vec![(*vc_id, *vc_dt)]));
+        // }
+        for (s_id, c_ids) in self.permenent.iter() {
+            if !c_ids.is_empty() {
+                let mut cids_vec = Vec::with_capacity(c_ids.len());
+                for c_id in c_ids.iter() {
+                    cids_vec.push(*c_id);
+                }
+                res_list.push((*s_id, cids_vec));
+            }
+        }
+        res_list
+    }
+}
 struct SwapState {
     max_swarms: usize,
     running_swarms: HashSet<SwarmID>,
@@ -111,6 +218,7 @@ pub struct ApplicationManager {
     pub active_app_data: (SwarmID, Sender<ToAppData>),
     name_to_id: HashMap<SwarmName, SwarmState>,
     swap_state: SwapState,
+    read_state: ReadState,
     to_gnome_mgr: Sender<ToGnomeManager>,
     to_user: Sender<ToApp>,
     to_app_mgr: Sender<ToAppMgr>,
@@ -142,11 +250,57 @@ impl ApplicationManager {
                 process: SwapProcess::Idle,
                 to_join: vec![],
             },
+            read_state: ReadState::new(),
             to_gnome_mgr,
             to_user,
             to_app_mgr,
         }
     }
+
+    // pub fn add_pending_read(
+    //     &mut self,
+    //     s_id: SwarmID,
+    //     c_id: ContentID,
+    //     // d_type: DataType,
+    //     is_volatile: bool,
+    // ) {
+    //     eprintln!(
+    //         "{} add_pending {}(is_volatile: {})",
+    //         s_id, c_id, is_volatile
+    //     );
+    //     self.read_state.add_pending(s_id, c_id, is_volatile)
+    // }
+
+    // pub fn update_pending_read(
+    //     &mut self,
+    //     s_id: SwarmID,
+    //     c_id: ContentID,
+    //     d_type: DataType,
+    //     // is_volatile: bool,
+    // ) -> Option<(SwarmID, u16, DataType)> {
+    //     eprintln!("{} update_pending_read {}", s_id, c_id,);
+    //     self.read_state.update_pending(s_id, c_id, d_type)
+    // }
+
+    pub fn add_read(
+        &mut self,
+        s_id: SwarmID,
+        c_id: ContentID,
+        d_type: DataType,
+        // is_volatile: bool,
+    ) {
+        // ) -> Option<(SwarmID, u16, DataType)> {
+        eprintln!("{} update_pending_read {}", s_id, c_id,);
+        self.read_state.add(s_id, c_id, d_type)
+    }
+
+    pub fn remove_read(&mut self, s_id: SwarmID, c_id: ContentID, d_type: DataType) {
+        self.read_state.remove(s_id, c_id, d_type);
+    }
+    pub fn read_list(&self) -> Vec<(SwarmID, Vec<(ContentID, DataType)>)> {
+        self.read_state.read_list()
+    }
+
     pub fn update_my_name(&mut self, my_name: SwarmName) {
         self.my_name = my_name.clone();
         self.swap_state.to_join.push(my_name);
@@ -313,6 +467,7 @@ impl ApplicationManager {
     ) {
         // 1 update process value from Leaving to Idle
         self.swap_state.running_swarms.remove(&s_id);
+        self.read_state.remove_all(s_id);
         let prev_swap_state = std::mem::replace(&mut self.swap_state.process, SwapProcess::Idle);
         eprintln!("PState: {}    {} {}", prev_swap_state, s_id, s_name);
         match prev_swap_state {
