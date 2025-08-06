@@ -206,6 +206,7 @@ pub enum TimeoutType {
     AddToWaitList(SwarmName),
     HasNeighbors,
     AuditMemoryForSwarm(SwarmID, SwarmName),
+    IsSwarmSynced(SwarmID, SwarmName),
     AuditReads,
 }
 
@@ -261,7 +262,43 @@ pub enum ToAppData {
     PurgePagesFromMemory(usize, Vec<(ContentID, usize)>),
     Terminate,
 }
-
+struct PartialHashes {
+    missing_parts: HashSet<u16>,
+    stored_parts: HashMap<u16, Data>,
+}
+impl PartialHashes {
+    pub fn new(parts_count: u16) -> Self {
+        let mut missing_parts = HashSet::with_capacity(parts_count as usize + 1);
+        for i in 0..=parts_count {
+            missing_parts.insert(i);
+        }
+        PartialHashes {
+            missing_parts,
+            stored_parts: HashMap::new(),
+        }
+    }
+    pub fn add_part(&mut self, part_no: u16, data: Data) -> bool {
+        if !data.is_empty() {
+            if self.missing_parts.remove(&part_no) {
+                self.stored_parts.insert(part_no, data);
+            }
+        }
+        return self.missing_parts.is_empty();
+    }
+    pub fn data_vec(mut self) -> Vec<Data> {
+        let len = self.stored_parts.len();
+        let mut results = Vec::with_capacity(len);
+        for p_n in 0..len as u16 {
+            if let Some(data) = self.stored_parts.remove(&p_n) {
+                results.push(data);
+            } else {
+                eprintln!("Part {} was not stored!", p_n);
+                break;
+            }
+        }
+        results
+    }
+}
 struct ReadState {
     c_len: u16,
     requestor: Requestor,
@@ -708,6 +745,11 @@ async fn serve_app_manager(
                     is_last,
                     data_vec,
                 )) => {
+                    for data in &data_vec {
+                        if data.is_empty() {
+                            eprintln!("ReadSuccess with empty data: {}", data.get_hash());
+                        }
+                    }
                     if chunk_no == 0 && !is_last {
                         // if let Some((cc_sid, cc_cid, _dt)) =
                         // app_mgr.update_pending_read(s_id, c_id, dtype)
@@ -1103,12 +1145,56 @@ async fn serve_app_manager(
                         // check if s_id & s_name match,
                         // if so send request to_app_data_send
                         // if not: ignore, since that swarm instance is gone
-                        if let Some(curr_id) = app_mgr.get_swarm_id(&s_name) {
-                            if curr_id == s_id {
-                                if let Some(sender) = app_mgr.app_data_store.get(&curr_id) {
-                                    let _ = sender.send(ToAppData::RunMemoryUseAudit(1)).await;
+                        if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
+                            let res = sender.send(ToAppData::RunMemoryUseAudit(1)).await;
+                            if res.is_err() {
+                                let err = res.err().unwrap();
+                                eprintln!(
+                                    "{s_id} RunMemoryUseAudit sending failed:\n{:?}\n",
+                                    err.to_string(),
+                                );
+                            }
+                        } else {
+                            eprintln!("Can not audit memory for {} {}", s_id, s_name);
+                        }
+                    }
+                    TimeoutType::IsSwarmSynced(s_id, s_name) => {
+                        eprintln!("IsSwarmSynced({},{})", s_id, s_name);
+                        if let Some(s_state) = app_mgr.get_swarm_state(&s_name) {
+                            if s_state.s_id == s_id {
+                                if s_state.is_synced {
+                                    eprintln!("{} Yes it is", s_id);
+                                    spawn(start_a_timer(
+                                        to_app_mgr.clone(),
+                                        TimeoutType::AuditMemoryForSwarm(s_id, s_name.clone()),
+                                        Duration::from_secs(60),
+                                    ));
+                                } else {
+                                    eprintln!("{} No it is not.", s_id);
+                                    if let Some(to_app_data) = app_mgr.app_data_store.get(&s_id) {
+                                        let _ = to_app_data.send(ToAppData::TimeoutSyncCheck);
+                                    }
+                                    spawn(start_a_timer(
+                                        to_app_mgr.clone(),
+                                        TimeoutType::IsSwarmSynced(s_id, s_name.clone()),
+                                        Duration::from_secs(5),
+                                    ));
                                 }
                             }
+                        } else {
+                            // TODO: if it was generic swarm name,
+                            // then find it's new name and check
+                            if s_name.founder.is_any() {
+                                if let Some(new_name) = app_mgr.get_name(s_id) {
+                                    eprintln!("was generic…");
+                                    spawn(start_a_timer(
+                                        to_app_mgr.clone(),
+                                        TimeoutType::IsSwarmSynced(s_id, new_name.clone()),
+                                        Duration::from_secs(1),
+                                    ));
+                                }
+                            }
+                            eprintln!("{} Swarm {} is no more…", s_id, s_name);
                         }
                     }
                     TimeoutType::Cooldown => {
@@ -1502,10 +1588,11 @@ async fn serve_app_manager(
                             app_mgr.swarm_joined(s_name.clone());
                             // TODO: make sure we are not running multiple timers
                             // for the same swarm
+                            // TODO: first we have to make sure that given swarm is synced, and only after that should we run audit
                             spawn(start_a_timer(
                                 to_app_mgr.clone(),
-                                TimeoutType::AuditMemoryForSwarm(s_id, s_name.clone()),
-                                Duration::from_secs(60),
+                                TimeoutType::IsSwarmSynced(s_id, s_name.clone()),
+                                Duration::from_secs(5),
                             ));
                             swarm_swap.not_a_candidate(&s_name);
                             // if swarm_swap.has_candidates() {
@@ -1928,6 +2015,7 @@ async fn serve_app_data(
     to_search_enigne: ASender<SearchMsg>,
     store_on_disk: StoragePolicy,
 ) {
+    // eprintln!("{swarm_id} serve_app_data started");
     let mut s_storage = PathBuf::new();
     let mut missing_pages = (0, HashMap::new());
     // TODO: Understand & implement Tiny Pointers for efficient data storage in RAM
@@ -1996,6 +2084,7 @@ async fn serve_app_data(
         Some((0, HashMap::new()));
     let sleep_time = Duration::from_millis(32);
     let mut active_reads: HashMap<ContentID, ReadState> = HashMap::new();
+    let mut incomplete_bottom_hashes = HashMap::new();
     while let Ok(resp) = app_data_recv.recv().await {
         match resp {
             // TODO: We should always assume to be out of sync
@@ -2038,7 +2127,7 @@ async fn serve_app_data(
                 //
                 // And if we do not have data on disk we follow the same route as if
                 // we had some data on disk, but it was all invalid, so maximum difference.
-                spawn(sync_timeout(app_data_send.clone()));
+                // spawn(sync_timeout(app_data_send.clone()));
                 let sync_requests: Vec<SyncRequest> = vec![
                     SyncRequest::Datastore,
                     // SyncRequest::AllFirstPages(Some(vec![0])),
@@ -2584,6 +2673,10 @@ async fn serve_app_data(
                 .await
             }
             ToAppData::CustomResponse(m_type, _neighbor_id, cast_data) => {
+                // eprintln!(
+                //     "Got CustomResponse: {} {} {:?}",
+                //     m_type, _neighbor_id, cast_data
+                // );
                 custom_response_task(
                     m_type,
                     _neighbor_id,
@@ -2593,6 +2686,7 @@ async fn serve_app_data(
                     swarm_id,
                     &mut app_data,
                     &mut active_reads,
+                    &mut incomplete_bottom_hashes,
                     &swarm_name,
                     &to_gnome_sender,
                     &s_storage,
@@ -2743,7 +2837,7 @@ async fn serve_app_data(
             }
             ToAppData::TimeoutSyncCheck => {
                 if datastore_sync.is_some() {
-                    spawn(sync_timeout(app_data_send.clone()));
+                    // spawn(sync_timeout(app_data_send.clone()));
                     eprintln!("{} Sending SyncRequest::Datastore again", swarm_id);
                     let sync_requests: Vec<SyncRequest> = vec![SyncRequest::Datastore];
                     let _ = to_gnome_sender.send(ToGnome::AskData(
@@ -3536,6 +3630,7 @@ impl ApplicationData {
         page_from: u16,
         page_to_incl: u16,
     ) -> Result<Vec<Data>, AppError> {
+        // eprintln!("get_data_range {} {}-{}", c_id, page_from, page_to_incl);
         // TODO: implement logic
         self.change_reg.insert(c_id);
         let mut data_vec = Vec::with_capacity(64);
@@ -3885,7 +3980,7 @@ pub async fn start_a_timer(
 ) {
     // let timeout = Duration::from_secs(5);
     sleep(timeout).await;
-    eprintln!("Timeout for {:?} is over", timeout_type);
+    eprintln!("{:?} timeout for {:?} is over", timeout, timeout_type);
     let _ = sender.send(ToAppMgr::TimeoutOver(timeout_type)).await;
 }
 pub async fn start_cycling_timer(
@@ -3895,7 +3990,10 @@ pub async fn start_cycling_timer(
 ) {
     loop {
         sleep(timeout).await;
-        eprintln!("Timeout for {:?} is over", timeout_type);
+        eprintln!(
+            "{:?} cycling timeout for {:?} is over",
+            timeout, timeout_type
+        );
         let _ = sender
             .send(ToAppMgr::TimeoutOver(timeout_type.clone()))
             .await;
@@ -3907,8 +4005,11 @@ async fn update_active_reads(
     page_no: u16,
     app_data_send: &ASender<ToAppData>,
 ) {
+    // eprintln!("update_active_reads");
     if let Some(rs) = active_reads.get_mut(&c_id) {
+        // eprintln!("Some rs");
         if rs.page_arrived(page_no) {
+            // eprintln!("sending data to user");
             //TODO: send data chunk to user
             let next_chunk = if page_no % 64 > 0 {
                 1 + page_no >> 6
@@ -3922,11 +4023,11 @@ async fn update_active_reads(
     }
 }
 
-async fn sync_timeout(sender: ASender<ToAppData>) {
-    let timeout = Duration::from_secs(5);
-    sleep(timeout).await;
-    let _ = sender.send(ToAppData::TimeoutSyncCheck).await;
-}
+// async fn sync_timeout(sender: ASender<ToAppData>) {
+//     let timeout = Duration::from_secs(5);
+//     sleep(timeout).await;
+//     let _ = sender.send(ToAppData::TimeoutSyncCheck).await;
+// }
 async fn change_content_task(
     c_id: ContentID,
     d_type: DataType,
@@ -3936,6 +4037,10 @@ async fn change_content_task(
     to_gnome_sender: &Sender<ToGnome>,
 ) {
     if let Ok((curr_d_type, curr_content_len)) = app_data.get_type_and_len(c_id) {
+        // eprintln!(
+        //     "{} type: {:?}, len: {}",
+        //     c_id, curr_d_type, curr_content_len
+        // );
         let curr_hash = app_data.content_root_hash(c_id).unwrap();
         if curr_d_type == DataType::Link && curr_content_len > 0 {
             // if let Ok(_hashes) = app_data.read_link_ti_data(c_id, 0, curr_d_type) {
@@ -4819,8 +4924,6 @@ async fn custom_request_task(
     // match m_type {
     //     0 => {
     let sync_requests = deserialize_requests(cast_data.bytes());
-    // eprintln!("Got Sync Request: {:?}", sync_requests);
-    // println!("Got AppSync inquiry");
     // TODO: we have to unconditionally sync partial_data!!!
     let sync_type = 0;
     let partial_hashes = app_data.get_partial_hashes();
@@ -4950,6 +5053,8 @@ async fn custom_request_task(
                                 ));
                                 if res.is_ok() {
                                     eprintln!("Hashes [{}/{}] of {} sent", i, hashes_len, c_id);
+                                } else {
+                                    eprintln!("Unable to send hashes: {}", res.err().unwrap());
                                 }
                             }
                         } else {
@@ -4973,6 +5078,8 @@ async fn custom_request_task(
                                             "Hashes [{}/{}] of {} sent",
                                             h_id, hashes_len, c_id
                                         );
+                                    } else {
+                                        eprintln!("Unable to send: {}", res.err().unwrap());
                                     }
                                 }
                             }
@@ -4988,11 +5095,15 @@ async fn custom_request_task(
                 );
                 if let Ok((data_type, len)) = app_data.get_type_and_len(c_id) {
                     if data_type == d_type {
+                        // eprintln!("DType: {:?}", data_type);
                         if len > 0 {
                             let total = len as u16 - 1;
                             let sync_type = 0;
                             for p_id in _p_ids {
                                 if let Ok(data) = app_data.read_data(c_id, p_id) {
+                                    if data.is_empty() {
+                                        eprintln!("Sending empty Data for: {}-{}", c_id, p_id);
+                                    }
                                     let sync_response =
                                         SyncResponse::Page(c_id, data_type, p_id, total, data);
                                     let r = to_gnome_sender.send(ToGnome::SendData(
@@ -5004,13 +5115,34 @@ async fn custom_request_task(
                                     ));
                                     if r.is_ok() {
                                         eprintln!("Sent {}[{}/{}]", c_id, p_id, total);
+                                    } else {
+                                        eprintln!("Unable to send: {}", r.err().unwrap());
                                     }
                                 } else {
                                     eprintln!("No Data read.");
                                 }
                             }
+                        } else if data_type.is_link() {
+                            if let Ok(mut data_vec) = app_data.get_all_data(c_id) {
+                                eprintln!("Got link data len: {}", data_vec.len());
+                                let data = data_vec.remove(0);
+                                let sync_response = SyncResponse::Page(c_id, data_type, 0, 0, data);
+                                let r = to_gnome_sender.send(ToGnome::SendData(
+                                    neighbor_id,
+                                    NeighborResponse::Custom(
+                                        sync_type,
+                                        CastData::new(sync_response.serialize()).unwrap(),
+                                    ),
+                                ));
+                                if r.is_ok() {
+                                    eprintln!("Sent {} link ", c_id);
+                                } else {
+                                    eprintln!("Unable to send: {}", r.err().unwrap());
+                                }
+                            };
                         }
                     } else if data_type == DataType::Link {
+                        // TODO: this case is matched above…
                         eprintln!("Link len: {}", len);
                         if len > 0 {
                             let total = len as u16 - 1;
@@ -5030,6 +5162,8 @@ async fn custom_request_task(
                                     ));
                                     if r.is_ok() {
                                         eprintln!("Sent {}[{}/{}]", c_id, p_id, total);
+                                    } else {
+                                        eprintln!("Unable to send: {}", r.err().unwrap());
                                     }
                                 } else {
                                     eprintln!("No Data read.");
@@ -5037,8 +5171,10 @@ async fn custom_request_task(
                             }
                         }
                     } else {
-                        // Err(AppError::DatatypeMismatch)
+                        eprintln!("DType mismatch");
                     };
+                } else {
+                    eprintln!("Unable to get type & len for {}", c_id);
                 }
             }
             SyncRequest::AllPages(c_ids) => {
@@ -5063,15 +5199,19 @@ async fn custom_request_task(
                         let total = if len > 0 { len - 1 } else { 0 };
 
                         for (part_no, data) in data_vec.into_iter().enumerate() {
+                            if data.is_empty() {
+                                eprintln!("Sending empty Data for: {}-{}", c_id, part_no);
+                            }
                             let sync_response =
                                 SyncResponse::Page(c_id, data_type, part_no as u16, total, data);
-                            let _ = to_gnome_sender.send(ToGnome::SendData(
+                            let _res = to_gnome_sender.send(ToGnome::SendData(
                                 neighbor_id,
                                 NeighborResponse::Custom(
                                     sync_type,
                                     CastData::new(sync_response.serialize()).unwrap(),
                                 ),
                             ));
+                            // eprintln!("To Gnome send result: {:?}", res);
                         }
                     } else {
                         //TODO
@@ -5097,6 +5237,7 @@ async fn custom_response_task(
     swarm_id: SwarmID,
     app_data: &mut ApplicationData,
     active_reads: &mut HashMap<ContentID, ReadState>,
+    incomplete_bottom_hashes: &mut HashMap<ContentID, PartialHashes>,
     swarm_name: &SwarmName,
     to_gnome_sender: &Sender<ToGnome>,
     s_storage: &PathBuf,
@@ -5119,7 +5260,7 @@ async fn custom_response_task(
                 app_data.update_partial(is_hash_data, data);
             }
             SyncResponse::Datastore(part_no, total, mut hashes) => {
-                eprintln!("{} Got SyncResponse::Datastore", swarm_id);
+                // eprintln!("{} Got SyncResponse::Datastore", swarm_id);
                 let prev_dstore_sync = std::mem::replace(datastore_sync, None);
                 // eprintln!(
                 //     "{} PrevDSync: {:?}",
@@ -5374,13 +5515,47 @@ async fn custom_response_task(
                                 );
                             }
                         } else {
-                            todo!("dapp-lib/lib.rs:1981 implement me!");
+                            eprintln!("Got Hashes of {} [{}/{}]", c_id, part_no, total);
+                            let mut p_h =
+                                if let Some(e_p_h) = incomplete_bottom_hashes.remove(&c_id) {
+                                    e_p_h
+                                } else {
+                                    PartialHashes::new(total)
+                                };
+                            if p_h.add_part(part_no, hashes) {
+                                // eprintln!("We've got all we need");
+                                let mut c_tree = ContentTree::empty(0);
+                                for data in p_h.data_vec() {
+                                    for chunk in data.bytes().chunks_exact(8) {
+                                        let hsh = u64::from_be_bytes(chunk.try_into().unwrap());
+                                        let _ = c_tree.append(Data::empty(hsh));
+                                    }
+                                }
+                                let c = Content::Data(d_type, 1, c_tree);
+                                // eprintln!(
+                                //     "New bottom hashes: {:?}",
+                                //     c.data_hashes()
+                                // );
+                                let new_hash = c.hash();
+                                let (_type, old_hash) = app_data.content_root_hash(c_id).unwrap();
+                                if old_hash == new_hash {
+                                    let _old_c = app_data.update(c_id, c).unwrap();
+                                } else {
+                                    eprintln!(
+                                        "2 Can not update CID {} since old {} != {} new",
+                                        c_id, old_hash, new_hash
+                                    );
+                                }
+                            } else {
+                                incomplete_bottom_hashes.insert(c_id, p_h);
+                            }
                         }
                     }
                 }
             }
             SyncResponse::Page(c_id, data_type, page_no, total, data) => {
                 eprintln!("CID-{} Page #{}/{}", c_id, page_no, total);
+                let d_empty = data.is_empty();
                 //TODO: make it proper
                 if page_no == 0 {
                     eprintln!(
@@ -5390,11 +5565,12 @@ async fn custom_response_task(
                     if let Ok((d_type, len)) = app_data.get_type_and_len(c_id) {
                         eprintln!("CID {} already exists, len: {}", c_id, len);
                         if d_type == DataType::Link {
-                            if len > 0 {
+                            // eprintln!("DT is Link");
+                            if len > 1 {
                                 // eprintln!("Update existing Link");
                                 let res = app_data
                                     .update_transformative_link(false, c_id, page_no, total, data);
-                                if res.is_ok() {
+                                if res.is_ok() && !d_empty {
                                     update_active_reads(
                                         active_reads,
                                         &c_id,
@@ -5405,16 +5581,21 @@ async fn custom_response_task(
                                 }
                             } else {
                                 // eprintln!("Create new Link");
-                                let res = app_data.update(c_id, data_to_link(data).unwrap());
-                                // eprintln!("Update result: {:?}", res);
-                                if res.is_ok() {
-                                    update_active_reads(
-                                        active_reads,
-                                        &c_id,
-                                        page_no,
-                                        app_data_send,
-                                    )
-                                    .await;
+                                let link_result = data_to_link(data);
+                                if let Ok(link) = link_result {
+                                    let res = app_data.update(c_id, link);
+                                    // eprintln!("Update result: {:?}", res);
+                                    if res.is_ok() && !d_empty {
+                                        update_active_reads(
+                                            active_reads,
+                                            &c_id,
+                                            page_no,
+                                            app_data_send,
+                                        )
+                                        .await;
+                                    }
+                                } else {
+                                    eprintln!("Could not create link ");
                                 }
                             }
                         } else {
@@ -5422,7 +5603,7 @@ async fn custom_response_task(
 
                             eprintln!("New page #0 hash: {}", data.get_hash());
                             let res = app_data.update_data(c_id, page_no, data.clone());
-                            if res.is_ok() {
+                            if res.is_ok() && !d_empty {
                                 update_active_reads(active_reads, &c_id, page_no, app_data_send)
                                     .await;
                                 // We send an update to print content
@@ -5465,7 +5646,7 @@ async fn custom_response_task(
                         }
                         let _res = app_data
                             .update(c_id, Content::Data(data_type, 1, ContentTree::Filled(data)));
-                        if _res.is_ok() {
+                        if _res.is_ok() && !d_empty {
                             update_active_reads(active_reads, &c_id, page_no, app_data_send).await;
                         }
                     } else {
@@ -5481,7 +5662,7 @@ async fn custom_response_task(
                         let link_result = data_to_link(data);
                         if let Ok(link) = link_result {
                             let _res = app_data.update(c_id, link);
-                            if _res.is_ok() {
+                            if _res.is_ok() && !d_empty {
                                 update_active_reads(active_reads, &c_id, page_no, app_data_send)
                                     .await;
                             }
@@ -5494,7 +5675,7 @@ async fn custom_response_task(
                     if d_type == data_type {
                         // let res = app_data.append_data(c_id, data);
                         let res = app_data.update_data(c_id, page_no, data);
-                        if res.is_ok() {
+                        if res.is_ok() && !d_empty {
                             update_active_reads(active_reads, &c_id, page_no, app_data_send).await;
                             eprintln!("C-{} Page #{} update result: ok", c_id, page_no,);
                         } else {
@@ -5510,7 +5691,7 @@ async fn custom_response_task(
                         let res =
                             app_data.update_transformative_link(false, c_id, page_no, total, data);
                         // println!("Update TI result: {:?}", res);
-                        if res.is_ok() {
+                        if res.is_ok() && !d_empty {
                             update_active_reads(active_reads, &c_id, page_no, app_data_send).await;
                         }
                     } else {
@@ -5607,7 +5788,7 @@ async fn read_data_task(
     }
 
     let get_data_result = if len <= 64 {
-        if read_to_page_incl > len {
+        if read_to_page_incl >= len {
             app_data.get_all_data(c_id)
         } else {
             app_data.get_data_range(c_id, starting_page, read_to_page_incl)
@@ -5622,14 +5803,16 @@ async fn read_data_task(
         let mut data_missing = vec![];
         for (i, dta) in data_vec.iter().enumerate() {
             if dta.is_empty() {
+                eprintln!("{} still missing: {}", c_id, i as u16 + starting_page);
                 data_missing.push(i as u16 + starting_page);
             }
         }
         if !data_missing.is_empty() {
             // …and then try to load missing Data either from
             // local storage…
+            let disk_path = storage.join(swarm_name.to_path());
             if let Some(c_from_store) =
-                load_content_from_disk(storage.to_path_buf(), c_id, d_type, root_hash).await
+                load_content_from_disk(disk_path, c_id, d_type, root_hash).await
             {
                 let mut data_filled_from_storage = vec![];
                 for d_id in &data_missing {
@@ -5644,9 +5827,12 @@ async fn read_data_task(
                     }
                 }
                 data_missing.retain(|&el| !data_filled_from_storage.contains(&el));
+            } else {
+                eprintln!("Unable to load content from disk!");
             }
 
             if !data_missing.is_empty() {
+                eprintln!("Data for {} is still not empty", c_id);
                 //  …or from neighbors.
                 //
                 // We need to store internaly existing pages
@@ -5690,6 +5876,7 @@ async fn read_data_task(
                         ),
                     ));
                 }
+                return;
             }
         } else {
             // We have all data for chunk 0, so we should iterate till
@@ -5753,8 +5940,8 @@ async fn read_data_task(
         // local storage or from neighbors.
         //
         // TODO: Build timer logic to ping AppDatas about reads
-        eprintln!("AppData error when reading contents of {}", c_id);
         let error = get_data_result.err().unwrap();
+        eprintln!("AppData error {} when reading contents of {}", error, c_id);
         if matches!(error, AppError::ContentEmpty) {
             eprintln!("got ContentEmpty");
             let sync_requests: Vec<SyncRequest> = vec![SyncRequest::AllPages(vec![c_id])];

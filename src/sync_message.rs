@@ -142,6 +142,7 @@ pub fn deserialize_requests(bytes: Vec<u8>) -> Vec<SyncRequest> {
     requests
 }
 
+#[derive(Debug)]
 pub enum SyncRequest {
     Datastore,
     AllFirstPages(Option<Vec<u8>>),

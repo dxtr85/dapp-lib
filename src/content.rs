@@ -930,11 +930,12 @@ impl Content {
 }
 
 pub fn data_to_link(data: Data) -> Result<Content, AppError> {
-    // eprintln!("data_to_link: {:?}", data);
+    eprintln!("data_to_link: {:?}", data.get_hash());
     let mut bytes_iter = data.bytes().into_iter();
     let len = bytes_iter.len();
     // eprintln!("creating link from {} bytes", len);
     if len < 11 {
+        // eprintln!("data_to_link too short data {}", len);
         return Err(AppError::Smthg);
     }
     let d_len = bytes_iter.next().unwrap();
@@ -1541,7 +1542,8 @@ impl Subtree {
     }
     pub fn read(&self, idx: u16) -> Result<Data, AppError> {
         if idx >= self.data_count {
-            Err(AppError::Smthg)
+            eprintln!("Req read {}, when data count: {}", idx, self.data_count);
+            Err(AppError::IndexingError)
         } else {
             let left_count = self.left.len();
             if idx >= left_count {

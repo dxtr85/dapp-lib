@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use crate::ToAppData;
 
+#[derive(Clone, Copy)]
 pub struct SwarmState {
     pub s_id: SwarmID,
     pub is_synced: bool,
@@ -257,6 +258,9 @@ impl ApplicationManager {
         }
     }
 
+    pub fn get_swarm_state(&self, s_name: &SwarmName) -> Option<SwarmState> {
+        self.name_to_id.get(s_name).copied()
+    }
     // pub fn add_pending_read(
     //     &mut self,
     //     s_id: SwarmID,
