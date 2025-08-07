@@ -567,6 +567,15 @@ impl Manifest {
         output
     }
 
+    pub fn update_tag(&mut self, id: u8, tag: Tag) -> bool {
+        eprintln!("update_tag {id} to {tag:?}");
+        if let Some(e_tag) = self.tags.get_mut(&id) {
+            *e_tag = tag;
+            true
+        } else {
+            false
+        }
+    }
     pub fn add_tags(&mut self, tags: Vec<Tag>) -> bool {
         eprintln!("add_tags {:?}", tags);
         let mut any_tag_added = false;
