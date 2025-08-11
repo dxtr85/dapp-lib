@@ -1,7 +1,7 @@
 #[derive(Debug, Copy, Clone)]
 pub enum AppType {
     Catalog,
-    //Forum,
+    Forum,
     //Market,
     //Storage,
     //Ledger,
@@ -12,6 +12,7 @@ impl AppType {
     pub fn byte(&self) -> u8 {
         match self {
             Self::Catalog => 255,
+            Self::Forum => 254,
             Self::Other(val) => *val,
         }
     }
