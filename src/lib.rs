@@ -121,6 +121,7 @@ pub enum ToApp {
     Disconnected(bool, SwarmID, SwarmName), //bool indicates if we try to reconnect
     SearchQueries(Vec<(String, usize)>),
     SearchResults(String, Vec<Hit>),
+    // SwitchToApp(AppType, SwarmID, SwarmName),
     Quit,
 }
 
@@ -158,6 +159,7 @@ pub enum ToAppMgr {
     QueryForNeighboringSwarms(Option<SwarmID>), // SwarmID should not be queried
     TimeoutOver(TimeoutType),
     StorageNeighbors(Vec<(GnomeId, NetworkSettings)>),
+    StartNewSwarm(AppType, SwarmName),
     Quit,
     // TODO: move above into below
     FromGMgr(FromGnomeManager),
@@ -535,6 +537,7 @@ async fn serve_app_manager(
     let mut own_swarm_activated = false;
     let mut quit_application = false;
     let mut swarm_swap = SwarmSwap::new();
+    let mut swarm_start_requested = None;
     spawn(serve_gnome_mgr_requests(from_gnome_mgr, to_app_mgr.clone()));
     spawn(start_cycling_timer(
         to_app_mgr.clone(),
@@ -1610,7 +1613,21 @@ async fn serve_app_manager(
                             // TODO: build an algorithm that decides how many pages should be provisioned
                             let max_pages_in_memory = 32768;
                             // eprintln!("spawning new serve_app_data");
-                            let app_data = ApplicationData::new(AppType::Catalog);
+                            let app_type =
+                                if let Some((app_type, sr_name)) = swarm_start_requested.take() {
+                                    if sr_name == s_name {
+                                        eprintln!("Started a swarm: {app_type:?} {sr_name}");
+                                        app_type
+                                    } else {
+                                        eprintln!("TODO: Started a swarm: {s_name}");
+                                        eprintln!("was expecting: {app_type:?} {sr_name}");
+                                        swarm_start_requested = Some((app_type, sr_name));
+                                        AppType::Catalog
+                                    }
+                                } else {
+                                    AppType::Catalog
+                                };
+                            let app_data = ApplicationData::new(app_type);
                             spawn(serve_app_data(
                                 config.storage.clone(),
                                 max_pages_in_memory,
@@ -1976,6 +1993,14 @@ async fn serve_app_manager(
                             .send(ToGnomeManager::ProvideNeighboringSwarms(query_id))
                             .await;
                     }
+                }
+                ToAppMgr::StartNewSwarm(app_type, s_name) => {
+                    // TODO
+                    swarm_start_requested = Some((app_type, s_name.clone()));
+                    eprintln!("I am supposed to start a swarm:{app_type:?} {s_name}");
+                    let _ = to_gnome_mgr
+                        .send(ToGnomeManager::JoinSwarm(s_name, None))
+                        .await;
                 }
                 ToAppMgr::Quit => {
                     quit_application = true;

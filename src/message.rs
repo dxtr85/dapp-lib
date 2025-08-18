@@ -199,9 +199,9 @@ impl SyncMessageType {
                 SyncMessageType::AppendContent(dt)
             }
             253 => {
-                let d_type = DataType::from(bytes.drain(0..1).next().unwrap());
                 let b1 = bytes.drain(0..1).next().unwrap();
                 let b2 = bytes.drain(0..1).next().unwrap();
+                let d_type = DataType::from(bytes.drain(0..1).next().unwrap());
                 let c_id = u16::from_be_bytes([b1, b2]);
                 let operation = ChangeContentOperation::from(bytes).unwrap();
                 SyncMessageType::ChangeContent(c_id, d_type, operation)
@@ -267,7 +267,7 @@ impl SyncMessageType {
             SyncMessageType::AppendContent(d_type) => vec![254, d_type.byte()],
             SyncMessageType::ChangeContent(c_id, d_type, operation) => {
                 let [b1, b2] = c_id.to_be_bytes();
-                let mut bvec = vec![253, d_type.byte(), b1, b2];
+                let mut bvec = vec![253, b1, b2, d_type.byte()];
                 bvec.append(&mut operation.bytes());
                 bvec
             }
