@@ -1,11 +1,17 @@
 use crate::app_type::AppType;
 use crate::Data;
 use gnome::prelude::sha_hash;
+use gnome::prelude::ByteSet;
+use gnome::prelude::CapabiliTree;
+use gnome::prelude::Capabilities;
+use gnome::prelude::GnomeId;
 use gnome::prelude::Nat;
 use gnome::prelude::NetworkSettings;
-// use gnome::prelude::NetworkSettings;
+use gnome::prelude::Policy;
 use gnome::prelude::PortAllocationRule;
+use gnome::prelude::Requirement;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::hash::Hash;
 // use std::hash::{DefaultHasher, Hasher};
 use std::net::IpAddr;
@@ -100,6 +106,23 @@ pub struct Manifest {
     pub description: String,
     pub tags: HashMap<u8, Tag>,
     pub d_types: HashMap<u8, Tag>,
+    // TODO: store Swarm's Policy
+    pub policy_reg: HashMap<Policy, Requirement>,
+    // TODO: store Swarm's Capabilities
+    pub capability_reg: HashMap<Capabilities, CapabiliTree>,
+    // TODO: store Swarm's ByteSets
+    pub byteset_reg: HashMap<u8, ByteSet>,
+    // Above should be loaded only when needed,
+    // for many users this might not be the case.
+    //
+    // TODO: once we have above in place we have to derive
+    // logic for making sure what Swarm has in it's running settings
+    // matches that in Manifest data.
+    // For this we need a way to retrieve Swarm's running PRCBs values.
+    // Now we can check if running settings allow us to make changes.
+    // If so, we compare running settings with Manifest settings to see,
+    // if there needs to be a change.
+    // If that is true we prepare Reconfigure messages and send them to Gnome.
 }
 // TODO: a new Manifest definition, with attributes being added as needed during development
 //  Manifest should apply to a Swarm, not an Application, application is defined in code
@@ -150,6 +173,9 @@ impl Manifest {
             description: String::new(),
             tags,
             d_types: HashMap::new(),
+            policy_reg: HashMap::new(),
+            capability_reg: HashMap::new(),
+            byteset_reg: HashMap::new(),
         }
     }
 
@@ -194,13 +220,11 @@ impl Manifest {
     }
 
     //TODO: There can be up to 256 Tags defined in a manifest,
-    // each 32 bytes long, so a Manifest will be at most 9 Data chunks long
-    // (later there can be some additions).
-    // There is only one exception to this, when there are no Tags defined,
-    // Then it can be only 1 Data long
+    // each 32 bytes long, so Tags will use at most 9 Data chunks
     // If we add a single Tag, then Manifest has to expand to 2 Datas.
     // Tags are ordered from 0 to 255.
-    // Each Tag is stored as a sequence of 32 bytes in Data, if all of these bytes are 0,
+    // Each Tag is stored as a sequence of 32 bytes in Data,
+    // if all of these bytes are 0,
     // then given Tag is not defined, otherwise given Tag is defined.
     pub fn from(data_vec: Vec<Data>) -> Self {
         let data_count = data_vec.len();
@@ -211,6 +235,9 @@ impl Manifest {
                 description: String::new(),
                 tags: HashMap::new(),
                 d_types: HashMap::new(),
+                policy_reg: HashMap::new(),
+                capability_reg: HashMap::new(),
+                byteset_reg: HashMap::new(),
             };
         }
         // eprintln!("Constructing manifest from: {} Data blocks", data_count);
@@ -224,6 +251,9 @@ impl Manifest {
                 description: String::new(),
                 tags: HashMap::new(),
                 d_types: HashMap::new(),
+                policy_reg: HashMap::new(),
+                capability_reg: HashMap::new(),
+                byteset_reg: HashMap::new(),
             };
         }
         let app_type_byte = iter.next();
@@ -234,48 +264,104 @@ impl Manifest {
                 description: String::new(),
                 tags: HashMap::new(),
                 d_types: HashMap::new(),
+                policy_reg: HashMap::new(),
+                capability_reg: HashMap::new(),
+                byteset_reg: HashMap::new(),
             };
         }
         let app_type = AppType::from(app_type_byte.unwrap());
-        // let tags_count = if let Some(byte) = iter.next() {
-        //     byte as usize
-        // } else {
-        //     0
-        // };
         let first_tags_page = u16::from_be_bytes([iter.next().unwrap(), iter.next().unwrap()]);
+        eprintln!("first_tags_page: {first_tags_page}");
         let first_dt_page = u16::from_be_bytes([iter.next().unwrap(), iter.next().unwrap()]);
-        let other_defs = u16::from_be_bytes([iter.next().unwrap(), iter.next().unwrap()]);
+        eprintln!("first_dt_page: {first_dt_page}");
+        let first_policy_page = u16::from_be_bytes([iter.next().unwrap(), iter.next().unwrap()]);
+        eprintln!("first_policy_page: {first_policy_page}");
+        let first_caps_page = if let Some(bte) = iter.next() {
+            u16::from_be_bytes([bte, iter.next().unwrap()])
+        } else {
+            0
+        };
+        eprintln!("first_caps_page: {first_caps_page}");
+        let first_bsets_page = if let Some(bte) = iter.next() {
+            u16::from_be_bytes([bte, iter.next().unwrap()])
+        } else {
+            0
+        };
+        eprintln!("first_bsets_page: {first_bsets_page}");
+
         let tag_pages_count = if first_tags_page == 0 {
             0
         } else {
-            if first_dt_page == 0 && other_defs == 0 {
+            if first_dt_page == 0
+                && first_policy_page == 0
+                && first_caps_page == 0
+                && first_bsets_page == 0
+            {
                 data_count - 1
             } else if first_dt_page > 0 {
                 first_dt_page as usize - first_tags_page as usize
+            } else if first_policy_page > 0 {
+                first_policy_page as usize - first_tags_page as usize
+            } else if first_caps_page > 0 {
+                first_caps_page as usize - first_tags_page as usize
             } else {
-                other_defs as usize - first_tags_page as usize
+                first_bsets_page as usize - first_tags_page as usize
             }
         };
-        let mut tags = HashMap::with_capacity(tag_pages_count << 5);
-        // let d_types_count = if let Some(byte) = iter.next() {
-        //     byte as usize
-        // } else {
-        //     0
-        // };
-        let dt_page_count = if other_defs == 0 {
-            data_count - first_dt_page as usize
+        let dt_page_count = if first_dt_page == 0 {
+            0
         } else {
-            other_defs as usize - first_dt_page as usize
+            if first_policy_page == 0 && first_caps_page == 0 && first_bsets_page == 0 {
+                data_count - (first_dt_page as usize)
+            } else if first_policy_page > 0 {
+                first_policy_page as usize - first_dt_page as usize
+            } else if first_caps_page > 0 {
+                first_caps_page as usize - first_dt_page as usize
+            } else {
+                first_bsets_page as usize - first_dt_page as usize
+            }
+        };
+        let policy_page_count = if first_policy_page == 0 {
+            0
+        } else {
+            if first_caps_page == 0 && first_bsets_page == 0 {
+                data_count - (first_policy_page as usize)
+            } else if first_caps_page > 0 {
+                first_caps_page as usize - first_policy_page as usize
+            } else {
+                first_bsets_page as usize - first_policy_page as usize
+            }
+        };
+        let caps_page_count = if first_caps_page == 0 {
+            0
+        } else {
+            if first_bsets_page == 0 {
+                data_count - (first_caps_page as usize)
+            } else {
+                first_bsets_page as usize - first_caps_page as usize
+            }
+        };
+        let bsets_page_count = if first_bsets_page == 0 {
+            0
+        } else {
+            eprintln!("data_count: {data_count}– {first_bsets_page}");
+            data_count - (first_bsets_page as usize)
         };
 
-        let mut d_types = HashMap::with_capacity(dt_page_count << 5);
         let mut pub_ips = CombinedNetworkSettings::new();
-        // First byte in UTF-8 encoded String can not start with a 1 bit, so we are good
-        // TODO: read one byte and check its value
-        // if it's higher than 251 use old logic
-        // otherwise it indicates how many following bytes need to be read
-        // in order to retrieve pub_ips
-        // read that many and update pub_ips
+        let mut tags = HashMap::with_capacity(tag_pages_count << 5);
+        let mut d_types = HashMap::with_capacity(dt_page_count << 5);
+        let mut policy_reg = HashMap::new();
+        let mut capability_reg = HashMap::new();
+        let mut byteset_reg = HashMap::new();
+
+        // First byte in UTF-8 encoded String can not start with a 1 value,
+        // so we are good
+        // Read one byte and check its value:
+        // – if it's higher than 251 use old logic
+        // – otherwise it indicates how many following bytes
+        //   need to be read in order to retrieve pub_ips.
+        // Read that many and update pub_ips
         if let Some(next_byte) = iter.clone().peekable().next() {
             eprintln!("Next_byte: {}", next_byte);
             if next_byte == 255 || next_byte == 254 || next_byte == 253 || next_byte == 252 {
@@ -339,29 +425,30 @@ impl Manifest {
                     }
                 }
             } else if next_byte == 0 {
-                let next_byte = iter.next().unwrap();
-                let next_byte = iter.next().unwrap();
-                let mut ns_bytes = Vec::with_capacity(next_byte as usize);
+                let _byte = iter.next().unwrap();
+                let ns_bytesize = iter.next().unwrap();
+                let mut ns_bytes = Vec::with_capacity(ns_bytesize as usize);
                 eprintln!(
-                    "We are using new method to load pub_ips from storage {}b",
-                    next_byte
+                    "We are using new method to load pub_ips from {} bytes",
+                    ns_bytesize
                 );
-                for _i in 0..next_byte {
+                for _i in 0..ns_bytesize {
                     ns_bytes.push(iter.next().unwrap());
                 }
                 let nss = NetworkSettings::from(&ns_bytes);
                 pub_ips.update(nss);
+            } else {
+                eprintln!("Uncecognized next_byte: {next_byte}");
             }
         }
         eprintln!("Loading Description…");
         let description = String::from_utf8(iter.collect()).unwrap();
 
         let mut current_tag_id: u8 = 0;
-        let mut tag_pages_read = 0;
-        // let mut current_dtype_id = 0;
-        let mut dtype_pages_read = 0;
-        let mut adding_tags = true;
-        while let Some(data) = data_iter.next() {
+        // let mut adding_tags = true;
+        // let mut tag_pages_read = 0;
+        for _page in 0..tag_pages_count {
+            let data = data_iter.next().unwrap();
             let bytes = data.bytes();
             for chunk in bytes.chunks_exact(32) {
                 let mut all_zeros = true;
@@ -382,34 +469,152 @@ impl Manifest {
                 }
                 if !all_zeros {
                     let tag = Tag::new(String::from_utf8(name_bytes).unwrap()).unwrap();
-                    if adding_tags {
-                        tags.insert(current_tag_id, tag);
-                    } else {
-                        d_types.insert(current_tag_id, tag);
-                    }
-                    // tags_added = tags_added + 1;
+                    tags.insert(current_tag_id, tag);
                 }
                 current_tag_id = current_tag_id.saturating_add(1);
-                // if adding_tags && tags_added >= tags_count {
-                //     adding_tags = false;
-                //     tags_added = 0;
-                //     current_tag_id = 0;
-                // }
             }
-            if adding_tags {
-                tag_pages_read = tag_pages_read + 1;
-                if tag_pages_read >= tag_pages_count {
-                    adding_tags = false;
-                    current_tag_id = 0;
+        }
+        current_tag_id = 0;
+        // let mut dtype_pages_read = 0;
+        for _page in 0..dt_page_count {
+            // TODO: Rework parsing bytes logic
+            let data = data_iter.next().unwrap();
+            let bytes = data.bytes();
+            for chunk in bytes.chunks_exact(32) {
+                let mut all_zeros = true;
+                let mut non_space_byte_occured = false;
+                let mut name_bytes = Vec::with_capacity(32);
+                for byte in chunk {
+                    if *byte > 0 {
+                        all_zeros = false;
+                    }
+                    if *byte == 32 {
+                        if non_space_byte_occured {
+                            name_bytes.push(*byte);
+                        }
+                    } else {
+                        non_space_byte_occured = true;
+                        name_bytes.push(*byte);
+                    }
+                }
+                if !all_zeros {
+                    let tag = Tag::new(String::from_utf8(name_bytes).unwrap()).unwrap();
+                    d_types.insert(current_tag_id, tag);
+                }
+                current_tag_id = current_tag_id.saturating_add(1);
+            }
+        }
+        //  read policy
+        let mut p_bytes = Vec::with_capacity(policy_page_count * 1024);
+        for _page in 0..policy_page_count {
+            if let Some(data) = data_iter.next() {
+                let mut bts = data.bytes();
+                if !bts.is_empty() {
+                    p_bytes.append(&mut bts);
+                } else {
+                    eprintln!("Data empty for Policy");
+                    break;
                 }
             } else {
-                dtype_pages_read = dtype_pages_read + 1;
-                if dtype_pages_read >= dt_page_count {
-                    // We don't want to tread other data as data type defs
+                eprintln!("Missing Data for Policy");
+                break;
+            }
+        }
+        while !p_bytes.is_empty() {
+            let pol = Policy::from(&mut p_bytes);
+            let req = Requirement::from(&mut p_bytes);
+            policy_reg.insert(pol, req);
+        }
+
+        //  read capabilities
+        let mut c_bytes = Vec::with_capacity(caps_page_count * 1024);
+        for _page in 0..caps_page_count {
+            if let Some(data) = data_iter.next() {
+                let mut bts = data.bytes();
+                if !bts.is_empty() {
+                    c_bytes.append(&mut bts);
+                } else {
+                    eprintln!("Data empty for Capabilities");
                     break;
+                }
+            } else {
+                eprintln!("Missing Data for Capabilities");
+                break;
+            }
+        }
+        while !c_bytes.is_empty() {
+            let cap = Capabilities::from(c_bytes.remove(0));
+            let how_many = c_bytes.remove(0);
+            let mut ctree = if let Some(ct) = capability_reg.remove(&cap) {
+                ct
+            } else {
+                CapabiliTree::create()
+            };
+
+            for _i in 0..how_many {
+                let mut b_arr: [u8; 8] = [0; 8];
+                for j in 0..8 {
+                    b_arr[j] = c_bytes.remove(0);
+                }
+                ctree.insert(GnomeId::from(b_arr));
+            }
+            capability_reg.insert(cap, ctree);
+        }
+        //  read byte sets
+        let mut b_bytes = Vec::with_capacity(bsets_page_count * 1024);
+        for _page in 0..bsets_page_count {
+            // TODO: Rework parsing bytes logic
+            if let Some(data) = data_iter.next() {
+                let mut bts = data.bytes();
+                if !bts.is_empty() {
+                    b_bytes.append(&mut bts);
+                } else {
+                    eprintln!("Data empty for ByteSet");
+                    break;
+                }
+            } else {
+                eprintln!("Missing Data for ByteSet");
+                break;
+            }
+        }
+
+        if !b_bytes.is_empty() {
+            let mut b_idx = b_bytes.remove(0);
+            let mut b_set = ByteSet::empty();
+            while !b_bytes.is_empty() {
+                let b_type = b_bytes.remove(0);
+                let b_s_count = u16::from_be_bytes([b_bytes.remove(0), b_bytes.remove(0)]);
+                if b_type == 1 {
+                    let mut h_set = HashSet::with_capacity(b_s_count as usize);
+                    for _i in 0..b_s_count {
+                        h_set.insert(b_bytes.remove(0));
+                    }
+                    b_set = ByteSet::new(h_set);
+                } else if b_type == 2 {
+                    b_set = if let Some(b_s) = byteset_reg.remove(&b_idx) {
+                        b_s
+                    } else {
+                        ByteSet::empty()
+                    };
+                    let mut val: [u8; 2] = [0, 0];
+                    for _i in 0..b_s_count {
+                        val[0] = b_bytes.remove(0);
+                        val[1] = b_bytes.remove(0);
+                        b_set.add_pair(u16::from_be_bytes(val))
+                    }
+                } else if b_type == 0 {
+                    //todo
+                } else {
+                    eprintln!("unexpected ByteSet type: {b_type}");
+                }
+                let curr_bset = std::mem::replace(&mut b_set, ByteSet::empty());
+                byteset_reg.insert(b_idx, curr_bset);
+                if !b_bytes.is_empty() {
+                    b_idx = b_bytes.remove(0);
                 }
             }
         }
+
         // TODO: read other data if any!
         Self {
             app_type,
@@ -417,32 +622,76 @@ impl Manifest {
             description,
             tags,
             d_types,
+            policy_reg,
+            capability_reg,
+            byteset_reg,
         }
     }
 
     pub fn to_data(&self) -> Vec<Data> {
         let mut res = Vec::with_capacity(1024);
         res.push(self.app_type.byte());
-        let tags_len = self.tags.len() as u8;
+        let tags_len = self.tags.len() as u16;
+        let dtypes_len = self.d_types.len() as u16;
         res.push(0);
-        if tags_len == 0 {
+        let tags_page_count = if tags_len == 0 {
             res.push(0);
+            0
         } else {
             res.push(1);
-        }
-        let d_types_len = self.d_types.len() as u8;
-        res.push(0);
-        if d_types_len == 0 {
+            tags_len >> 4 + if tags_len % 32 > 0 { 1 } else { 0 }
+        };
+        let d_types_len = self.d_types.len();
+        let dtypes_page_count = if d_types_len == 0 {
+            res.push(0);
+            res.push(0);
+            0
+        } else {
+            let next_free_page: [u8; 2] = (1 + tags_page_count).to_be_bytes();
+            res.push(next_free_page[0]);
+            res.push(next_free_page[1]);
+            (dtypes_len >> 4 + if dtypes_len % 32 > 0 { 1 } else { 0 }) as u16
+        };
+        // TODO: index of other data after Data type definitions, 0 if none
+        //
+        // policy
+        let mut policy_pages = self.get_policy_data_vec();
+        let policy_page_count: u16 = policy_pages.len() as u16;
+        if policy_page_count == 0 {
+            res.push(0);
             res.push(0);
         } else {
-            //TODO: Calculate d_id of first page containing user defined data types
-            // it is right after Tags pages
-            let tags_pages_count = tags_len >> 4 + if tags_len % 32 > 0 { 1 } else { 0 };
-            res.push(tags_pages_count + 1);
-        }
-        // TODO: index of other data after Data type definitions, 0 if none
-        res.push(0);
-        res.push(0);
+            let next_free_page: [u8; 2] = (1 + tags_page_count + dtypes_page_count).to_be_bytes();
+            res.push(next_free_page[0]);
+            res.push(next_free_page[1]);
+        };
+        //
+        // TODO: capabilities
+        let mut caps_pages = self.get_capabilities_data_vec();
+        let caps_page_count = caps_pages.len() as u16;
+        if caps_page_count == 0 {
+            res.push(0);
+            res.push(0);
+        } else {
+            let next_free_page: [u8; 2] =
+                (1 + tags_page_count + dtypes_page_count + policy_page_count).to_be_bytes();
+            res.push(next_free_page[0]);
+            res.push(next_free_page[1]);
+        };
+        //
+        // TODO: ByteSets
+        let mut bsets_pages = self.get_bsets_data_vec();
+        let bsets_page_count = bsets_pages.len();
+        if bsets_page_count == 0 {
+            res.push(0);
+            res.push(0);
+        } else {
+            let next_free_page: [u8; 2] =
+                (1 + tags_page_count + dtypes_page_count + policy_page_count + caps_page_count)
+                    .to_be_bytes();
+            res.push(next_free_page[0]);
+            res.push(next_free_page[1]);
+        };
         res.append(&mut self.pub_ips.get_bytes());
         // match self.pub_ips.len() {
         //     0 => res.push(252),
@@ -563,6 +812,9 @@ impl Manifest {
             let next_data_bytes = std::mem::replace(&mut res, Vec::with_capacity(1024));
             output.push(Data::new(next_data_bytes).unwrap());
         }
+        output.append(&mut policy_pages);
+        output.append(&mut caps_pages);
+        output.append(&mut bsets_pages);
 
         output
     }
@@ -722,6 +974,168 @@ impl Manifest {
     ) -> bool {
         self.pub_ips.update(ips)
     }
+    fn get_policy_data_vec(&self) -> Vec<Data> {
+        let mut r_vec = vec![];
+        if self.policy_reg.is_empty() {
+            return r_vec;
+        }
+        // We need to traverse policy_reg in the same order every time!
+        let policies = [
+            Policy::Default,
+            Policy::Data,
+            Policy::StartBroadcast,
+            Policy::ChangeBroadcastOrigin,
+            Policy::EndBroadcast,
+            Policy::StartMulticast,
+            Policy::ChangeMulticastOrigin,
+            Policy::EndMulticast,
+            Policy::CreateGroup,
+            Policy::DeleteGroup,
+            Policy::ModifyGroup,
+            Policy::InsertPubkey,
+            Policy::DataWithFirstByte(0),
+            Policy::UserDefined(0),
+        ];
+        let mut bytes = Vec::with_capacity(1024);
+        for pol in policies {
+            if matches!(pol, Policy::DataWithFirstByte(0)) {
+                for i in 0..=255 {
+                    bytes = self.get_policy_helper(&mut r_vec, bytes, Policy::DataWithFirstByte(i));
+                }
+            } else if matches!(pol, Policy::UserDefined(0)) {
+                for i in 0..=255 {
+                    bytes = self.get_policy_helper(&mut r_vec, bytes, Policy::DataWithFirstByte(i));
+                }
+            } else {
+                bytes = self.get_policy_helper(&mut r_vec, bytes, pol);
+            }
+        }
+        // remaining bytes!
+        if !bytes.is_empty() {
+            r_vec.push(Data::new(bytes).unwrap());
+        }
+        r_vec
+    }
+    fn get_policy_helper(&self, res: &mut Vec<Data>, mut bytes: Vec<u8>, pol: Policy) -> Vec<u8> {
+        if let Some(req) = self.policy_reg.get(&pol) {
+            pol.append_bytes_to(&mut bytes);
+            req.append_bytes_to(&mut bytes);
+            if bytes.len() >= 1024 {
+                let mut chunks = bytes.chunks_exact(1024);
+                while let Some(chunk) = chunks.next() {
+                    res.push(Data::new(chunk.try_into().unwrap()).unwrap());
+                }
+                bytes = chunks.remainder().try_into().unwrap();
+            }
+        }
+        bytes
+    }
+
+    fn get_capabilities_data_vec(&self) -> Vec<Data> {
+        let mut r_vec = vec![];
+        if self.capability_reg.is_empty() {
+            return r_vec;
+        }
+        // TODO
+        // We need to traverse capabilities_reg
+        // in the same order every time!
+        let caps = [
+            Capabilities::Founder,
+            Capabilities::Owner,
+            Capabilities::Admin,
+            Capabilities::Moderator,
+            Capabilities::Superuser,
+            Capabilities::Capability(0),
+        ];
+        let mut bytes = Vec::with_capacity(1024);
+        for cap in caps {
+            if matches!(cap, Capabilities::Capability(0)) {
+                // TODO: when we add a fixed Capability, this will scan
+                // for non-existing Caps
+                for i in 0..251 {
+                    bytes =
+                        self.get_capability_helper(&mut r_vec, bytes, Capabilities::Capability(i));
+                }
+            } else {
+                bytes = self.get_capability_helper(&mut r_vec, bytes, cap);
+            }
+        }
+        // remaining bytes!
+        if !bytes.is_empty() {
+            r_vec.push(Data::new(bytes).unwrap());
+        }
+        r_vec
+    }
+    fn get_capability_helper(
+        &self,
+        res: &mut Vec<Data>,
+        mut bytes: Vec<u8>,
+        cap: Capabilities,
+    ) -> Vec<u8> {
+        if let Some(c_tree) = self.capability_reg.get(&cap) {
+            let gnomes = c_tree.get_all_members();
+            // TODO: support larger sizes
+            let g_size = if gnomes.len() > 255 {
+                255
+            } else {
+                gnomes.len() as u8
+            };
+            bytes.push(cap.byte());
+            bytes.push(g_size);
+            for g_id in &gnomes[0..256] {
+                bytes.append(&mut Vec::from(g_id.bytes()));
+            }
+            //.cache
+            if bytes.len() >= 1024 {
+                let mut chunks = bytes.chunks_exact(1024);
+                while let Some(chunk) = chunks.next() {
+                    res.push(Data::new(chunk.try_into().unwrap()).unwrap());
+                }
+                bytes = chunks.remainder().try_into().unwrap();
+            }
+            // TODO
+        }
+        bytes
+    }
+
+    fn get_bsets_data_vec(&self) -> Vec<Data> {
+        let mut r_vec = vec![];
+        if self.byteset_reg.is_empty() {
+            return r_vec;
+        }
+        let mut raw_bytes = Vec::with_capacity(2048);
+        for i in 0..=255 {
+            if let Some(bset) = self.byteset_reg.get(&i) {
+                let mut b_bytes = bset.bytes();
+                let b_len = (b_bytes.len() as u16).to_be_bytes();
+                raw_bytes.push(i);
+                if bset.is_pair() {
+                    raw_bytes.push(2);
+                } else if bset.is_none() {
+                    raw_bytes.push(0);
+                } else {
+                    raw_bytes.push(1);
+                }
+                raw_bytes.push(b_len[0]);
+                raw_bytes.push(b_len[1]);
+                raw_bytes.append(&mut b_bytes);
+                if raw_bytes.len() >= 1024 {
+                    let mut chunks = raw_bytes.chunks_exact(1024);
+                    while let Some(chunk) = chunks.next() {
+                        r_vec.push(Data::new(chunk.try_into().unwrap()).unwrap());
+                    }
+                    raw_bytes = chunks.remainder().try_into().unwrap();
+                }
+                // TODO
+            }
+        }
+        // remaining bytes!
+        if !raw_bytes.is_empty() {
+            r_vec.push(Data::new(raw_bytes).unwrap());
+        }
+        r_vec
+    }
+
     // pub fn update_pub_ips(
     //     &mut self,
     //     // ips: Vec<(IpAddr, u16, Nat, (PortAllocationRule, i8))>,

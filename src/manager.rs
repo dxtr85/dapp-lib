@@ -324,8 +324,12 @@ impl ApplicationManager {
             }
         }
     }
-    pub fn swarm_joined(&mut self, s_name: SwarmName) {
+    pub fn swarm_joined(&mut self, s_id: SwarmID, s_name: SwarmName) {
+        // eprintln!("{s_id} SwarmJoined: {}", s_name);
         let prev_swap_state = std::mem::replace(&mut self.swap_state.process, SwapProcess::Idle);
+        // if !s_name.founder.is_any() {
+        //     self.update_app_data_founder(s_id, s_name.clone());
+        // }
         match prev_swap_state {
             SwapProcess::Joining(js_name) => {
                 if s_name != js_name {
@@ -358,6 +362,9 @@ impl ApplicationManager {
         None
     }
     pub fn get_swarm_id(&self, s_name: &SwarmName) -> Option<SwarmID> {
+        for name in self.name_to_id.keys() {
+            eprintln!("I know: {:?}", name);
+        }
         if let Some(s_state) = self.name_to_id.get(s_name) {
             Some(s_state.s_id)
         } else {

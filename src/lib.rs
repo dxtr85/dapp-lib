@@ -95,7 +95,9 @@ pub mod prelude {
     pub use gnome::prelude::GnomeId;
     pub use gnome::prelude::Nat;
     pub use gnome::prelude::NetworkSettings;
+    pub use gnome::prelude::Policy;
     pub use gnome::prelude::PortAllocationRule;
+    pub use gnome::prelude::Requirement;
     pub use gnome::prelude::SwarmID;
     pub use gnome::prelude::SwarmName;
     pub use gnome::prelude::SyncData;
@@ -103,6 +105,7 @@ pub mod prelude {
     pub use gnome::prelude::Transport;
 }
 
+#[derive(Debug)]
 pub enum ToApp {
     ActiveSwarm(SwarmName, SwarmID), //TODO: send Vec<Data> from CID=0(Manifest)
     Neighbors(SwarmID, Vec<GnomeId>),
@@ -122,6 +125,7 @@ pub enum ToApp {
     SearchQueries(Vec<(String, usize)>),
     SearchResults(String, Vec<Hit>),
     // SwitchToApp(AppType, SwarmID, SwarmName),
+    RunningPolicies(Vec<(Policy, Requirement)>),
     Quit,
 }
 
@@ -181,6 +185,7 @@ pub enum LibRequest {
     GetSearchResults(String),
     SetActiveApp(SwarmName),
     ProvidePublicIPs,
+    RunningPolicies(SwarmName),
 }
 #[derive(Debug)]
 pub enum LibResponse {
@@ -262,6 +267,8 @@ pub enum ToAppData {
     RunMemoryUseAudit(u8), //Request from Manager
     PartialAuditResult(u8, usize, ContentID, Vec<(ContentID, usize)>),
     PurgePagesFromMemory(usize, Vec<(ContentID, usize)>),
+    RunningPoliciesReq,
+    // RunningPolicies(Vec<(Policy, Requirement)>),
     Terminate,
 }
 struct PartialHashes {
@@ -1588,7 +1595,7 @@ async fn serve_app_manager(
                             // TODO: in swarm-consensus we need to add a timeout when waiting
                             // for neighboring Gnomes so that we are not stuck forever there
                             // TODO: Check SwarmSwap if there are other NewSwarms waiting to join
-                            app_mgr.swarm_joined(s_name.clone());
+                            app_mgr.swarm_joined(s_id, s_name.clone());
                             // TODO: make sure we are not running multiple timers
                             // for the same swarm
                             // TODO: first we have to make sure that given swarm is synced, and only after that should we run audit
@@ -1673,6 +1680,9 @@ async fn serve_app_manager(
                         //     eprintln!("dapp-lib got info about {} {} terminated", swarm_id, s_name);
                         //     to_app_mgr.send(ToAppMgr::SwarmTerminated(swarm_id, s_name));
                         // }
+                        FromGnomeManager::RunningPolicies(policies) => {
+                            let _ = to_user.send(ToApp::RunningPolicies(policies)).await;
+                        }
                         FromGnomeManager::Disconnected(s_ids) => {
                             eprintln!("AppMgr received Disconnected:");
                             for (s_id, s_name) in &s_ids {
@@ -2001,6 +2011,18 @@ async fn serve_app_manager(
                     let _ = to_gnome_mgr
                         .send(ToGnomeManager::JoinSwarm(s_name, None))
                         .await;
+                }
+                ToAppMgr::FromApp(LibRequest::RunningPolicies(s_name)) => {
+                    eprintln!("we need to implement asking Gnome for runing policies");
+                    if let Some(s_id) = app_mgr.get_swarm_id(&s_name) {
+                        // TODO
+                        let to_d_store = app_mgr.app_data_store.get(&s_id).unwrap();
+                        let _ = to_d_store.send(ToAppData::RunningPoliciesReq).await;
+                        // let _ = to_user.send(ToApp::RunningPolicies).await;
+                    } else {
+                        eprintln!("send anyway…");
+                        let _ = to_user.send(ToApp::RunningPolicies(vec![])).await;
+                    }
                 }
                 ToAppMgr::Quit => {
                     quit_application = true;
@@ -2953,6 +2975,12 @@ async fn serve_app_data(
                     .await;
                 eprintln!("{} Freed {} pages from memory", swarm_id, purged);
             }
+            ToAppData::RunningPoliciesReq => {
+                let _ = to_gnome_sender.send(ToGnome::RunningPolicies);
+            }
+            // ToAppData::RunningPolicies(policies)=> {
+            //     let _ = to_app_mgr_send.send(ToAppMgr::StartUnicast)
+            // }
             ToAppData::Terminate => {
                 // TODO: determine whether or not we want to store this Swarm on disk
                 // if store_on_disk {
