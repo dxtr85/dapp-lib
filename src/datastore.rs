@@ -20,8 +20,17 @@ pub enum Datastore {
 impl Datastore {
     // pub fn new(manifest: Manifest) -> Datastore {
     pub fn new(app_type: AppType) -> Datastore {
+        eprintln!("New Datastore: {:?}", app_type);
         let mut content_tree = ContentTree::empty(0);
         let _ = content_tree.append(Data::new(vec![app_type.byte()]).unwrap());
+        let content = Content::Data(DataType::Data(0), 1, content_tree);
+        Datastore::Filled(content)
+    }
+
+    pub fn empty() -> Datastore {
+        eprintln!("Empty Datastore");
+        let mut content_tree = ContentTree::empty(0);
+        let _ = content_tree.append(Data::empty(0));
         let content = Content::Data(DataType::Data(0), 1, content_tree);
         Datastore::Filled(content)
     }

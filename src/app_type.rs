@@ -19,6 +19,7 @@ impl AppType {
     pub fn from(byte: u8) -> Self {
         match byte {
             255 => Self::Catalog,
+            254 => Self::Forum,
             other => Self::Other(other),
         }
     }

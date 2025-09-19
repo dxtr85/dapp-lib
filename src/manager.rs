@@ -1,5 +1,6 @@
 use crate::content::ContentID;
 use crate::content::DataType;
+use crate::prelude::AppType;
 use crate::ToApp;
 use crate::ToAppMgr;
 use crate::{start_a_timer, TimeoutType};
@@ -19,13 +20,15 @@ use crate::ToAppData;
 #[derive(Clone, Copy)]
 pub struct SwarmState {
     pub s_id: SwarmID,
+    pub app_type: AppType,
     pub is_synced: bool,
     pub is_busy: bool,
 }
 impl SwarmState {
-    pub fn new(s_id: SwarmID, is_synced: bool, is_busy: bool) -> Self {
+    pub fn new(s_id: SwarmID, app_type: AppType, is_synced: bool, is_busy: bool) -> Self {
         SwarmState {
             s_id,
+            app_type,
             is_synced,
             is_busy,
         }
@@ -309,8 +312,28 @@ impl ApplicationManager {
         self.my_name = my_name.clone();
         self.swap_state.to_join.push(my_name);
     }
-    pub fn update_app_data_founder(&mut self, s_id: SwarmID, s_name: SwarmName) {
-        let s_state = SwarmState::new(s_id, false, true);
+    pub async fn update_app_data_founder(
+        &mut self,
+        s_id: SwarmID,
+        app_type: AppType,
+        s_name: SwarmName,
+    ) {
+        eprintln!("update_app_data_founder: {} ({:?})", s_name, app_type);
+        if s_name.founder.is_any() {
+            let new_name = self.get_name(s_id).unwrap();
+            if let Some(state) = self.name_to_id.get_mut(&new_name) {
+                eprintln!("{} new AppType: {:?}", s_id, app_type);
+                state.app_type = app_type;
+            }
+            return;
+        }
+        let s_state = if let Some(mut e_state) = self.name_to_id.remove(&s_name) {
+            e_state.s_id = s_id;
+            e_state.app_type = app_type;
+            e_state
+        } else {
+            SwarmState::new(s_id, app_type, false, true)
+        };
         self.name_to_id.insert(s_name.clone(), s_state);
         let empty = SwarmName {
             founder: GnomeId::any(),
@@ -321,18 +344,21 @@ impl ApplicationManager {
                 self.name_to_id.insert(empty, s_state);
             } else {
                 eprintln!("Removed generic gnome to swarm mapping from AppMgr");
+                let sender = self.app_data_store.get(&s_id).unwrap();
+                let _ = sender.send(ToAppData::MyName(s_name)).await;
+                eprintln!("known names: {:?}", self.name_to_id.keys());
             }
         }
     }
     pub fn swarm_joined(&mut self, s_id: SwarmID, s_name: SwarmName) {
-        // eprintln!("{s_id} SwarmJoined: {}", s_name);
+        eprintln!("{s_id} SwarmJoined: {}", s_name);
         let prev_swap_state = std::mem::replace(&mut self.swap_state.process, SwapProcess::Idle);
         // if !s_name.founder.is_any() {
         //     self.update_app_data_founder(s_id, s_name.clone());
         // }
         match prev_swap_state {
             SwapProcess::Joining(js_name) => {
-                if s_name != js_name {
+                if s_name != js_name && self.name_to_id.len() != 1 {
                     eprintln!("JS: Joined {}, expected {}", s_name, js_name);
                     self.swap_state.process = SwapProcess::Joining(js_name);
                 } else {
@@ -362,9 +388,9 @@ impl ApplicationManager {
         None
     }
     pub fn get_swarm_id(&self, s_name: &SwarmName) -> Option<SwarmID> {
-        for name in self.name_to_id.keys() {
-            eprintln!("I know: {:?}", name);
-        }
+        // for name in self.name_to_id.keys() {
+        //     eprintln!("I know: {:?}", name);
+        // }
         if let Some(s_state) = self.name_to_id.get(s_name) {
             Some(s_state.s_id)
         } else {
@@ -401,6 +427,7 @@ impl ApplicationManager {
     pub fn set_synced(&mut self, s_id: SwarmID) -> bool {
         for s_state in self.name_to_id.values_mut() {
             if s_state.s_id == s_id {
+                eprintln!("{} is now synced", s_id);
                 s_state.is_synced = true;
                 return s_state.is_synced && !s_state.is_busy && self.active_app_data.0 != s_id;
             }
@@ -685,21 +712,39 @@ impl ApplicationManager {
         }
         None
     }
-    pub fn add_app_data(&mut self, s_name: SwarmName, s_id: SwarmID, sender: Sender<ToAppData>) {
-        eprintln!("add_app_data {}", s_name);
+    pub fn add_app_data(
+        &mut self,
+        s_name: SwarmName,
+        s_id: SwarmID,
+        app_type: Option<AppType>,
+        sender: Sender<ToAppData>,
+    ) {
+        eprintln!("add_app_data {}, {:?}", s_name, app_type);
         if self.app_data_store.is_empty() {
             eprintln!("add_app_data empty");
             self.active_app_data = (s_id, sender.clone());
         }
+        let app_type = if let Some(a_type) = app_type {
+            a_type
+        } else {
+            AppType::Other(0)
+        };
         self.name_to_id
-            .insert(s_name, SwarmState::new(s_id, false, true));
+            .insert(s_name, SwarmState::new(s_id, app_type, false, true));
+        for val in self.name_to_id.values() {
+            eprintln!("n2id {} {:?}", val.s_id, val.app_type);
+        }
         self.app_data_store.insert(s_id, sender);
     }
-    pub fn get_mapping(&self) -> HashMap<SwarmName, SwarmID> {
+    pub fn get_mapping(&self) -> HashMap<SwarmName, (SwarmID, AppType)> {
+        eprintln!("In get_mapping");
         let mut mapping = HashMap::new();
         for (s_name, s_state) in self.name_to_id.iter() {
             if s_state.is_synced {
-                mapping.insert(s_name.clone(), s_state.s_id);
+                eprintln!("get_mapping incl: {} {:?}", s_name, s_state.app_type);
+                mapping.insert(s_name.clone(), (s_state.s_id, s_state.app_type));
+            } else {
+                eprintln!("get_mapping excl: {} {:?}", s_name, s_state.app_type);
             }
         }
         mapping
