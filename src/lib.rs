@@ -90,6 +90,7 @@ pub mod prelude {
     pub use crate::LibRequest;
     pub use crate::ToApp;
     pub use gnome::prelude::sha_hash;
+    pub use gnome::prelude::ByteSet;
     pub use gnome::prelude::Capabilities;
     pub use gnome::prelude::CastData;
     pub use gnome::prelude::CastID;
@@ -127,6 +128,8 @@ pub enum ToApp {
     SearchResults(String, Vec<Hit>),
     // SwitchToApp(AppType, SwarmID, SwarmName),
     RunningPolicies(Vec<(Policy, Requirement)>),
+    RunningCapabilities(Vec<(Capabilities, Vec<GnomeId>)>),
+    RunningByteSets(Vec<(u8, ByteSet)>),
     Quit,
 }
 
@@ -187,7 +190,10 @@ pub enum LibRequest {
     SetActiveApp(SwarmName),
     ProvidePublicIPs,
     RunningPolicies(SwarmName),
+    RunningCapabilities(SwarmName),
+    RunningByteSets(SwarmName),
     SetRunningPolicy(SwarmName, Policy, Requirement),
+    SetRunningCapability(SwarmName, Capabilities, Vec<GnomeId>),
 }
 #[derive(Debug)]
 pub enum LibResponse {
@@ -272,6 +278,8 @@ pub enum ToAppData {
     PartialAuditResult(u8, usize, ContentID, Vec<(ContentID, usize)>),
     PurgePagesFromMemory(usize, Vec<(ContentID, usize)>),
     RunningPoliciesReq,
+    RunningCapabilitiesReq,
+    RunningByteSetsReq,
     MyName(SwarmName),
     Terminate,
 }
@@ -689,6 +697,11 @@ async fn serve_app_manager(
                 ToAppMgr::FromApp(LibRequest::SetRunningPolicy(s_name, pol, req)) => {
                     let _ = to_gnome_mgr
                         .send(ToGnomeManager::SetRunningPolicy(s_name, pol, req))
+                        .await;
+                }
+                ToAppMgr::FromApp(LibRequest::SetRunningCapability(s_name, cap, v_gids)) => {
+                    let _ = to_gnome_mgr
+                        .send(ToGnomeManager::SetRunningCapability(s_name, cap, v_gids))
                         .await;
                 }
                 // ToAppMgr::FromSearch(LibRequest::ReadAllFirstPages(s_id)) => {
@@ -1718,6 +1731,12 @@ async fn serve_app_manager(
                         FromGnomeManager::RunningPolicies(policies) => {
                             let _ = to_user.send(ToApp::RunningPolicies(policies)).await;
                         }
+                        FromGnomeManager::RunningCapabilities(caps) => {
+                            let _ = to_user.send(ToApp::RunningCapabilities(caps)).await;
+                        }
+                        FromGnomeManager::RunningByteSets(bsets) => {
+                            let _ = to_user.send(ToApp::RunningByteSets(bsets)).await;
+                        }
                         FromGnomeManager::Disconnected(s_ids) => {
                             eprintln!("AppMgr received Disconnected:");
                             for (s_id, s_name) in &s_ids {
@@ -2064,6 +2083,28 @@ async fn serve_app_manager(
                     } else {
                         eprintln!("send anyway…");
                         let _ = to_user.send(ToApp::RunningPolicies(vec![])).await;
+                    }
+                }
+                ToAppMgr::FromApp(LibRequest::RunningCapabilities(s_name)) => {
+                    if let Some(s_id) = app_mgr.get_swarm_id(&s_name) {
+                        // TODO
+                        let to_d_store = app_mgr.app_data_store.get(&s_id).unwrap();
+                        let _ = to_d_store.send(ToAppData::RunningCapabilitiesReq).await;
+                        // let _ = to_user.send(ToApp::RunningPolicies).await;
+                    } else {
+                        eprintln!("send anyway…");
+                        let _ = to_user.send(ToApp::RunningCapabilities(vec![])).await;
+                    }
+                }
+                ToAppMgr::FromApp(LibRequest::RunningByteSets(s_name)) => {
+                    if let Some(s_id) = app_mgr.get_swarm_id(&s_name) {
+                        // TODO
+                        let to_d_store = app_mgr.app_data_store.get(&s_id).unwrap();
+                        let _ = to_d_store.send(ToAppData::RunningByteSetsReq).await;
+                        // let _ = to_user.send(ToApp::RunningPolicies).await;
+                    } else {
+                        eprintln!("send anyway…");
+                        let _ = to_user.send(ToApp::RunningByteSets(vec![])).await;
                     }
                 }
                 ToAppMgr::Quit => {
@@ -3021,9 +3062,12 @@ async fn serve_app_data(
             ToAppData::RunningPoliciesReq => {
                 let _ = to_gnome_sender.send(ToGnome::RunningPolicies);
             }
-            // ToAppData::RunningPolicies(policies)=> {
-            //     let _ = to_app_mgr_send.send(ToAppMgr::StartUnicast)
-            // }
+            ToAppData::RunningCapabilitiesReq => {
+                let _ = to_gnome_sender.send(ToGnome::RunningCapabilities);
+            }
+            ToAppData::RunningByteSetsReq => {
+                let _ = to_gnome_sender.send(ToGnome::RunningByteSets);
+            }
             ToAppData::Terminate => {
                 // TODO: determine whether or not we want to store this Swarm on disk
                 // if store_on_disk {
