@@ -194,6 +194,7 @@ pub enum LibRequest {
     RunningByteSets(SwarmName),
     SetRunningPolicy(SwarmName, Policy, Requirement),
     SetRunningCapability(SwarmName, Capabilities, Vec<GnomeId>),
+    SetRunningByteSet(SwarmName, u8, ByteSet),
 }
 #[derive(Debug)]
 pub enum LibResponse {
@@ -702,6 +703,11 @@ async fn serve_app_manager(
                 ToAppMgr::FromApp(LibRequest::SetRunningCapability(s_name, cap, v_gids)) => {
                     let _ = to_gnome_mgr
                         .send(ToGnomeManager::SetRunningCapability(s_name, cap, v_gids))
+                        .await;
+                }
+                ToAppMgr::FromApp(LibRequest::SetRunningByteSet(s_name, b_id, bset)) => {
+                    let _ = to_gnome_mgr
+                        .send(ToGnomeManager::SetRunningByteSet(s_name, b_id, bset))
                         .await;
                 }
                 // ToAppMgr::FromSearch(LibRequest::ReadAllFirstPages(s_id)) => {
