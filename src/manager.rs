@@ -20,12 +20,12 @@ use crate::ToAppData;
 #[derive(Clone, Copy)]
 pub struct SwarmState {
     pub s_id: SwarmID,
-    pub app_type: AppType,
+    pub app_type: Option<AppType>,
     pub is_synced: bool,
     pub is_busy: bool,
 }
 impl SwarmState {
-    pub fn new(s_id: SwarmID, app_type: AppType, is_synced: bool, is_busy: bool) -> Self {
+    pub fn new(s_id: SwarmID, app_type: Option<AppType>, is_synced: bool, is_busy: bool) -> Self {
         SwarmState {
             s_id,
             app_type,
@@ -315,11 +315,11 @@ impl ApplicationManager {
     pub async fn update_app_data_founder(
         &mut self,
         s_id: SwarmID,
-        app_type: AppType,
+        app_type: Option<AppType>,
         s_name: SwarmName,
     ) {
         eprintln!("update_app_data_founder: {} ({:?})", s_name, app_type);
-        if s_name.founder.is_any() {
+        if s_name.founder.is_any() && app_type.is_some() {
             let new_name = self.get_name(s_id).unwrap();
             if let Some(state) = self.name_to_id.get_mut(&new_name) {
                 eprintln!("{} new AppType: {:?}", s_id, app_type);
@@ -465,6 +465,15 @@ impl ApplicationManager {
         if self.active_founder_any() {
             if let Some(s_name) = self.get_name(s_id) {
                 eprintln!("His name: {} my_name: {}", s_name, self.my_name);
+                if let Some(s_state) = self.get_swarm_state(&s_name) {
+                    if s_state.app_type.is_none() {
+                        if let Some(sender) = self.app_data_store.get(&s_id) {
+                            let _ = sender
+                                .send(ToAppData::ReadPagesRange(crate::Requestor::App, 0, 0, 0))
+                                .await;
+                        }
+                    }
+                }
                 if s_name == self.my_name {
                     if let Ok(s_id) = self.set_active(&s_name) {
                         let _ = self.to_user.send(ToApp::ActiveSwarm(s_name, s_id)).await;
@@ -724,11 +733,11 @@ impl ApplicationManager {
             eprintln!("add_app_data empty");
             self.active_app_data = (s_id, sender.clone());
         }
-        let app_type = if let Some(a_type) = app_type {
-            a_type
-        } else {
-            AppType::Other(0)
-        };
+        // let app_type = if let Some(a_type) = app_type {
+        //     a_type
+        // } else {
+        //     AppType::Other(0)
+        // };
         self.name_to_id
             .insert(s_name, SwarmState::new(s_id, app_type, false, true));
         for val in self.name_to_id.values() {
@@ -736,7 +745,7 @@ impl ApplicationManager {
         }
         self.app_data_store.insert(s_id, sender);
     }
-    pub fn get_mapping(&self) -> HashMap<SwarmName, (SwarmID, AppType)> {
+    pub fn get_mapping(&self) -> HashMap<SwarmName, (SwarmID, Option<AppType>)> {
         eprintln!("In get_mapping");
         let mut mapping = HashMap::new();
         for (s_name, s_state) in self.name_to_id.iter() {

@@ -121,7 +121,7 @@ pub enum ToApp {
     FirstPages(SwarmID, Vec<(ContentID, DataType, Data)>),
     // MyPublicIPs(Vec<(IpAddr, u16, Nat, (PortAllocationRule, i8))>),
     MyPublicIPs(Vec<NetworkSettings>),
-    NameToIDMapping(HashMap<SwarmName, (SwarmID, AppType)>),
+    NameToIDMapping(HashMap<SwarmName, (SwarmID, Option<AppType>)>),
     AllNeighborsGone,
     Disconnected(bool, SwarmID, SwarmName), //bool indicates if we try to reconnect
     SearchQueries(Vec<(String, usize)>),
@@ -198,7 +198,7 @@ pub enum LibRequest {
 }
 #[derive(Debug)]
 pub enum LibResponse {
-    AppType(SwarmID, SwarmName, AppType),
+    AppType(SwarmID, SwarmName, Option<AppType>),
     SwarmSynced(SwarmID),
     SwarmSyncedExt(SwarmID, SwarmName, u64, ASender<ToAppData>),
     FirstPages(SwarmID, Vec<(ContentID, DataType, Data)>),
@@ -231,11 +231,12 @@ pub enum TimeoutType {
 pub enum Requestor {
     App,
     Search,
+    // Manager,
 }
 
 #[derive(Debug)]
 pub enum ToAppData {
-    AppType,
+    // AppType,
     Response(GnomeToApp),
     ReadAllPages(Requestor, ContentID),
     ReadPagesRange(Requestor, ContentID, u16, u16),
@@ -788,6 +789,26 @@ async fn serve_app_manager(
                             eprintln!("ReadSuccess with empty data: {}", data.get_hash());
                         }
                     }
+                    if app_mgr
+                        .get_swarm_state(&s_name)
+                        .is_some_and(|s| s.app_type.is_none())
+                        && chunk_no == 0
+                        && !data_vec.is_empty()
+                        && !data_vec[0].is_empty()
+                    {
+                        // if
+                        // // s_state.app_type.is_none() &&
+                        // chunk_no == 0 && !data_vec.is_empty() {
+                        // if !data_vec[0].is_empty() {
+                        let app_type = AppType::from(data_vec[0].first_byte());
+                        // s_state.app_type = Some(app_type);
+                        app_mgr
+                            .update_app_data_founder(s_id, Some(app_type), s_name.clone())
+                            .await;
+                        eprintln!("{s_id} Updated AppType: {app_type:?}");
+                        //     }
+                        // }
+                    }
                     if chunk_no == 0 && !is_last {
                         // if let Some((cc_sid, cc_cid, _dt)) =
                         // app_mgr.update_pending_read(s_id, c_id, dtype)
@@ -849,6 +870,9 @@ async fn serve_app_manager(
                     if let Ok(s_id) = app_mgr.set_active(&swarm_name) {
                         let _ = to_user.send(ToApp::ActiveSwarm(swarm_name, s_id)).await;
                     } else {
+                        let curr_id = app_mgr.active_app_data.0;
+                        let curr_swarm = app_mgr.get_name(curr_id).unwrap();
+                        let _ = to_user.send(ToApp::ActiveSwarm(curr_swarm, curr_id)).await;
                         eprintln!("Trying to join {}…", swarm_name);
                         //TODO: we should try to join requested swarm
                         // by searching for it in neighboring_swarms
@@ -1039,7 +1063,7 @@ async fn serve_app_manager(
                             let _ = to_app_data
                                 .send(ToAppData::ReadAllPages(Requestor::App, c_id))
                                 .await;
-                            let _ = to_app_data.send(ToAppData::AppType).await;
+                            // let _ = to_app_data.send(ToAppData::AppType).await;
                         }
                     }
                 }
@@ -1075,6 +1099,15 @@ async fn serve_app_manager(
                 }
                 ToAppMgr::FromDatastore(LibResponse::AppType(s_id, s_name, app_type)) => {
                     eprintln!("update 1");
+                    if app_type.is_none() {
+                        eprintln!("TODO:We should discover AppType from Manifest");
+                        if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
+                            //TODO
+                            let _ = sender
+                                .send(ToAppData::ReadPagesRange(Requestor::App, 0, 0, 0))
+                                .await;
+                        }
+                    }
                     app_mgr
                         .update_app_data_founder(s_id, app_type, s_name)
                         .await;
@@ -1355,7 +1388,7 @@ async fn serve_app_manager(
                             // We set a default AppType, and when response
                             // comes, we update it.
                             app_mgr
-                                .update_app_data_founder(swarm_id, AppType::Catalog, s_name)
+                                .update_app_data_founder(swarm_id, Some(AppType::Catalog), s_name)
                                 .await;
 
                             // This is in order to trigger initial home swarm activation
@@ -1684,11 +1717,7 @@ async fn serve_app_manager(
                                 app_type,
                                 to_app_data_send.clone(),
                             );
-                            let app_data = if let Some(a_type) = app_type {
-                                ApplicationData::new(a_type)
-                            } else {
-                                ApplicationData::empty()
-                            };
+                            let app_data = ApplicationData::new(app_type);
                             spawn(serve_app_data(
                                 config.storage.clone(),
                                 max_pages_in_memory,
@@ -1706,30 +1735,8 @@ async fn serve_app_manager(
                                 from_swarm,
                                 to_app_data_send.clone(),
                             ));
-                            // TODO: move following after we are sure to have
-                            // some neighbors in new swarm
-                            //
-                            // if let Some((expected_name, swarm_to_drop)) =
-                            //     swarm_swap.leave_when_joined.take()
-                            // {
-                            //     if expected_name == s_name {
-                            //         swarm_swap.is_leaving_a_swarm = Some(swarm_to_drop.clone());
-                            //         let _ = to_gnome_mgr
-                            //             .send(ToGnomeManager::LeaveSwarm(swarm_to_drop.1))
-                            //             .await;
-                            //         let _ = to_user
-                            //             .send(ToApp::Disconnected(
-                            //                 false,
-                            //                 swarm_to_drop.1,
-                            //                 swarm_to_drop.0,
-                            //             ))
-                            //             .await;
-                            //     } else {
-                            //         swarm_swap.leave_when_joined =
-                            //             Some((expected_name, swarm_to_drop));
-                            //     }
-                            // }
                         }
+
                         // FromGnomeManager::SwarmTerminated(swarm_id, s_name) => {
                         //     eprintln!("dapp-lib got info about {} {} terminated", swarm_id, s_name);
                         //     to_app_mgr.send(ToAppMgr::SwarmTerminated(swarm_id, s_name));
@@ -2224,14 +2231,14 @@ async fn serve_app_data(
     while let Ok(resp) = app_data_recv.recv().await {
         match resp {
             // TODO: We should always assume to be out of sync
-            ToAppData::AppType => {
-                let _ = to_app_mgr_send
-                    .send(ToAppMgr::FromDatastore(
-                        // requestor,
-                        LibResponse::AppType(swarm_id, swarm_name.clone(), app_data.app_type),
-                    ))
-                    .await;
-            }
+            // ToAppData::AppType => {
+            //     let _ = to_app_mgr_send
+            //         .send(ToAppMgr::FromDatastore(
+            //             // requestor,
+            //             LibResponse::AppType(swarm_id, swarm_name.clone(), app_data.app_type),
+            //         ))
+            //         .await;
+            // }
             ToAppData::MyName(s_name) => swarm_name = s_name,
             ToAppData::SwarmReady(s_name, am_i_founder) => {
                 i_am_founder = am_i_founder;
@@ -2286,6 +2293,7 @@ async fn serve_app_data(
 
                 let _ = to_gnome_sender.send(ToGnome::AskData(
                     GnomeId::any(),
+                    None,
                     NeighborRequest::Custom(
                         0,
                         CastData::new(serialize_requests(sync_requests)).unwrap(),
@@ -2904,6 +2912,7 @@ async fn serve_app_data(
                         to_gnome_sender
                             .send(ToGnome::AskData(
                                 GnomeId::any(),
+                                None,
                                 NeighborRequest::Custom(
                                     0,
                                     CastData::new(serialize_requests(vec![sync_request])).unwrap(),
@@ -2940,6 +2949,7 @@ async fn serve_app_data(
                             to_gnome_sender
                                 .send(ToGnome::AskData(
                                     GnomeId::any(),
+                                    None,
                                     NeighborRequest::Custom(
                                         0,
                                         CastData::new(serialize_requests(vec![sync_request]))
@@ -2956,6 +2966,7 @@ async fn serve_app_data(
                             to_gnome_sender
                                 .send(ToGnome::AskData(
                                     GnomeId::any(),
+                                    None,
                                     NeighborRequest::Custom(
                                         0,
                                         CastData::new(serialize_requests(vec![sync_request]))
@@ -2979,6 +2990,7 @@ async fn serve_app_data(
                     let sync_requests: Vec<SyncRequest> = vec![SyncRequest::Datastore];
                     let _ = to_gnome_sender.send(ToGnome::AskData(
                         GnomeId::any(),
+                        None,
                         NeighborRequest::Custom(
                             0,
                             CastData::new(serialize_requests(sync_requests)).unwrap(),
@@ -3213,6 +3225,7 @@ fn request_content_from_any_neighbor(
     hashes: bool,
     // first_page: bool,
     all_pages: bool,
+    exclude: Option<GnomeId>,
     to_gnome_sender: Sender<ToGnome>,
 ) {
     eprintln!(
@@ -3231,6 +3244,7 @@ fn request_content_from_any_neighbor(
     }
     let _ = to_gnome_sender.send(ToGnome::AskData(
         GnomeId::any(),
+        exclude,
         NeighborRequest::Custom(0, CastData::new(serialize_requests(sync_requests)).unwrap()),
     ));
 }
@@ -3421,7 +3435,7 @@ fn parse_cast(cast_data: CastData) -> Result<AppMessage, Data> {
     }
 }
 pub struct ApplicationData {
-    app_type: AppType,
+    // app_type: Option<AppType>,
     change_reg: ChangeRegistry,
     contents: Datastore,
     hash_to_temp_idx: HashMap<u64, u16>,
@@ -3495,11 +3509,16 @@ impl ApplicationData {
         unloaded_so_far
     }
 
-    pub fn new(app_type: AppType) -> Self {
+    pub fn new(app_type: Option<AppType>) -> Self {
+        let contents = if let Some(at) = &app_type {
+            Datastore::new(*at)
+        } else {
+            Datastore::empty()
+        };
         ApplicationData {
-            app_type,
+            // app_type,
             change_reg: ChangeRegistry::new(),
-            contents: Datastore::new(app_type),
+            contents,
             hash_to_temp_idx: HashMap::new(),
             partial_data: HashMap::new(),
             disk_root_hash: 0,
@@ -3507,7 +3526,7 @@ impl ApplicationData {
     }
     pub fn empty() -> Self {
         ApplicationData {
-            app_type: AppType::Other(0),
+            // app_type: None,
             change_reg: ChangeRegistry::new(),
             contents: Datastore::empty(),
             hash_to_temp_idx: HashMap::new(),
@@ -3750,6 +3769,9 @@ impl ApplicationData {
         data: Data,
     ) -> Result<Data, AppError> {
         self.change_reg.insert(c_id);
+        // if self.app_type == AppType::Other(0) && c_id == 0 && d_id == 0 {
+        //     eprintln!("Maybe we should update AppType?");
+        // }
         self.contents.update_data((c_id, d_id), data)
     }
     pub fn remove_data(&mut self, c_id: ContentID, d_id: u16) -> Result<Data, AppError> {
@@ -4113,19 +4135,19 @@ impl ApplicationData {
             }
         }
     } // TODO: design application level interface
-    fn update_app_type(&mut self) -> bool {
-        if let Ok(mut manif_pages) = self.get_data_range(0, 0, 0) {
-            let first_page = manif_pages.remove(0);
-            if first_page.is_empty() {
-                false
-            } else {
-                self.app_type = AppType::from(first_page.first_byte());
-                true
-            }
-        } else {
-            false
-        }
-    }
+      // fn update_app_type(&mut self) -> bool {
+      //     if let Ok(mut manif_pages) = self.get_data_range(0, 0, 0) {
+      //         let first_page = manif_pages.remove(0);
+      //         if first_page.is_empty() {
+      //             false
+      //         } else {
+      //             self.app_type = Some(AppType::from(first_page.first_byte()));
+      //             true
+      //         }
+      //     } else {
+      //         false
+      //     }
+      // }
 }
 fn get_root_hash(hashes: &Vec<u64>) -> u64 {
     let h_len = hashes.len();
@@ -5529,6 +5551,7 @@ async fn custom_response_task(
                                             curr_cid,
                                             true,
                                             true,
+                                            None,
                                             to_gnome_sender.clone(),
                                         );
                                         let _ = to_app_mgr_send
@@ -5576,6 +5599,7 @@ async fn custom_response_task(
                                         curr_cid,
                                         true,
                                         true,
+                                        Some(_neighbor_id),
                                         to_gnome_sender.clone(),
                                     );
                                     let _ = to_app_mgr_send
@@ -5602,6 +5626,7 @@ async fn custom_response_task(
                                     curr_cid,
                                     true,
                                     true,
+                                    None,
                                     to_gnome_sender.clone(),
                                 );
                                 let _ = to_app_mgr_send
@@ -5625,6 +5650,7 @@ async fn custom_response_task(
                                 curr_cid,
                                 true,
                                 true,
+                                None,
                                 to_gnome_sender.clone(),
                             );
                             let _ = to_app_mgr_send
@@ -5638,11 +5664,11 @@ async fn custom_response_task(
                         }
                         curr_cid += 1;
                     }
-                    if app_data.update_app_type() {
-                        eprintln!("{} AppType is now: {:?}", swarm_name, app_data.app_type);
-                    } else {
-                        eprintln!("Could not update AppType after hash sync");
-                    }
+                    // if app_data.update_app_type() {
+                    //     eprintln!("{} AppType is now: {:?}", swarm_name, app_data.app_type);
+                    // } else {
+                    //     eprintln!("Could not update AppType after hash sync");
+                    // }
                     eprintln!(
                         "{} Memory: {}/{} Pages (not fully implemented)",
                         swarm_id,
@@ -5655,24 +5681,25 @@ async fn custom_response_task(
                             LibResponse::SwarmSynced(swarm_id),
                         ))
                         .await;
-                    if app_data.app_type.is_catalog() {
-                        let max_cid = if let Some(c_id) = app_data.next_c_id() {
-                            c_id - 1
-                        } else {
-                            u16::MAX
-                        };
-                        let s_link = SwarmLink {
-                            s_name: swarm_name.clone(),
-                            max_cid,
-                            sender: app_data_send.clone(),
-                            root_hash: app_data.root_hash(),
-                            s_descr: String::new(),
-                            s_tags: HashMap::new(),
-                        };
-                        let _ = to_search_enigne
-                            .send(SearchMsg::SwarmSynced(swarm_id, s_link))
-                            .await;
-                    }
+                    // if app_data.app_type.is_some_and(|at| at.is_catalog()) {
+                    let max_cid = if let Some(c_id) = app_data.next_c_id() {
+                        c_id - 1
+                    } else {
+                        u16::MAX
+                    };
+                    let s_link = SwarmLink {
+                        s_name: swarm_name.clone(),
+                        app_type: None,
+                        max_cid,
+                        sender: app_data_send.clone(),
+                        root_hash: app_data.root_hash(),
+                        s_descr: String::new(),
+                        s_tags: HashMap::new(),
+                    };
+                    let _ = to_search_enigne
+                        .send(SearchMsg::SwarmSynced(swarm_id, s_link))
+                        .await;
+                    // }
                 } else {
                     eprintln!("Datastore is synced, why sent this?");
                 }
@@ -5829,25 +5856,25 @@ async fn custom_response_task(
                                     ))
                                     .await;
                                 eprintln!("C-{} Page #{} update result: ok", c_id, page_no,);
-                                if c_id == 0 {
-                                    let updated = app_data.update_app_type();
-                                    if updated {
-                                        eprintln!(
-                                            "{} Updated AppType: {:?}",
-                                            swarm_id, app_data.app_type
-                                        );
-                                        let _ = to_app_mgr_send
-                                            .send(ToAppMgr::FromDatastore(
-                                                // requestor,
-                                                LibResponse::AppType(
-                                                    swarm_id,
-                                                    swarm_name.clone(),
-                                                    app_data.app_type,
-                                                ),
-                                            ))
-                                            .await;
-                                    }
-                                }
+                                // if c_id == 0 {
+                                //     let updated = app_data.update_app_type();
+                                //     if updated {
+                                //         eprintln!(
+                                //             "{} Updated AppType: {:?}",
+                                //             swarm_id, app_data.app_type
+                                //         );
+                                //         let _ = to_app_mgr_send
+                                //             .send(ToAppMgr::FromDatastore(
+                                //                 // requestor,
+                                //                 LibResponse::AppType(
+                                //                     swarm_id,
+                                //                     swarm_name.clone(),
+                                //                     app_data.app_type,
+                                //                 ),
+                                //             ))
+                                //             .await;
+                                //     }
+                                // }
                             } else {
                                 eprintln!(
                                     "CID-{} hashes: {:?}",
@@ -6090,6 +6117,7 @@ async fn read_data_task(
                         vec![SyncRequest::Pages(c_id, d_type, dmc.to_vec())];
                     let _ = to_gnome_sender.send(ToGnome::AskData(
                         GnomeId::any(),
+                        None,
                         NeighborRequest::Custom(
                             0,
                             CastData::new(serialize_requests(sync_requests)).unwrap(),
@@ -6101,6 +6129,7 @@ async fn read_data_task(
                         vec![SyncRequest::Pages(c_id, d_type, rmd.to_vec())];
                     let _ = to_gnome_sender.send(ToGnome::AskData(
                         GnomeId::any(),
+                        None,
                         NeighborRequest::Custom(
                             0,
                             CastData::new(serialize_requests(sync_requests)).unwrap(),
@@ -6178,6 +6207,7 @@ async fn read_data_task(
             let sync_requests: Vec<SyncRequest> = vec![SyncRequest::AllPages(vec![c_id])];
             let _ = to_gnome_sender.send(ToGnome::AskData(
                 GnomeId::any(),
+                None,
                 NeighborRequest::Custom(
                     0,
                     CastData::new(serialize_requests(sync_requests)).unwrap(),

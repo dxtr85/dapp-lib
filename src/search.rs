@@ -3,6 +3,7 @@ use crate::manifest::Manifest;
 use crate::manifest::Tag;
 use crate::prelude::read_tags_and_header;
 use crate::prelude::AppError;
+use crate::prelude::AppType;
 use crate::prelude::DataType;
 use crate::ContentID;
 use crate::Data;
@@ -55,6 +56,7 @@ use gnome::prelude::SwarmID;
 #[derive(Debug)]
 pub struct SwarmLink {
     pub s_name: SwarmName,
+    pub app_type: Option<AppType>,
     pub max_cid: ContentID,
     pub sender: Sender<ToAppData>,
     pub root_hash: u64,
@@ -211,6 +213,7 @@ impl Engine {
             let anything_added = self.iter_queries(&s_name, c_id, &phrase);
             if let Some(s_link) = self.swarm_links.get_mut(&s_id) {
                 s_link.s_descr = manif.description;
+                s_link.app_type = Some(manif.app_type);
                 s_link.s_tags = manif.tags;
                 if self.queries.is_empty() {
                     return;

@@ -180,7 +180,8 @@ impl Manifest {
     }
 
     pub fn set_description(&mut self, text: String) -> bool {
-        if text.len() > 1022 {
+        // TODO: count how many bytes we have left
+        if text.len() > 1000 {
             return false;
         }
         self.description = text;
@@ -629,6 +630,7 @@ impl Manifest {
     }
 
     pub fn to_data(&self) -> Vec<Data> {
+        eprintln!("{:?} Manifest to_data", self.app_type);
         let mut res = Vec::with_capacity(1024);
         res.push(self.app_type.byte());
         let tags_len = self.tags.len() as u16;
