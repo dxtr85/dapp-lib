@@ -151,7 +151,7 @@ impl Engine {
                     eprintln!("Requesting all first pages for: {}", s_id);
                     let _ = s_link
                         .sender
-                        .send(ToAppData::ReadAllFirstPages(Requestor::Search))
+                        .send(ToAppData::ReadAllFirstPages(Requestor::Search, None))
                         .await;
 
                     break;
@@ -232,7 +232,7 @@ impl Engine {
                     eprintln!("2 Requesting all first pages for: {}", s_id);
                     let _ = s_link
                         .sender
-                        .send(ToAppData::ReadAllFirstPages(Requestor::Search))
+                        .send(ToAppData::ReadAllFirstPages(Requestor::Search, None))
                         .await;
                 } else {
                     self.state.enqueue_swarm(s_id);
@@ -350,7 +350,7 @@ impl Engine {
                         eprintln!("3 Requesting all first pages for: {}", s_id);
                         let _ = s_link
                             .sender
-                            .send(ToAppData::ReadAllFirstPages(Requestor::Search))
+                            .send(ToAppData::ReadAllFirstPages(Requestor::Search, None))
                             .await;
                         break;
                     } else {

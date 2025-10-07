@@ -159,10 +159,11 @@ pub async fn store_data_on_disk(
     policy: StoragePolicy,
 ) {
     if matches!(policy, StoragePolicy::Discard) {
+        eprintln!("STORAGE: Not writing to disk: Discard Policy");
         return;
     }
     if app_data.disk_root_hash == app_data.root_hash() {
-        eprintln!("Not writing to disk: all synced");
+        eprintln!("STORAGE: Not writing to disk: all synced");
         return;
     }
     let dsync_store = s_storage.join("datastore.sync");
@@ -195,6 +196,7 @@ pub async fn store_data_on_disk(
             .await;
         }
     }
+    eprintln!("STORAGE: Done writing Contents to Disk");
     // if matches!(policy, StoragePolicy::Datastore) {
     //     // Do nothing more
     // } else if let StoragePolicy::SelectMainPages(selection) = policy {

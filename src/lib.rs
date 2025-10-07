@@ -114,7 +114,7 @@ pub enum ToApp {
     NeighborLeft(SwarmID, GnomeId),
     NewContent(SwarmID, ContentID, DataType, Data),
     ContentChanged(SwarmID, ContentID, DataType, Option<Data>),
-    ReadSuccess(SwarmID, SwarmName, ContentID, DataType, Vec<Data>),
+    ReadSuccess(SwarmID, SwarmName, ContentID, DataType, u16, Vec<Data>),
     ReadError(SwarmID, ContentID, AppError),
     ReadInProgress(SwarmID, ContentID),
     GetCIDsForTags(SwarmID, GnomeId, Vec<u8>, Vec<(ContentID, Data)>),
@@ -182,7 +182,7 @@ pub enum LibRequest {
     ReadPagesRange(SwarmID, ContentID, u16, u16),
     CancelRead(SwarmID, ContentID, DataType),
     ReadDataGlobal(SwarmName, ContentID),
-    ReadAllFirstPages(SwarmID),
+    ReadFirstPages(SwarmID, Option<(ContentID, ContentID)>),
     Search(String),
     RemoveSearch(String),
     ListSearches,
@@ -244,7 +244,7 @@ pub enum ToAppData {
     ReadCancel(ContentID),
     ReadRefresh(Vec<(ContentID, DataType)>),
     SendFirstPage(GnomeId, ContentID, Data),
-    ReadAllFirstPages(Requestor),
+    ReadAllFirstPages(Requestor, Option<(ContentID, ContentID)>),
     BroadcastSend(CastID, CastData),
     MulticastSend(CastID, CastData),
     StartUnicast,
@@ -686,10 +686,10 @@ async fn serve_app_manager(
                         //TODO: read from storage or request join
                     }
                 }
-                ToAppMgr::FromApp(LibRequest::ReadAllFirstPages(s_id)) => {
+                ToAppMgr::FromApp(LibRequest::ReadFirstPages(s_id, range_opt)) => {
                     if let Some(to_app_data) = app_mgr.app_data_store.get(&s_id) {
                         let _ = to_app_data
-                            .send(ToAppData::ReadAllFirstPages(Requestor::App))
+                            .send(ToAppData::ReadAllFirstPages(Requestor::App, range_opt))
                             .await;
                     }
                 }
@@ -780,7 +780,7 @@ async fn serve_app_manager(
                     s_name,
                     c_id,
                     dtype,
-                    chunk_no,
+                    starting_page,
                     is_last,
                     data_vec,
                 )) => {
@@ -792,7 +792,8 @@ async fn serve_app_manager(
                     if app_mgr
                         .get_swarm_state(&s_name)
                         .is_some_and(|s| s.app_type.is_none())
-                        && chunk_no == 0
+                        && c_id == 0
+                        && starting_page == 0
                         && !data_vec.is_empty()
                         && !data_vec[0].is_empty()
                     {
@@ -809,7 +810,8 @@ async fn serve_app_manager(
                         //     }
                         // }
                     }
-                    if chunk_no == 0 && !is_last {
+                    if !is_last {
+                        // if starting_page == 0 && !is_last {
                         // if let Some((cc_sid, cc_cid, _dt)) =
                         // app_mgr.update_pending_read(s_id, c_id, dtype)
                         app_mgr.add_read(s_id, c_id, dtype)
@@ -818,12 +820,18 @@ async fn serve_app_manager(
                         //         let _ = to_app_data.send(ToAppData::ReadCancel(cc_cid)).await;
                         //     }
                         // }
-                    }
-                    if is_last {
+                    } else {
                         app_mgr.remove_read(s_id, c_id, dtype);
                     }
                     let _ = to_user
-                        .send(ToApp::ReadSuccess(s_id, s_name, c_id, dtype, data_vec))
+                        .send(ToApp::ReadSuccess(
+                            s_id,
+                            s_name,
+                            c_id,
+                            dtype,
+                            starting_page,
+                            data_vec,
+                        ))
                         .await;
                     //     }
                     //     Requestor::Search => {
@@ -2754,22 +2762,37 @@ async fn serve_app_data(
                     eprintln!("SFP Main page of {} sent successfully.", c_id,);
                 }
             }
-            ToAppData::ReadAllFirstPages(requestor) => {
+            ToAppData::ReadAllFirstPages(requestor, range_opt) => {
                 let mut first_pages_vec = vec![];
-                let last_idx = if let Some(idx) = app_data.next_c_id() {
-                    idx
+                let last_used_idx = if let Some(idx) = app_data.next_c_id() {
+                    if idx > 0 {
+                        Some(idx - 1)
+                    } else {
+                        None
+                    }
                 } else {
-                    u16::MAX + 1
+                    Some(u16::MAX)
                 };
-                for c_id in 1..last_idx {
-                    if let Ok((d_type, _len)) = app_data.get_type_and_len(c_id) {
-                        if let Ok(first_page) = app_data.read_data(c_id, 0) {
-                            first_pages_vec.push((c_id, d_type, first_page));
-                            // } else {
-                            //     first_pages_vec.push((c_id, Data::empty(0)));
+                if let Some(last_used_idx) = last_used_idx {
+                    let (first_idx, last_idx) = if let Some((f, l)) = range_opt {
+                        if f > last_used_idx {
+                            (1, 0)
+                        } else {
+                            (f, l.min(last_used_idx))
+                        }
+                    } else {
+                        (1, last_used_idx)
+                    };
+                    // let last_idx =
+                    for c_id in first_idx..=last_idx {
+                        if let Ok((d_type, _len)) = app_data.get_type_and_len(c_id) {
+                            if let Ok(first_page) = app_data.read_data(c_id, 0) {
+                                first_pages_vec.push((c_id, d_type, first_page));
+                            }
                         }
                     }
                 }
+
                 match requestor {
                     Requestor::App => {
                         let _ = to_app_mgr_send
@@ -2791,7 +2814,7 @@ async fn serve_app_data(
                     }
                 }
             }
-            ToAppData::Response(GnomeToApp::Block(_id, data)) => {
+            ToAppData::Response(GnomeToApp::Block(_id, data, singed_by)) => {
                 response_task(
                     // id,
                     data,
@@ -3087,6 +3110,7 @@ async fn serve_app_data(
                 let _ = to_gnome_sender.send(ToGnome::RunningByteSets);
             }
             ToAppData::Terminate => {
+                eprintln!("AppData: Terminate");
                 // TODO: determine whether or not we want to store this Swarm on disk
                 // if store_on_disk {
                 // TODO: pass parameters indicating what data to store
@@ -4185,9 +4209,13 @@ pub async fn start_cycling_timer(
             "{:?} cycling timeout for {:?} is over",
             timeout, timeout_type
         );
-        let _ = sender
+        let res = sender
             .send(ToAppMgr::TimeoutOver(timeout_type.clone()))
             .await;
+        if res.is_err() {
+            eprintln!("Done with cycling timer for {timeout_type:?}");
+            break;
+        }
     }
 }
 async fn update_active_reads(
@@ -6160,7 +6188,7 @@ async fn read_data_task(
 
         // ReadSuccess sends data in chunks
         // of up to 64 pieces
-        let chunk_no: u16 = starting_page >> 6;
+        // let chunk_no: u16 = starting_page >> 6;
         let is_last: bool = read_to_page_incl >= len; // == ?
         if is_last {
             active_reads.remove(&c_id);
@@ -6173,7 +6201,8 @@ async fn read_data_task(
                         swarm_name.clone(),
                         c_id,
                         t,
-                        chunk_no,
+                        starting_page,
+                        // chunk_no,
                         is_last,
                         data_vec,
                     )))
