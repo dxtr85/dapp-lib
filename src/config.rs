@@ -9,6 +9,7 @@ use gnome::prelude::{Nat, NetworkSettings, PortAllocationRule, Transport};
 use crate::storage::StoragePolicy;
 
 pub struct Configuration {
+    pub autosave: bool,
     pub work_dir: PathBuf,
     pub storage: PathBuf,
     pub neighbors: Option<Vec<NetworkSettings>>,
@@ -26,11 +27,13 @@ impl Configuration {
         } else {
             None
         };
+        let mut autosave = false;
         let mut max_connected_swarms = 8;
         let mut upload_bandwidth = 8192;
         let mut store_data_on_disk = StoragePolicy::Everything;
         if !conf_path.exists() {
             return Configuration {
+                autosave: false,
                 work_dir: dir.clone(),
                 storage: dir.join("storage"),
                 neighbors,
@@ -49,6 +52,9 @@ impl Configuration {
                 let mut split = ls.split_whitespace();
                 let line_header = split.next().unwrap();
                 match line_header {
+                    "AUTOSAVE" => {
+                        autosave = true;
+                    }
                     "MAX_CONNECTED_SWARMS" => {
                         if let Some(number_str) = split.next() {
                             if let Ok(number) = u8::from_str_radix(number_str, 10) {
@@ -95,6 +101,7 @@ impl Configuration {
             }
         }
         Configuration {
+            autosave,
             work_dir: dir.clone(),
             storage: dir.join("storage"),
             neighbors,

@@ -68,19 +68,22 @@ async fn parse_datastore_file(
     highest_inserted_id
 }
 pub async fn read_datastore_from_disk(
-    file_path: PathBuf,
+    storage: PathBuf,
+    autosave: bool,
+    policy: StoragePolicy,
     // to_app_data: Sender<ToAppData>
 ) -> ApplicationData {
+    let file_path = storage.join("datastore.sync");
+
     eprintln!("Reading Datastore from {:?}…", file_path);
     // TODO: here we read all the contents of given file and process it line-by-line.
     // Only when done we send response back and finish task.
     let mut temp_store = HashMap::new();
     let mut root_hash = 0;
     let highest_inserted_id =
-        parse_datastore_file(file_path, &mut temp_store, &mut root_hash).await;
+        parse_datastore_file(file_path.clone(), &mut temp_store, &mut root_hash).await;
 
-    // let mut app_data = ApplicationData::new(crate::prelude::AppType::Catalog);
-    let mut app_data = ApplicationData::empty();
+    let mut app_data = ApplicationData::empty(storage, autosave, policy);
     for i in 0..=highest_inserted_id {
         if let Some((dtype, hash)) = temp_store.remove(&i) {
             eprintln!("Disk read CID-{} with hash: {}", i, hash);
@@ -153,12 +156,8 @@ pub fn should_store_content_on_disk(policy: &StoragePolicy, c_id: ContentID) -> 
         StoragePolicy::Everything => (true, u16::MAX),
     }
 }
-pub async fn store_data_on_disk(
-    s_storage: PathBuf,
-    mut app_data: ApplicationData,
-    policy: StoragePolicy,
-) {
-    if matches!(policy, StoragePolicy::Discard) {
+pub async fn store_data_on_disk(s_storage: PathBuf, mut app_data: ApplicationData) {
+    if matches!(app_data.policy, StoragePolicy::Discard) {
         eprintln!("STORAGE: Not writing to disk: Discard Policy");
         return;
     }
@@ -176,16 +175,16 @@ pub async fn store_data_on_disk(
     if !content_changed {
         return;
     }
-    let (should_store, max_page) = should_store_content_on_disk(&policy, 0);
+    let (should_store, max_page) = should_store_content_on_disk(&app_data.policy, 0);
     if should_store {
         store_content_on_disk(0, &s_storage, &app_data.contents.take(0).unwrap(), max_page).await;
     }
 
-    if matches!(policy, StoragePolicy::Datastore) {
+    if matches!(app_data.policy, StoragePolicy::Datastore) {
         return;
     }
     for c_id in 1..=last_defined_c_id {
-        let (should_store, max_page) = should_store_content_on_disk(&policy, c_id);
+        let (should_store, max_page) = should_store_content_on_disk(&app_data.policy, c_id);
         if should_store {
             store_content_on_disk(
                 c_id,

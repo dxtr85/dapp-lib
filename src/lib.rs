@@ -3,6 +3,7 @@ use crate::prelude::SyncRequirements;
 use crate::prelude::TransformInfo;
 use crate::search::SearchMsg;
 use crate::search::SwarmLink;
+use crate::storage::write_datastore_to_disk;
 use crate::sync_message::serialize_requests;
 use std::collections::VecDeque;
 // use std::net::IpAddr;
@@ -84,6 +85,7 @@ pub mod prelude {
     pub use crate::search::Hit;
     pub use crate::storage::load_content_from_disk;
     pub use crate::storage::read_datastore_from_disk;
+    pub use crate::storage::StoragePolicy;
     pub use crate::ApplicationData;
     pub use crate::ApplicationManager;
     pub use crate::Configuration;
@@ -1725,7 +1727,12 @@ async fn serve_app_manager(
                                 app_type,
                                 to_app_data_send.clone(),
                             );
-                            let app_data = ApplicationData::new(app_type);
+                            let app_data = ApplicationData::new(
+                                app_type,
+                                config.storage.clone(),
+                                config.autosave,
+                                config.store_data_on_disk.clone(),
+                            );
                             spawn(serve_app_data(
                                 config.storage.clone(),
                                 max_pages_in_memory,
@@ -1736,7 +1743,6 @@ async fn serve_app_manager(
                                 to_swarm,
                                 to_app_mgr.clone(),
                                 to_search_enigne.clone(),
-                                config.store_data_on_disk.clone(),
                             ));
                             spawn(serve_swarm(
                                 Duration::from_millis(64),
@@ -2164,7 +2170,6 @@ async fn serve_app_data(
     to_gnome_sender: Sender<ToGnome>,
     to_app_mgr_send: ASender<ToAppMgr>,
     to_search_enigne: ASender<SearchMsg>,
-    store_on_disk: StoragePolicy,
 ) {
     // eprintln!("{swarm_id} serve_app_data started");
     let mut s_storage = PathBuf::new();
@@ -2223,7 +2228,7 @@ async fn serve_app_data(
     // This should be merged with application logic
     // let mut store_on_disk = false;
     let mut swarm_name = SwarmName::new(GnomeId::any(), "".to_string()).unwrap();
-    eprintln!("Storage root app data: {:?}", storage);
+    // eprintln!("Storage root app data: {:?}", storage);
     let mut b_cast_origin: Option<(CastID, Sender<CastData>)> = None;
     let mut m_cast_origin: Option<(CastID, Sender<CastData>)> = None;
     let mut link_with_transform_info: Option<ContentID> = None;
@@ -2252,16 +2257,19 @@ async fn serve_app_data(
                 i_am_founder = am_i_founder;
                 swarm_name = s_name.clone();
                 s_storage = storage.join(s_name.to_path());
-                let dsync_store = s_storage.join("datastore.sync");
+                let dsync_store = storage.clone();
+                let _ = dsync_store.join("datastore.sync");
                 if dsync_store.exists() {
                     app_data = read_datastore_from_disk(
-                        dsync_store.clone(),
+                        s_storage.clone(), // dsync_store.clone(),
                         // app_data_send.clone(),
+                        app_data.autosave,
+                        app_data.policy.clone(),
                     )
-                    .await
+                    .await;
                 } else {
                     eprintln!("{:?} does not exist", dsync_store);
-                    //     ApplicationData::new(AppType::Catalog)
+                    // ApplicationData::new(AppType::Catalog)
                 };
                 // TODO: spawn a task to load datastore from disk into memory for
                 //       comparison with Swarm's datastore
@@ -2818,6 +2826,7 @@ async fn serve_app_data(
                 response_task(
                     // id,
                     data,
+                    singed_by,
                     &mut app_data,
                     &to_app_mgr_send,
                     swarm_id,
@@ -3096,7 +3105,11 @@ async fn serve_app_data(
                     swarm_id, purge_count
                 );
                 let purged = app_data
-                    .unload_from_memory(&storage, &store_on_disk, purge_count, usage)
+                    .unload_from_memory(
+                        // &storage, &store_on_disk,
+                        purge_count,
+                        usage,
+                    )
                     .await;
                 eprintln!("{} Freed {} pages from memory", swarm_id, purged);
             }
@@ -3114,7 +3127,7 @@ async fn serve_app_data(
                 // TODO: determine whether or not we want to store this Swarm on disk
                 // if store_on_disk {
                 // TODO: pass parameters indicating what data to store
-                store_data_on_disk(s_storage, app_data, store_on_disk).await;
+                store_data_on_disk(s_storage, app_data).await;
                 // }
 
                 eprintln!("Done serving AppData");
@@ -3458,20 +3471,55 @@ fn parse_cast(cast_data: CastData) -> Result<AppMessage, Data> {
         }
     }
 }
+// TODO: implement various fixed size heaps in order to preserve memory
+// enum Heap{
+//     Void,
+//     Small,
+//     Medium,
+//     Large
+// }
 pub struct ApplicationData {
-    // app_type: Option<AppType>,
+    storage: PathBuf,
+    autosave: bool,
+    policy: StoragePolicy,
     change_reg: ChangeRegistry,
     contents: Datastore,
     hash_to_temp_idx: HashMap<u64, u16>,
     partial_data: HashMap<u16, (Vec<u64>, HashMap<u64, Data>)>,
     disk_root_hash: u64,
+    heap: Vec<(u8, Data, GnomeId)>,
 }
+// HEAP is an additional way for Apps to extend their logic above the limits of
+// Policy–Requirements–Capabilities–ByteSets offering. Latter support simple CRUD+
+// operations.
+//
+// For example if a user wants to edit his Forum Post but has no Capability to do so,
+// a machanism can be defined for the user to post a UserDefined SyncMessage asking for this
+// change. It then gets pushed onto the heap.
+// Once a Moderator comes he can pop/peek from that heap to check user's request validity.
+// If valid Moderator goes to submit a reqular SyncMessage that will modify selected Content.
+//
+// Apps can be defined that run on heap only, so that they persist only in memory.
+//
+// There could be a mechanism for writing heap history to disk.
+// If there comes to a situation where a Swarm gets forked into two independent
+// network instances a heap history might be used to (automatically) merge those two together.
+//
+// Heap management – it's your job!
+// App can pop data from it's local heap and then this local heap is different from other
+// heaps in this swarm.
+// But this is fine – it is Apps responsibility to handle the heap!
+// If something needs to be synced across the Swarm then a reqular SyncMessage
+// has to be sent up, like in above example.
+// If an App has some in–memory data structures that are not based on Datastore then
+// this needs App level logic to handle syncing on it's own.
+//
 
 impl ApplicationData {
     pub async fn unload_from_memory(
         &mut self,
-        storage: &PathBuf,
-        policy: &StoragePolicy,
+        // storage: &PathBuf,
+        // policy: &StoragePolicy,
         to_purge_count: usize,
         mut usage: Vec<(u16, usize)>,
     ) -> usize {
@@ -3502,11 +3550,7 @@ impl ApplicationData {
                             break;
                         }
                     }
-                    // TODO: respect storage policy
-                    let (should_store, max_page) = should_store_content_on_disk(&policy, c_id);
-                    if should_store {
-                        store_content_on_disk(c_id, storage, &cloned_c, max_page).await;
-                    }
+                    self.save_content_to_disk(c_id, Some(cloned_c)).await;
                 }
             }
         }
@@ -3521,7 +3565,7 @@ impl ApplicationData {
                     }
                     let p_use_before = self.contents.used_memory_pages_for(c_id);
                     let c_empty = Content::Data(d_type, 1, ContentTree::Empty(r_hash));
-                    self.contents.update(c_id, c_empty);
+                    let _ = self.contents.update(c_id, c_empty);
                     unloaded_so_far = unloaded_so_far + p_use_before - 1;
                     if unloaded_so_far >= to_purge_count {
                         break;
@@ -3532,30 +3576,66 @@ impl ApplicationData {
         }
         unloaded_so_far
     }
+    async fn save_content_to_disk(
+        &mut self,
+        // policy: &StoragePolicy,
+        // storage: &Path,
+        c_id: ContentID,
+        content: Option<Content>,
+    ) {
+        // TODO: respect storage policy
+        let (should_store, max_page) = should_store_content_on_disk(&self.policy, c_id);
+        if should_store {
+            let content = if let Some(cnt) = content {
+                cnt
+            } else {
+                self.clone_content(c_id).unwrap()
+            };
+            eprintln!("Writing {c_id} to disk…");
+            store_content_on_disk(c_id, &self.storage, &content, max_page).await;
+            let d_store = self.storage.join("datastore.sync");
+            eprintln!("Updating {:?}…", d_store);
+            write_datastore_to_disk(d_store, &self).await;
+        } else {
+            eprintln!("Not writing {c_id} to disk");
+        }
+    }
 
-    pub fn new(app_type: Option<AppType>) -> Self {
+    pub fn new(
+        app_type: Option<AppType>,
+        storage: PathBuf,
+        autosave: bool,
+        policy: StoragePolicy,
+    ) -> Self {
         let contents = if let Some(at) = &app_type {
             Datastore::new(*at)
         } else {
             Datastore::empty()
         };
         ApplicationData {
-            // app_type,
+            storage,
+            autosave,
+            policy,
             change_reg: ChangeRegistry::new(),
             contents,
             hash_to_temp_idx: HashMap::new(),
             partial_data: HashMap::new(),
             disk_root_hash: 0,
+            heap: vec![],
         }
     }
-    pub fn empty() -> Self {
+    pub fn empty(storage: PathBuf, autosave: bool, policy: StoragePolicy) -> Self {
         ApplicationData {
+            storage,
+            autosave,
+            policy,
             // app_type: None,
             change_reg: ChangeRegistry::new(),
             contents: Datastore::empty(),
             hash_to_temp_idx: HashMap::new(),
             partial_data: HashMap::new(),
             disk_root_hash: 0,
+            heap: vec![],
         }
     }
 
@@ -4025,6 +4105,9 @@ impl ApplicationData {
                         }
                         let hash = self.root_hash();
                         // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
+                        if self.autosave {
+                            self.save_content_to_disk(c_id, None).await;
+                        }
                         eprintln!("ChangeContent completed successfully ({})", hash);
                     }
                 } else {
@@ -4059,6 +4142,9 @@ impl ApplicationData {
                         eprintln!("POST validation failed on ChangeContent(DropAndAppend)");
                         eprintln!("Restore result: {:?}", restore_res);
                     } else {
+                        if self.autosave {
+                            self.save_content_to_disk(c_id, None).await;
+                        }
                         eprintln!("ChangeContent(DropAndAppend) completed");
                     }
                 } else {
@@ -4102,6 +4188,9 @@ impl ApplicationData {
                         eprintln!("POST validation failed on ChangeContent(PopAndAppendConverted)");
                         eprintln!("Restore result: {:?}", restore_res);
                     } else {
+                        if self.autosave {
+                            self.save_content_to_disk(c_id, None).await;
+                        }
                         eprintln!("ChangeContent(PopAndAppendConverted) completed");
                     }
                 } else {
@@ -4144,6 +4233,8 @@ impl ApplicationData {
                         eprintln!("POST validation failed on ChangeContent(PopAndCTreeRebuild)");
                         eprintln!("Restore result: {:?}", restore_res);
                     } else {
+                        // Here we do not need to autosave
+                        // self.save_content_to_disk(c_id, None).await;
                         eprintln!("ChangeContent(PopAndCTreeRebuild) completed");
                         // let main_page = self.read_data(c_id, 0).unwrap();
                         let _to_mgr_res = to_app_mgr_send
@@ -4172,6 +4263,37 @@ impl ApplicationData {
       //         false
       //     }
       // }
+      // pushing comes from Swarm only
+    fn push_heap(&mut self, header: u8, data: Data, signed_by: GnomeId) {
+        // TODO: allow App to retrieve this data
+        eprintln!("Push Heap {header}[len:{}] (© {signed_by})", data.len());
+        self.heap.push((header, data, signed_by));
+    }
+
+    pub fn pop_heap(&mut self) -> Option<(u8, Data, GnomeId)> {
+        if self.heap.is_empty() {
+            None
+        } else {
+            Some(self.heap.remove(self.heap.len() - 1))
+        }
+    }
+
+    pub fn peek_heap(&self) -> Option<(u8, Data, GnomeId)> {
+        if self.heap.is_empty() {
+            None
+        } else {
+            Some(self.heap[self.heap.len() - 1].clone())
+        }
+    }
+
+    pub fn heap_size(&self) -> usize {
+        self.heap.len()
+    }
+
+    pub fn reset_heap(&mut self) {
+        self.heap = vec![]
+    }
+    // TODO: some more heap ops?
 }
 fn get_root_hash(hashes: &Vec<u64>) -> u64 {
     let h_len = hashes.len();
@@ -4802,6 +4924,7 @@ async fn change_content_task(
 async fn response_task(
     // _id: BlockID,
     data: SyncData,
+    signed_by: GnomeId,
     app_data: &mut ApplicationData,
     to_app_mgr_send: &ASender<ToAppMgr>,
     swarm_id: SwarmID,
@@ -4883,14 +5006,21 @@ async fn response_task(
                         Data::empty(0)
                     };
                     let _res = app_data.append(content);
-                    eprintln!("Content added: {:?}", _res);
-                    // let hash = app_data.root_hash();
-                    // eprintln!("Sending updated hash: {}", hash);
-                    // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
-                    // eprintln!("Send res: {:?}", res);
-                    let _to_mgr_res = to_app_mgr_send
-                        .send(ToAppMgr::ContentAdded(swarm_id, recv_id, d_type, main_page))
-                        .await;
+                    if _res.is_ok() {
+                        eprintln!("Content added: {:?}", _res);
+                        // let hash = app_data.root_hash();
+                        // eprintln!("Sending updated hash: {}", hash);
+                        // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
+                        // eprintln!("Send res: {:?}", res);
+                        if app_data.autosave {
+                            app_data.save_content_to_disk(next_id, None).await;
+                        }
+                        let _to_mgr_res = to_app_mgr_send
+                            .send(ToAppMgr::ContentAdded(swarm_id, recv_id, d_type, main_page))
+                            .await;
+                    } else {
+                        eprintln!("FAILED to append content: {:?}", _res.err().unwrap());
+                    }
                 } else {
                     eprintln!("Recv id: {}, next id: {}", recv_id, next_id);
                     eprintln!("Recv hash: {}, next hash: {}", recv_hash, content.hash());
@@ -4991,6 +5121,9 @@ async fn response_task(
                     // eprintln!("Sending updated hash: {}", hash);
                     // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
                     // eprintln!("Send res: {:?}", res);
+                    if app_data.autosave {
+                        app_data.save_content_to_disk(c_id, None).await;
+                    }
                     eprintln!("Data appended successfully ({})", hash);
                 }
             }
@@ -5023,6 +5156,9 @@ async fn response_task(
                     // );
                     eprintln!("Restore result: {:?}", res);
                 } else {
+                    if app_data.autosave {
+                        app_data.save_content_to_disk(c_id, None).await;
+                    }
                     eprintln!("Data removed successfully ({})", app_data.root_hash());
                 }
             }
@@ -5089,6 +5225,9 @@ async fn response_task(
                     // eprintln!("Sending updated hash: {}", hash);
                     // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
                     // eprintln!("Send res: {:?}", res);
+                    if app_data.autosave {
+                        app_data.save_content_to_disk(c_id, None).await;
+                    }
                     eprintln!("Data updated successfully ({})", hash);
                 }
             } else {
@@ -5097,15 +5236,18 @@ async fn response_task(
         }
         SyncMessageType::InsertData(c_id, d_id) => {
             //TODO
+            // app_data.save_content_to_disk(c_id, None).await;
             eprintln!("SyncMessageType::InsertData ");
         }
         SyncMessageType::ExtendData(c_id, d_id) => {
             //TODO
+            // app_data.save_content_to_disk(c_id, None).await;
             eprintln!("SyncMessageType::ExtendData ");
         }
-        SyncMessageType::UserDefined(_value) => {
-            //TODO
-            eprintln!("SyncMessageType::UserDefined({})", _value);
+        SyncMessageType::UserDefined(value) => {
+            //TODO: should we do req check?
+            app_data.push_heap(value, data, signed_by);
+            eprintln!("SyncMessageType::UserDefined({})", value);
         }
     }
 }
