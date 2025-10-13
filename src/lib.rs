@@ -1717,6 +1717,9 @@ async fn serve_app_manager(
                                         swarm_start_requested = Some((a_type, sr_name));
                                         None
                                     }
+                                } else if !own_swarm_started {
+                                    eprintln!("Assuming it was our own Catalog self-start");
+                                    Some(AppType::Catalog)
                                 } else {
                                     eprintln!("Was not waiting for SwarmStart");
                                     None
@@ -2259,7 +2262,8 @@ async fn serve_app_data(
                 s_storage = storage.join(s_name.to_path());
                 let dsync_store = storage.clone();
                 let _ = dsync_store.join("datastore.sync");
-                if dsync_store.exists() {
+                if s_storage.exists() {
+                    eprintln!("{s_storage:?} exists");
                     app_data = read_datastore_from_disk(
                         s_storage.clone(), // dsync_store.clone(),
                         // app_data_send.clone(),
