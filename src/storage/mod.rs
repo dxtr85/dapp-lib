@@ -83,7 +83,8 @@ pub async fn read_datastore_from_disk(
     let highest_inserted_id =
         parse_datastore_file(file_path.clone(), &mut temp_store, &mut root_hash).await;
 
-    let mut app_data = ApplicationData::empty(storage, autosave, policy);
+    let heap_auto_forward = false;
+    let mut app_data = ApplicationData::empty(storage, autosave, policy, heap_auto_forward);
     for i in 0..=highest_inserted_id {
         if let Some((dtype, hash)) = temp_store.remove(&i) {
             eprintln!("Disk read CID-{} with hash: {}", i, hash);

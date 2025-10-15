@@ -453,7 +453,8 @@ impl ApplicationManager {
         // self.update_swap_state(s_id, can_be_swapped).await;
         self.update_swap_state_after_leave(None, false).await;
     }
-    pub async fn swarm_synced(&mut self, s_id: SwarmID) {
+    pub async fn swarm_synced(&mut self, s_id: SwarmID) -> bool {
+        let mut own_swarm_started_and_activated = false;
         self.swap_state.running_swarms.insert(s_id);
         let can_be_swapped = self.set_synced(s_id);
         eprintln!(
@@ -476,6 +477,7 @@ impl ApplicationManager {
                 }
                 if s_name == self.my_name {
                     if let Ok(s_id) = self.set_active(&s_name) {
+                        own_swarm_started_and_activated = true;
                         let _ = self.to_user.send(ToApp::ActiveSwarm(s_name, s_id)).await;
                     }
                 }
@@ -492,6 +494,7 @@ impl ApplicationManager {
         // } else {
         self.update_swap_state_after_leave(None, false).await;
         // }
+        own_swarm_started_and_activated
     }
     pub fn cooldown_over(&mut self) {
         let prev_swap_state = std::mem::replace(&mut self.swap_state.process, SwapProcess::Idle);

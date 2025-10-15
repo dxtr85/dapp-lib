@@ -5,9 +5,8 @@ use crate::search::SearchMsg;
 use crate::search::SwarmLink;
 use crate::storage::write_datastore_to_disk;
 use crate::sync_message::serialize_requests;
+use std::array;
 use std::collections::VecDeque;
-// use std::net::IpAddr;
-// use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 mod app_type;
@@ -27,17 +26,14 @@ use app_type::AppType;
 use async_std::fs::create_dir_all;
 use async_std::task::yield_now;
 use message::ChangeContentOperation;
-// use manifest::Manifest;
 use search::Hit;
-use storage::should_store_content_on_disk;
-use storage::store_content_on_disk;
-use storage::StoragePolicy;
-// use async_std::net::ToSocketAddrs;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use storage::load_content_from_disk;
+use storage::should_store_content_on_disk;
+use storage::store_content_on_disk;
 use storage::store_data_on_disk;
-// use storage::write_datastore_to_disk;
+use storage::StoragePolicy;
 use sync_message::deserialize_requests;
 use sync_message::SyncRequest;
 use sync_message::SyncResponse;
@@ -132,6 +128,7 @@ pub enum ToApp {
     RunningPolicies(Vec<(Policy, Requirement)>),
     RunningCapabilities(Vec<(Capabilities, Vec<GnomeId>)>),
     RunningByteSets(Vec<(u8, ByteSet)>),
+    HeapData(SwarmID, u8, Data, GnomeId),
     Quit,
 }
 
@@ -161,6 +158,7 @@ pub enum ToAppMgr {
     AppendData(SwarmID, ContentID, Data),
     RemoveData(SwarmID, ContentID, u16),
     UpdateData(SwarmID, ContentID, u16, Data),
+    UserDefined(SwarmID, u8, u16, u16, Data),
     ContentAdded(SwarmID, ContentID, DataType, Data),
     ContentChanged(SwarmID, ContentID, DataType, Option<Data>),
     TransformLinkRequest(Box<SyncData>),
@@ -216,6 +214,7 @@ pub enum LibResponse {
     ReadError(SwarmID, ContentID, AppError),
     DownloadingPages(SwarmID, ContentID, DataType),
     AuditResult(SwarmID, usize, usize, u8),
+    HeapData(SwarmID, u8, Data, GnomeId),
 }
 #[derive(Debug, Clone)]
 pub enum TimeoutType {
@@ -269,6 +268,7 @@ pub enum ToAppData {
     ChangeContent(ContentID, DataType, Vec<Data>),
     ChangeDiameter(u8),
     UpdateData(ContentID, u16, Data),
+    UserDefined(u8, u16, u16, Data),
     AppendContent(DataType, Data),
     AppendData(ContentID, Data),
     RemoveData(ContentID, u16),
@@ -761,6 +761,12 @@ async fn serve_app_manager(
                         ));
                     }
                 }
+                ToAppMgr::FromDatastore(LibResponse::HeapData(s_id, m_type, data, signed_by)) => {
+                    eprintln!("AppMgr sending Heap Data to user",);
+                    let _ = to_user
+                        .send(ToApp::HeapData(s_id, m_type, data, signed_by))
+                        .await;
+                }
                 ToAppMgr::GetCIDsForTags(swarm_id, n_id, tags, all_first_pages) => {
                     eprintln!("We are requesting tags {:?} for {:?} swarm", tags, swarm_id);
                     let _ = to_user
@@ -1043,6 +1049,13 @@ async fn serve_app_manager(
                         let _ = sender.send(ToAppData::UpdateData(c_id, d_id, data)).await;
                     }
                 }
+                ToAppMgr::UserDefined(s_id, req_id, c_id, d_id, data) => {
+                    if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
+                        let _ = sender
+                            .send(ToAppData::UserDefined(req_id, c_id, d_id, data))
+                            .await;
+                    }
+                }
                 // ToAppMgr::AppendShelledDatas(_s_id, c_id, data) => {
                 //     //TODO
                 //     // let mut data_hashes = vec![];
@@ -1123,7 +1136,11 @@ async fn serve_app_manager(
                         .await;
                 }
                 ToAppMgr::FromDatastore(LibResponse::SwarmSynced(s_id)) => {
-                    app_mgr.swarm_synced(s_id).await;
+                    let was_own_swarm = app_mgr.swarm_synced(s_id).await;
+                    if !own_swarm_started && was_own_swarm {
+                        own_swarm_started = true;
+                        own_swarm_activated = true;
+                    }
                     // eprintln!("SwarmSynced {}", s_id);
                     // if !own_swarm_activated && own_swarm_started {
                     //     if let Some(s_name) = app_mgr.get_name(s_id) {
@@ -1735,6 +1752,7 @@ async fn serve_app_manager(
                                 config.storage.clone(),
                                 config.autosave,
                                 config.store_data_on_disk.clone(),
+                                false, // heap auto forward
                             );
                             spawn(serve_app_data(
                                 config.storage.clone(),
@@ -2562,6 +2580,9 @@ async fn serve_app_data(
                     &to_gnome_sender,
                 )
                 .await
+            }
+            ToAppData::UserDefined(req_id, c_id, d_id, data) => {
+                let _ = user_defined_request_task(req_id, c_id, d_id, data, &to_gnome_sender).await;
             }
 
             ToAppData::ChangeDiameter(new_diameter) => {
@@ -3476,12 +3497,147 @@ fn parse_cast(cast_data: CastData) -> Result<AppMessage, Data> {
     }
 }
 // TODO: implement various fixed size heaps in order to preserve memory
-// enum Heap{
-//     Void,
-//     Small,
-//     Medium,
-//     Large
-// }
+// they should work as a FIFO queue in order not to disturb App's functioning.
+//
+struct HeapSmall {
+    size: usize,
+    start: usize,
+    end: usize,
+    the_heap: [(u8, Data, GnomeId); 16],
+}
+impl HeapSmall {
+    pub fn new(prev_heap_opt: Option<Heap>) -> Self {
+        let mut heap = HeapSmall {
+            size: 0,
+            start: 0,
+            end: 0,
+            the_heap: array::from_fn(|_i| (0, Data::empty(0), GnomeId::any())),
+        };
+        if let Some(mut p_heap) = prev_heap_opt {
+            while let Some(item) = p_heap.pop() {
+                heap.push(item);
+            }
+        }
+        heap
+    }
+
+    pub fn push(&mut self, item: (u8, Data, GnomeId)) {
+        if self.size >= 16 {
+            eprintln!("OVERWRITING HEAP!({})", self.size);
+        }
+        self.the_heap[self.end] = item;
+        self.update_after_push();
+    }
+
+    pub fn peek(&self) -> Option<(u8, Data, GnomeId)> {
+        if self.size == 0 {
+            None
+        } else {
+            Some(self.the_heap[self.start].clone())
+        }
+    }
+
+    pub fn pop(&mut self) -> Option<(u8, Data, GnomeId)> {
+        let res = if self.size == 0 {
+            None
+        } else {
+            Some(self.the_heap[self.start].clone())
+        };
+        if res.is_some() {
+            self.update_after_pop();
+        }
+        res
+    }
+
+    pub fn len(&self) -> usize {
+        self.size
+    }
+
+    pub fn reset(&mut self) {
+        self.size = 0;
+        self.start = 0;
+        self.end = 0;
+        self.the_heap = array::from_fn(|_i| (0, Data::empty(0), GnomeId::any()));
+    }
+
+    fn update_after_push(&mut self) {
+        // We are maxxed out, heap is eating it's own tail
+        if self.size >= 16 {
+            self.end = self.start;
+            let mut new_start = self.start + 1;
+            if new_start >= 16 {
+                new_start = 0;
+            }
+            self.start = new_start;
+        } else {
+            self.size = self.size + 1;
+            let mut new_end = self.end + 1;
+            if new_end >= 16 {
+                new_end = 0;
+            }
+            self.end = new_end;
+        }
+    }
+
+    fn update_after_pop(&mut self) {
+        self.size = self.size - 1;
+        let mut new_start = self.start + 1;
+        if new_start >= 16 {
+            new_start = 0;
+        }
+        self.start = new_start;
+    }
+}
+
+enum Heap {
+    Void,
+    Small(HeapSmall),
+    // Medium, // 256 elements
+    // Large,  // u16::MAX elems
+}
+
+impl Heap {
+    pub fn push(&mut self, item: (u8, Data, GnomeId)) {
+        match self {
+            Self::Small(hs) => {
+                hs.push(item);
+            }
+            _o => {
+                // do nothing
+            }
+        }
+    }
+    pub fn peek(&self) -> Option<(u8, Data, GnomeId)> {
+        match self {
+            Self::Small(hs) => hs.peek(),
+            _o => None,
+        }
+    }
+    pub fn pop(&mut self) -> Option<(u8, Data, GnomeId)> {
+        match self {
+            Self::Small(hs) => hs.pop(),
+            _o => None,
+        }
+    }
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Small(hs) => hs.len(),
+            _o => 0,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn reset(&mut self) {
+        match self {
+            Self::Small(hs) => hs.reset(),
+            _o => {
+                // do nothing
+            }
+        }
+    }
+}
 pub struct ApplicationData {
     storage: PathBuf,
     autosave: bool,
@@ -3491,7 +3647,8 @@ pub struct ApplicationData {
     hash_to_temp_idx: HashMap<u64, u16>,
     partial_data: HashMap<u16, (Vec<u64>, HashMap<u64, Data>)>,
     disk_root_hash: u64,
-    heap: Vec<(u8, Data, GnomeId)>,
+    heap_auto_forward: bool,
+    heap: Heap,
 }
 // HEAP is an additional way for Apps to extend their logic above the limits of
 // Policy–Requirements–Capabilities–ByteSets offering. Latter support simple CRUD+
@@ -3610,6 +3767,7 @@ impl ApplicationData {
         storage: PathBuf,
         autosave: bool,
         policy: StoragePolicy,
+        heap_auto_forward: bool,
     ) -> Self {
         let contents = if let Some(at) = &app_type {
             Datastore::new(*at)
@@ -3625,21 +3783,27 @@ impl ApplicationData {
             hash_to_temp_idx: HashMap::new(),
             partial_data: HashMap::new(),
             disk_root_hash: 0,
-            heap: vec![],
+            heap_auto_forward,
+            heap: Heap::Small(HeapSmall::new(None)),
         }
     }
-    pub fn empty(storage: PathBuf, autosave: bool, policy: StoragePolicy) -> Self {
+    pub fn empty(
+        storage: PathBuf,
+        autosave: bool,
+        policy: StoragePolicy,
+        heap_auto_forward: bool,
+    ) -> Self {
         ApplicationData {
             storage,
             autosave,
             policy,
-            // app_type: None,
             change_reg: ChangeRegistry::new(),
             contents: Datastore::empty(),
             hash_to_temp_idx: HashMap::new(),
             partial_data: HashMap::new(),
             disk_root_hash: 0,
-            heap: vec![],
+            heap_auto_forward,
+            heap: Heap::Small(HeapSmall::new(None)),
         }
     }
 
@@ -4267,27 +4431,30 @@ impl ApplicationData {
       //         false
       //     }
       // }
-      // pushing comes from Swarm only
+      //
+
+    pub fn set_heap_auto_forward(&mut self, new_setting: bool) {
+        // TODO: implement a mechanism to gradually clean up heap
+        self.heap_auto_forward = new_setting;
+    }
+
+    pub fn should_auto_forward_heap_msg(&self) -> bool {
+        self.heap_auto_forward && self.heap.is_empty()
+    }
+
+    // pushing comes from Swarm only
     fn push_heap(&mut self, header: u8, data: Data, signed_by: GnomeId) {
-        // TODO: allow App to retrieve this data
         eprintln!("Push Heap {header}[len:{}] (© {signed_by})", data.len());
         self.heap.push((header, data, signed_by));
     }
 
+    // TODO: allow App to retrieve this data
     pub fn pop_heap(&mut self) -> Option<(u8, Data, GnomeId)> {
-        if self.heap.is_empty() {
-            None
-        } else {
-            Some(self.heap.remove(self.heap.len() - 1))
-        }
+        self.heap.pop()
     }
 
     pub fn peek_heap(&self) -> Option<(u8, Data, GnomeId)> {
-        if self.heap.is_empty() {
-            None
-        } else {
-            Some(self.heap[self.heap.len() - 1].clone())
-        }
+        self.heap.peek()
     }
 
     pub fn heap_size(&self) -> usize {
@@ -4295,10 +4462,13 @@ impl ApplicationData {
     }
 
     pub fn reset_heap(&mut self) {
-        self.heap = vec![]
+        self.heap.reset();
     }
+    // TODO: allow for changing heap size
+    // TODO: allow for setting autoforwarding of heap contents to App
     // TODO: some more heap ops?
 }
+
 fn get_root_hash(hashes: &Vec<u64>) -> u64 {
     let h_len = hashes.len();
     let mut sub_hashes = Vec::with_capacity((h_len >> 1 as usize) + 1);
@@ -4925,6 +5095,27 @@ async fn change_content_task(
         eprintln!("Unable to change non existing content");
     }
 }
+async fn user_defined_request_task(
+    req_id: u8,
+    c_id: ContentID,
+    d_id: u16,
+    data: Data,
+    to_gnome_sender: &Sender<ToGnome>,
+) {
+    let msg = SyncMessage::new(
+        SyncMessageType::UserDefined(req_id, c_id, d_id),
+        SyncRequirements {
+            pre: vec![], // TODO: maybe we should use reqs?
+            post: vec![],
+        },
+        data,
+    );
+    let parts = msg.into_parts();
+    for part in parts {
+        eprintln!("ToGnome::AddData(UserDefined({req_id}))");
+        let _ = to_gnome_sender.send(ToGnome::AddData(part));
+    }
+}
 async fn response_task(
     // _id: BlockID,
     data: SyncData,
@@ -5248,9 +5439,19 @@ async fn response_task(
             // app_data.save_content_to_disk(c_id, None).await;
             eprintln!("SyncMessageType::ExtendData ");
         }
-        SyncMessageType::UserDefined(value) => {
+        SyncMessageType::UserDefined(value, c_id, d_id) => {
             //TODO: should we do req check?
-            app_data.push_heap(value, data, signed_by);
+            if app_data.should_auto_forward_heap_msg() {
+                // send immediately to App
+                eprintln!("forwarding heap data directly to app");
+                let _ = to_app_mgr_send
+                    .send(ToAppMgr::FromDatastore(LibResponse::HeapData(
+                        swarm_id, value, data, signed_by,
+                    )))
+                    .await;
+            } else {
+                app_data.push_heap(value, data, signed_by);
+            }
             eprintln!("SyncMessageType::UserDefined({})", value);
         }
     }

@@ -182,7 +182,8 @@ pub enum SyncMessageType {
     UpdateData(ContentID, u16),
     InsertData(ContentID, u16),
     ExtendData(ContentID, u16),
-    UserDefined(u8),
+    UserDefined(u8, u16, u16), // req_id, CID (2bytes!), DID
+                               // Policy check will only recognize two bytes of CID, none of DID!
 }
 impl SyncMessageType {
     pub fn new(bytes: &mut Vec<u8>) -> Self {
@@ -254,7 +255,16 @@ impl SyncMessageType {
                 SyncMessageType::ExtendData(c_id, d_id)
             }
 
-            other => SyncMessageType::UserDefined(other),
+            other => {
+                let b1 = bytes.drain(0..1).next().unwrap();
+                let b2 = bytes.drain(0..1).next().unwrap();
+                let c_id = u16::from_be_bytes([b1, b2]);
+                let b1 = bytes.drain(0..1).next().unwrap();
+                let b2 = bytes.drain(0..1).next().unwrap();
+                let d_id = u16::from_be_bytes([b1, b2]);
+                // eprintln!("UserDefined from bytes: {other}, {c_id}, {d_id}");
+                SyncMessageType::UserDefined(other, c_id, d_id)
+            }
         }
     }
 
@@ -299,7 +309,12 @@ impl SyncMessageType {
                 vec![248, b1, b2, b3, b4]
             }
 
-            SyncMessageType::UserDefined(other) => vec![*other],
+            SyncMessageType::UserDefined(other, c_id, d_id) => {
+                // eprintln!("UserDefined bytes: {other},{c_id},{d_id}");
+                let [b1, b2] = c_id.to_be_bytes();
+                let [b3, b4] = d_id.to_be_bytes();
+                vec![*other, b1, b2, b3, b4]
+            }
         }
     }
 }
