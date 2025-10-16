@@ -129,6 +129,8 @@ pub enum ToApp {
     RunningCapabilities(Vec<(Capabilities, Vec<GnomeId>)>),
     RunningByteSets(Vec<(u8, ByteSet)>),
     HeapData(SwarmID, u8, Data, GnomeId),
+    CustomNeighborRequest(SwarmID, GnomeId, u8, CastData),
+    CustomNeighborResponse(SwarmID, GnomeId, u8, CastData),
     Quit,
 }
 
@@ -195,6 +197,8 @@ pub enum LibRequest {
     SetRunningPolicy(SwarmName, Policy, Requirement),
     SetRunningCapability(SwarmName, Capabilities, Vec<GnomeId>),
     SetRunningByteSet(SwarmName, u8, ByteSet),
+    CustomNeighborRequest(SwarmName, GnomeId, u8, CastData),
+    CustomNeighborResponse(SwarmName, GnomeId, u8, CastData),
 }
 #[derive(Debug)]
 pub enum LibResponse {
@@ -215,6 +219,8 @@ pub enum LibResponse {
     DownloadingPages(SwarmID, ContentID, DataType),
     AuditResult(SwarmID, usize, usize, u8),
     HeapData(SwarmID, u8, Data, GnomeId),
+    CustomNeighborRequest(SwarmID, GnomeId, u8, CastData),
+    CustomNeighborResponse(SwarmID, GnomeId, u8, CastData),
 }
 #[derive(Debug, Clone)]
 pub enum TimeoutType {
@@ -713,6 +719,38 @@ async fn serve_app_manager(
                         .send(ToGnomeManager::SetRunningByteSet(s_name, b_id, bset))
                         .await;
                 }
+                ToAppMgr::FromApp(LibRequest::CustomNeighborRequest(
+                    s_name,
+                    g_id,
+                    req_id,
+                    data,
+                )) => {
+                    if req_id < 245 {
+                        let _ = to_gnome_mgr
+                            .send(ToGnomeManager::CustomNeighborRequest(
+                                s_name, g_id, req_id, data,
+                            ))
+                            .await;
+                    } else {
+                        eprintln!("Not sending CustomNeighReq{req_id}, max id = 245");
+                    }
+                }
+                ToAppMgr::FromApp(LibRequest::CustomNeighborResponse(
+                    s_name,
+                    g_id,
+                    req_id,
+                    data,
+                )) => {
+                    if req_id < 243 {
+                        let _ = to_gnome_mgr
+                            .send(ToGnomeManager::CustomNeighborResponse(
+                                s_name, g_id, req_id, data,
+                            ))
+                            .await;
+                    } else {
+                        eprintln!("Not sending CustomNeighResp{req_id}, max id = 243");
+                    }
+                }
                 // ToAppMgr::FromSearch(LibRequest::ReadAllFirstPages(s_id)) => {
                 //     if let Some(to_app_data) = app_mgr.app_data_store.get(&s_id) {
                 //         let _ = to_app_data
@@ -765,6 +803,28 @@ async fn serve_app_manager(
                     eprintln!("AppMgr sending Heap Data to user",);
                     let _ = to_user
                         .send(ToApp::HeapData(s_id, m_type, data, signed_by))
+                        .await;
+                }
+                ToAppMgr::FromDatastore(LibResponse::CustomNeighborRequest(
+                    s_id,
+                    g_id,
+                    req_type,
+                    c_data,
+                )) => {
+                    eprintln!("AppMgr sending CustNeighReq to user",);
+                    let _ = to_user
+                        .send(ToApp::CustomNeighborRequest(s_id, g_id, req_type, c_data))
+                        .await;
+                }
+                ToAppMgr::FromDatastore(LibResponse::CustomNeighborResponse(
+                    s_id,
+                    g_id,
+                    resp_type,
+                    c_data,
+                )) => {
+                    eprintln!("AppMgr sending Heap Data to user",);
+                    let _ = to_user
+                        .send(ToApp::CustomNeighborResponse(s_id, g_id, resp_type, c_data))
                         .await;
                 }
                 ToAppMgr::GetCIDsForTags(swarm_id, n_id, tags, all_first_pages) => {
@@ -2333,7 +2393,7 @@ async fn serve_app_data(
                     GnomeId::any(),
                     None,
                     NeighborRequest::Custom(
-                        0,
+                        245,
                         CastData::new(serialize_requests(sync_requests)).unwrap(),
                     ),
                 ));
@@ -2780,7 +2840,7 @@ async fn serve_app_data(
                     .await;
             }
             ToAppData::SendFirstPage(n_id, c_id, data) => {
-                let sync_type = 0;
+                let sync_type = 243;
                 let (data_type, len) = app_data.get_type_and_len(c_id).unwrap();
                 let sync_response = SyncResponse::Page(c_id, data_type, 0, len, data);
                 // println!("Sending bytes: {:?}", bytes);
@@ -2971,7 +3031,7 @@ async fn serve_app_data(
                                 GnomeId::any(),
                                 None,
                                 NeighborRequest::Custom(
-                                    0,
+                                    245,
                                     CastData::new(serialize_requests(vec![sync_request])).unwrap(),
                                 ),
                             ))
@@ -3008,7 +3068,7 @@ async fn serve_app_data(
                                     GnomeId::any(),
                                     None,
                                     NeighborRequest::Custom(
-                                        0,
+                                        245,
                                         CastData::new(serialize_requests(vec![sync_request]))
                                             .unwrap(),
                                     ),
@@ -3025,7 +3085,7 @@ async fn serve_app_data(
                                     GnomeId::any(),
                                     None,
                                     NeighborRequest::Custom(
-                                        0,
+                                        245,
                                         CastData::new(serialize_requests(vec![sync_request]))
                                             .unwrap(),
                                     ),
@@ -3049,7 +3109,7 @@ async fn serve_app_data(
                         GnomeId::any(),
                         None,
                         NeighborRequest::Custom(
-                            0,
+                            245,
                             CastData::new(serialize_requests(sync_requests)).unwrap(),
                         ),
                     ));
@@ -3307,7 +3367,10 @@ fn request_content_from_any_neighbor(
     let _ = to_gnome_sender.send(ToGnome::AskData(
         GnomeId::any(),
         exclude,
-        NeighborRequest::Custom(0, CastData::new(serialize_requests(sync_requests)).unwrap()),
+        NeighborRequest::Custom(
+            245,
+            CastData::new(serialize_requests(sync_requests)).unwrap(),
+        ),
     ));
 }
 async fn serve_unicast(c_id: CastID, sleep_time: Duration, user_res: Receiver<CastData>) {
@@ -5483,15 +5546,23 @@ async fn custom_request_task(
     // Special case to consider is when we are sending main Page of a Link.
     // Link has optional TransformInfo attribute, and it is necessary
     // when sideloading Pages via broadcast or other means than SyncMessages.
-    if m_type != 0 {
-        eprintln!("Unhandled request {}", m_type);
+    if m_type != 245 {
+        eprintln!("Forwarding CustNeighRequest({})", m_type);
+        to_app_mgr_send
+            .send(ToAppMgr::FromDatastore(LibResponse::CustomNeighborRequest(
+                swarm_id,
+                neighbor_id,
+                m_type,
+                cast_data,
+            )))
+            .await;
         return;
     }
     // match m_type {
     //     0 => {
     let sync_requests = deserialize_requests(cast_data.bytes());
     // TODO: we have to unconditionally sync partial_data!!!
-    let sync_type = 0;
+    let sync_type = 243;
     let partial_hashes = app_data.get_partial_hashes();
     for hdata in partial_hashes.into_iter() {
         let sync_response = SyncResponse::Partial(true, hdata);
@@ -5563,7 +5634,7 @@ async fn custom_request_task(
                         ))
                         .await;
                 } else {
-                    let sync_type = 0;
+                    let sync_type = 243;
                     for c_id in 1..app_data.next_c_id().unwrap() {
                         eprintln!("We need to send main page of ContentID-{}", c_id);
                         if let Ok(data) = app_data.read_data(c_id, 0) {
@@ -5601,7 +5672,7 @@ async fn custom_request_task(
                 };
                 if let Ok(mut hashes) = hash_res {
                     if !hashes.is_empty() {
-                        let sync_type = 0;
+                        let sync_type = 243;
                         let hashes_len = hashes.len() as u16 - 1;
                         if h_ids.is_empty() {
                             // eprintln!("We send all hashes of CID {}", c_id);
@@ -5664,7 +5735,7 @@ async fn custom_request_task(
                         // eprintln!("DType: {:?}", data_type);
                         if len > 0 {
                             let total = len as u16 - 1;
-                            let sync_type = 0;
+                            let sync_type = 243;
                             for p_id in _p_ids {
                                 if let Ok(data) = app_data.read_data(c_id, p_id) {
                                     if data.is_empty() {
@@ -5712,7 +5783,7 @@ async fn custom_request_task(
                         eprintln!("Link len: {}", len);
                         if len > 0 {
                             let total = len as u16 - 1;
-                            let sync_type = 0;
+                            let sync_type = 243;
                             for p_id in _p_ids {
                                 if let Ok((data, size)) =
                                     app_data.read_link_ti_data(c_id, p_id, d_type)
@@ -5751,7 +5822,7 @@ async fn custom_request_task(
                     "We are requested to send all pages of Contents: {:?}.",
                     c_ids
                 );
-                let sync_type = 0;
+                let sync_type = 243;
                 for c_id in c_ids {
                     eprintln!("Sending {} CID-{}", swarm_id, c_id);
                     //TODO: first we send all page hashes
@@ -5795,7 +5866,7 @@ async fn custom_request_task(
 }
 async fn custom_response_task(
     m_type: u8,
-    _neighbor_id: GnomeId,
+    neighbor_id: GnomeId,
     cast_data: CastData,
     // c_id: ContentID,
     datastore_sync: &mut Option<(u16, HashMap<u16, Vec<(DataType, u64)>>)>,
@@ -5812,8 +5883,13 @@ async fn custom_response_task(
     app_data_send: &ASender<ToAppData>,
     to_search_enigne: &ASender<SearchMsg>,
 ) {
-    if m_type != 0 {
-        eprintln!("Unhandled response {}", m_type);
+    if m_type != 243 {
+        eprintln!("Forwarding CustNeighResponse({})", m_type);
+        to_app_mgr_send
+            .send(ToAppMgr::FromDatastore(
+                LibResponse::CustomNeighborResponse(swarm_id, neighbor_id, m_type, cast_data),
+            ))
+            .await;
         return;
     }
     // match m_type {
@@ -5974,7 +6050,7 @@ async fn custom_response_task(
                                         curr_cid,
                                         true,
                                         true,
-                                        Some(_neighbor_id),
+                                        Some(neighbor_id),
                                         to_gnome_sender.clone(),
                                     );
                                     let _ = to_app_mgr_send
@@ -6494,7 +6570,7 @@ async fn read_data_task(
                         GnomeId::any(),
                         None,
                         NeighborRequest::Custom(
-                            0,
+                            245,
                             CastData::new(serialize_requests(sync_requests)).unwrap(),
                         ),
                     ));
@@ -6506,7 +6582,7 @@ async fn read_data_task(
                         GnomeId::any(),
                         None,
                         NeighborRequest::Custom(
-                            0,
+                            245,
                             CastData::new(serialize_requests(sync_requests)).unwrap(),
                         ),
                     ));
@@ -6585,7 +6661,7 @@ async fn read_data_task(
                 GnomeId::any(),
                 None,
                 NeighborRequest::Custom(
-                    0,
+                    245,
                     CastData::new(serialize_requests(sync_requests)).unwrap(),
                 ),
             ));
