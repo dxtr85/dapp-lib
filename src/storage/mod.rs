@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 // use async_std::channel::Sender;
@@ -286,7 +287,13 @@ pub async fn store_content_on_disk(
     // eprintln!("CID-{} hash {}", c_id, rhash);
     // Load existing file contents into memory
     let header_file = s_storage.join(format!("{}.hdr", c_id));
+    // if !header_file.exists() {
+    //     let _ = File::create(header_file.clone()).await;
+    // }
     let data_file = s_storage.join(format!("{}.dat", c_id));
+    // if !data_file.exists() {
+    //     let _ = File::create(data_file.clone()).await;
+    // }
     let mut temp_storage = HashMap::new();
     let mut byte_pointer: u32 = 0;
     if let Some(file_content) = load_content_from_header_file(
@@ -297,88 +304,56 @@ pub async fn store_content_on_disk(
     )
     .await
     {
-        // eprintln!("Header file for CID-{} read", c_id);
+        eprintln!("Header file for CID-{} read", c_id);
         // Calculate it's root hash
-        if file_content.hash() != rhash {
-            // Only if hashes are different append pages that differ
-            eprintln!(
-                "CID-{} on disk {} differs from {} in memory\n(file: {:?})",
-                c_id,
-                file_content.hash(),
-                rhash,
-                header_file,
-            );
-            // eprintln!("on disk page hashes: {:?}", file_content.data_hashes());
-            // eprintln!(
-            //     "in memr page hashes: {:?}",
-            //     app_data.content_bottom_hashes(c_id).unwrap()
-            // );
-            let header_file = OpenOptions::new()
-                .write(true)
-                .append(true)
-                .open(header_file)
-                .await
-                .unwrap();
-            let mut header_file = BufWriter::new(header_file);
-            let data_file = OpenOptions::new()
-                .write(true)
-                .append(true)
-                .open(data_file)
-                .await
-                .unwrap();
-            let mut data_file = BufWriter::new(data_file);
-            // let mem_data_hashes = content.content_bottom_hashes(c_id).unwrap();
-            let mem_data_hashes = content.data_hashes();
-            for (i, mem_hash) in mem_data_hashes.into_iter().enumerate() {
-                if let Some((hash, _offset, _size)) = temp_storage.get(&(i as u16)) {
-                    if *hash != mem_hash {
-                        eprintln!("PID-{} Disk: {}, mem: {} ", i, hash, mem_hash);
-                        //TODO: send updated contents to disk
-                        // hdr file format:
-                        // PID(2B)    PageHash(8B)    Offset(4B)    Size(2B)
-                        let [d0, d1] = (i as u16).to_be_bytes();
-                        let read_result = content.read_data(i as u16);
-                        if read_result.is_err() {
-                            eprintln!(
-                                "Failed to read data for CID-{}/{}:\n{:?}",
-                                c_id, i, read_result
-                            );
-                            continue;
-                        }
-                        let data = read_result.unwrap();
-                        buff_header[0] = d0;
-                        buff_header[1] = d1;
-                        let mut i = 2;
-                        for byte in mem_hash.to_be_bytes() {
-                            buff_header[i] = byte;
-                            i += 1;
-                        }
-                        if data.is_empty() {
-                            //Only write hdr file
-                            for i in 10..16 {
-                                buff_header[i] = 0;
-                            }
-                            let _ = header_file.write(&buff_header).await;
-                        } else {
-                            let mut i = 10;
-                            for byte in byte_pointer.to_be_bytes() {
-                                buff_header[i] = byte;
-                                i += 1;
-                            }
-                            let data_len = data.len() as u32;
-                            for byte in (data_len as u16).to_be_bytes() {
-                                buff_header[i] = byte;
-                                i += 1;
-                            }
-                            let _ = header_file.write(&buff_header).await;
-                            let _ = data_file.write(&data.bytes()).await;
-                            byte_pointer += data_len;
-                        }
-                    }
-                } else {
-                    // TODO: too much copy-pasting!!!
+        // if file_content.hash() != rhash {
+        // Only if hashes are different append pages that differ
+        // eprintln!(
+        //     "CID-{} on disk {} differs from {} in memory\n(file: {:?})",
+        //     c_id,
+        //     file_content.hash(),
+        //     rhash,
+        //     header_file,
+        // );
+        // eprintln!("on disk page hashes: {:?}", file_content.data_hashes());
+        // eprintln!(
+        //     "in memr page hashes: {:?}",
+        //     app_data.content_bottom_hashes(c_id).unwrap()
+        // );
+        let header_file = OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(header_file)
+            .await
+            .unwrap();
+        let mut header_file = BufWriter::new(header_file);
+        let data_file = OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(data_file)
+            .await
+            .unwrap();
+        let mut data_file = BufWriter::new(data_file);
+        // let mem_data_hashes = content.content_bottom_hashes(c_id).unwrap();
+        let mem_data_hashes = content.data_hashes();
+        for (i, mem_hash) in mem_data_hashes.into_iter().enumerate() {
+            if let Some((hash, _offset, _size)) = temp_storage.get(&(i as u16)) {
+                eprintln!("Header for D-{i} h: {hash}, off: {_offset} size: {_size}");
+                if *hash != mem_hash || *_size == 0 {
+                    eprintln!("PgID-{} Disk: {}, mem: {} ", i, hash, mem_hash);
+                    //TODO: send updated contents to disk
+                    // hdr file format:
+                    // PID(2B)    PageHash(8B)    Offset(4B)    Size(2B)
                     let [d0, d1] = (i as u16).to_be_bytes();
-                    let data = content.read_data(i as u16).unwrap();
+                    let read_result = content.read_data(i as u16);
+                    if read_result.is_err() {
+                        eprintln!(
+                            "Failed to read data for CID-{}/{}:\n{:?}",
+                            c_id, i, read_result
+                        );
+                        continue;
+                    }
+                    let data = read_result.unwrap();
                     buff_header[0] = d0;
                     buff_header[1] = d1;
                     let mut i = 2;
@@ -387,12 +362,14 @@ pub async fn store_content_on_disk(
                         i += 1;
                     }
                     if data.is_empty() {
+                        eprintln!("Data is empty, not writing anything.");
                         //Only write hdr file
-                        for i in 10..16 {
-                            buff_header[i] = 0;
-                        }
-                        let _ = header_file.write(&buff_header).await;
+                        // for i in 10..16 {
+                        //     buff_header[i] = 0;
+                        // }
+                        // let _ = header_file.write(&buff_header).await;
                     } else {
+                        eprintln!("Data with bytes");
                         let mut i = 10;
                         for byte in byte_pointer.to_be_bytes() {
                             buff_header[i] = byte;
@@ -408,14 +385,47 @@ pub async fn store_content_on_disk(
                         byte_pointer += data_len;
                     }
                 }
-                if i as u16 >= break_on_page {
-                    break;
+            } else {
+                // TODO: too much copy-pasting!!!
+                let [d0, d1] = (i as u16).to_be_bytes();
+                let data = content.read_data(i as u16).unwrap();
+                buff_header[0] = d0;
+                buff_header[1] = d1;
+                let mut i = 2;
+                for byte in mem_hash.to_be_bytes() {
+                    buff_header[i] = byte;
+                    i += 1;
+                }
+                if data.is_empty() {
+                    //Only write hdr file
+                    for i in 10..16 {
+                        buff_header[i] = 0;
+                    }
+                    let _ = header_file.write(&buff_header).await;
+                } else {
+                    let mut i = 10;
+                    for byte in byte_pointer.to_be_bytes() {
+                        buff_header[i] = byte;
+                        i += 1;
+                    }
+                    let data_len = data.len() as u32;
+                    for byte in (data_len as u16).to_be_bytes() {
+                        buff_header[i] = byte;
+                        i += 1;
+                    }
+                    let _ = header_file.write(&buff_header).await;
+                    let _ = data_file.write(&data.bytes()).await;
+                    byte_pointer += data_len;
                 }
             }
-            let _ = header_file.flush().await;
-            let _ = data_file.flush().await;
-            // TODO: we need to update what has changed into disk
+            if i as u16 >= break_on_page {
+                break;
+            }
         }
+        let _ = header_file.flush().await;
+        let _ = data_file.flush().await;
+        // TODO: we need to update what has changed into disk
+        // }
     } else {
         eprintln!("Creating new header and data for CID-{}", c_id);
         let mut header_file = BufWriter::new(File::create(header_file).await.unwrap());
@@ -434,6 +444,7 @@ pub async fn store_content_on_disk(
             }
             if data.is_empty() {
                 //Only write hdr file
+                eprintln!("CID{c_id} D{data_id} is empty!");
                 for i in 10..16 {
                     buff_header[i] = 0;
                 }
@@ -450,7 +461,8 @@ pub async fn store_content_on_disk(
                     i += 1;
                 }
                 let _ = header_file.write(&buff_header).await;
-                let _ = data_file.write(&data.bytes()).await;
+                let _r = data_file.write(&data.bytes()).await;
+                eprintln!("DID {data_id} Data file res: {_r:?}");
                 byte_pointer += data_len;
             }
             if data_id >= break_on_page {
@@ -499,6 +511,7 @@ pub async fn load_content_from_disk(
             let mut c_tree = ContentTree::empty(0);
             let mut mem_size = 0;
             let mut buffer: [u8; 1024] = [0; 1024];
+            eprintln!("Reading: {data_file:?}");
             let mut file = BufReader::new(File::open(data_file).await.unwrap());
             for i in 0..=u16::MAX {
                 if let Some((hash, pointer, size)) = temp_storage.remove(&i) {
@@ -514,12 +527,16 @@ pub async fn load_content_from_disk(
                         if count >= size {
                             let v = Vec::from(&buffer[..size]);
                             let data = Data::new(v).unwrap();
-                            if data.get_hash() == hash {
+                            let d_hash = data.get_hash();
+                            if d_hash == hash {
                                 let _ar = c_tree.append(data);
                                 mem_size += 1;
                                 // eprintln!("Append result: {:?}", _ar);
                             } else {
-                                eprintln!("CID-{} Page hash mismatch", cid);
+                                eprintln!(
+                                    "CID-{} Page hash mismatch(data: {d_hash}, expected: {hash})",
+                                    cid
+                                );
                                 return None;
                             }
                         }
@@ -577,7 +594,10 @@ async fn load_content_from_header_file(
         if new_pointer > *byte_pointer {
             *byte_pointer = new_pointer;
         }
-        // eprintln!("Insert {} - {}", page_id, page_hash);
+        eprintln!(
+            "Insert {} - {}, off: {}, size: {}",
+            page_id, page_hash, offset, page_size
+        );
         temp_storage.insert(page_id, (page_hash, offset, page_size));
     }
     // eprintln!("Read {} entries", temp_storage.len());

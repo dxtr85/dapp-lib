@@ -53,6 +53,7 @@ impl Configuration {
                 let line_header = split.next().unwrap();
                 match line_header {
                     "AUTOSAVE" => {
+                        eprintln!("Enabling AUTOSAVE");
                         autosave = true;
                     }
                     "MAX_CONNECTED_SWARMS" => {

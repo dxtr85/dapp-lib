@@ -634,6 +634,7 @@ impl Manifest {
         let mut res = Vec::with_capacity(1024);
         res.push(self.app_type.byte());
         let tags_len = self.tags.len() as u16;
+        eprintln!("tags_len: {tags_len}");
         let dtypes_len = self.d_types.len() as u16;
         res.push(0);
         let tags_page_count = if tags_len == 0 {
@@ -641,8 +642,14 @@ impl Manifest {
             0
         } else {
             res.push(1);
-            tags_len >> 4 + if tags_len % 32 > 0 { 1 } else { 0 }
+            eprintln!("{tags_len}%32: {}", tags_len % 32);
+            if (tags_len % 32) > 0 {
+                1 + (tags_len >> 5)
+            } else {
+                tags_len >> 5
+            }
         };
+        eprintln!("tags_page_count: {tags_page_count}");
         let d_types_len = self.d_types.len();
         let dtypes_page_count = if d_types_len == 0 {
             res.push(0);
@@ -768,6 +775,7 @@ impl Manifest {
         }
         let first_data_bytes = std::mem::replace(&mut res, Vec::with_capacity(1024));
         let mut output = vec![Data::new(first_data_bytes).unwrap()];
+        eprintln!("o-len 0: {}", output.len());
         let mut tags_to_add = self.tags.len();
         let mut elements_pushed = 0;
         for i in 0..=255 {
@@ -784,39 +792,48 @@ impl Manifest {
             if elements_pushed >= 32 {
                 elements_pushed = 0;
                 let next_data_bytes = std::mem::replace(&mut res, Vec::with_capacity(1024));
+                eprintln!("output push tag data");
                 output.push(Data::new(next_data_bytes).unwrap());
             }
         }
         if res.len() > 0 {
             let next_data_bytes = std::mem::replace(&mut res, Vec::with_capacity(1024));
+            eprintln!("output push tag data rem");
             output.push(Data::new(next_data_bytes).unwrap());
         }
         let mut d_types_to_add = self.d_types.len();
         let mut elements_pushed = 0;
         for i in 0..=255 {
+            if d_types_to_add == 0 {
+                break;
+            }
             if let Some(tag) = self.d_types.get(&i) {
+                eprintln!("DType: {}", tag.0);
                 res.append(&mut tag.bytes());
                 d_types_to_add -= 1;
             } else {
                 res.append(&mut vec![0; 32]);
             }
             elements_pushed += 1;
-            if d_types_to_add == 0 {
-                break;
-            }
             if elements_pushed >= 32 {
                 elements_pushed = 0;
                 let next_data_bytes = std::mem::replace(&mut res, Vec::with_capacity(1024));
+                eprintln!("output push dtype data");
                 output.push(Data::new(next_data_bytes).unwrap());
             }
         }
         if res.len() > 0 {
             let next_data_bytes = std::mem::replace(&mut res, Vec::with_capacity(1024));
+            eprintln!("output push dtype data rem");
             output.push(Data::new(next_data_bytes).unwrap());
         }
+        eprintln!("o-len 1: {}", output.len());
         output.append(&mut policy_pages);
+        eprintln!("o-len 2: {}", output.len());
         output.append(&mut caps_pages);
+        eprintln!("o-len 3: {}", output.len());
         output.append(&mut bsets_pages);
+        eprintln!("o-len 4: {}", output.len());
 
         output
     }
@@ -950,6 +967,7 @@ impl Manifest {
         let mut tag_names = Vec::with_capacity(256);
         for id in 0..=255 {
             if let Some(tag) = self.tags.get(&id) {
+                eprintln!("add TAG: {}", tag.0);
                 tag_names.push(tag.0.clone());
             }
         }
@@ -959,6 +977,7 @@ impl Manifest {
         let mut type_names = Vec::with_capacity(256);
         for id in 0..=255 {
             if let Some(tag) = self.d_types.get(&id) {
+                eprintln!("add DType: {}", tag.0);
                 type_names.push(tag.0.clone());
             }
         }
