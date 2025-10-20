@@ -557,7 +557,7 @@ impl Content {
     pub fn description(&self) -> String {
         match self {
             Self::Link(_sn, _c, descr, _tags, _ti) => descr.0.clone(),
-            Self::Data(d_type, _mem, _ct) => String::new(),
+            Self::Data(_d_type, _mem, _ct) => String::new(),
         }
     }
     pub fn data_type(&self) -> DataType {

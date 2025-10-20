@@ -1,14 +1,14 @@
 use std::collections::HashMap;
-use std::fs;
+// use std::fs;
 use std::path::{Path, PathBuf};
 
 // use async_std::channel::Sender;
 use async_std::fs::{File, OpenOptions};
 use async_std::io::prelude::SeekExt;
 use async_std::io::{BufReader, BufWriter, ReadExt, WriteExt};
-use gnome::prelude::{GnomeId, SwarmName};
+// use gnome::prelude::{GnomeId, SwarmName};
 
-use crate::content::{data_to_link, Content, ContentID, ContentTree, DataType, Description};
+use crate::content::{data_to_link, Content, ContentID, ContentTree, DataType};
 use crate::{ApplicationData, Data};
 
 // TODO: We need to define different storage policies given swarm can have:
@@ -281,7 +281,7 @@ pub async fn store_content_on_disk(
     break_on_page: u16,
 ) {
     // if let Ok((dtype, rhash)) = ) {
-    let rhash = content.hash();
+    // let rhash = content.hash();
     let dtype = content.data_type();
     let mut buff_header: [u8; 16] = [0; 16];
     // eprintln!("CID-{} hash {}", c_id, rhash);
@@ -296,7 +296,7 @@ pub async fn store_content_on_disk(
     // }
     let mut temp_storage = HashMap::new();
     let mut byte_pointer: u32 = 0;
-    if let Some(file_content) = load_content_from_header_file(
+    if let Some(_file_content) = load_content_from_header_file(
         header_file.clone(),
         dtype,
         &mut temp_storage,

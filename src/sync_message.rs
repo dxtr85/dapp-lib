@@ -1,5 +1,3 @@
-use std::ascii::AsciiExt;
-
 use crate::{content::DataType, prelude::ContentID, Data};
 pub fn serialize_requests(requests: Vec<SyncRequest>) -> Vec<u8> {
     let mut bytes = vec![];

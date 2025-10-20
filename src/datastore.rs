@@ -67,7 +67,7 @@ impl Datastore {
         //     insert_result,
         //     content.read_data(d_id).unwrap()
         // );
-        let update_result = self.update(c_id, content);
+        let _update_result = self.update(c_id, content);
         // eprintln!("Update result: {:?}", update_result);
         insert_result
     }
@@ -83,7 +83,7 @@ impl Datastore {
         let mut content = take_result.unwrap();
         let append_result = content.push_data(data);
         let _r = self.update(c_id, content);
-        let (_t, len) = self.type_and_len(c_id).unwrap();
+        let (_t, _len) = self.type_and_len(c_id).unwrap();
         // eprintln!("Update result: {}, len: {}", _r.is_ok(), len);
         append_result
     }

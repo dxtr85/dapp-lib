@@ -210,7 +210,7 @@ impl Engine {
                 phrase.push_str(" ");
                 phrase.push_str(&tag.0);
             }
-            let anything_added = self.iter_queries(&s_name, c_id, &phrase);
+            let _anything_added = self.iter_queries(&s_name, c_id, &phrase);
             if let Some(s_link) = self.swarm_links.get_mut(&s_id) {
                 s_link.s_descr = manif.description;
                 s_link.app_type = Some(manif.app_type);

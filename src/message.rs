@@ -62,7 +62,7 @@ impl SyncRequirements {
     // TODO: we need to add a changed: Vec<Content_ID> argument
     // to verify that only specified contents were changed
     // and that all specified contents were changed
-    pub fn post_validate(&self, c_id: ContentID, app: &ApplicationData) -> bool {
+    pub fn post_validate(&self, _c_id: ContentID, app: &ApplicationData) -> bool {
         for (c_id, hash) in self.post.iter() {
             if let Ok((_d_type, d_hash)) = app.content_root_hash(*c_id) {
                 if d_hash != *hash {

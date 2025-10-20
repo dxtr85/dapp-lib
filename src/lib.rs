@@ -425,7 +425,7 @@ impl SwarmSwap {
 
     pub fn filter_out_candidates(&mut self, swarm_id: SwarmID) {
         let c_len = self.candidates.len();
-        for i in 0..c_len {
+        for _i in 0..c_len {
             if let Some((s_id, s_name, g_id)) = self.candidates.pop_front() {
                 if s_id == swarm_id {
                     continue;
@@ -600,13 +600,13 @@ async fn serve_app_manager(
                         .await;
                 }
                 ToAppMgr::FromApp(LibRequest::Search(phrase)) => {
-                    to_search_enigne.send(SearchMsg::AddQuery(phrase)).await;
+                    let _ = to_search_enigne.send(SearchMsg::AddQuery(phrase)).await;
                 }
                 ToAppMgr::FromApp(LibRequest::RemoveSearch(phrase)) => {
-                    to_search_enigne.send(SearchMsg::DelQuery(phrase)).await;
+                    let _ = to_search_enigne.send(SearchMsg::DelQuery(phrase)).await;
                 }
                 ToAppMgr::FromApp(LibRequest::ListSearches) => {
-                    to_search_enigne.send(SearchMsg::ListQueries).await;
+                    let _ = to_search_enigne.send(SearchMsg::ListQueries).await;
                 }
                 ToAppMgr::FromApp(LibRequest::GetSearchResults(phrase)) => {
                     let _ = to_search_enigne.send(SearchMsg::GetResults(phrase)).await;
@@ -1073,7 +1073,7 @@ async fn serve_app_manager(
                 ToAppMgr::NeighborsListing(s_id, neighbors) => {
                     let _ = to_user.send(ToApp::Neighbors(s_id, neighbors)).await;
                 }
-                ToAppMgr::ChangeDiameter(s_id, new_diameter) => {
+                ToAppMgr::ChangeDiameter(_s_id, new_diameter) => {
                     // TODO: make sure we are sending this to correct swarm!
                     // but for now we just test if this functionality works
                     let _ = app_mgr
@@ -1082,7 +1082,7 @@ async fn serve_app_manager(
                         .send(ToAppData::ChangeDiameter(new_diameter))
                         .await;
                 }
-                ToAppMgr::ChangeContent(s_id, c_id, d_type, data_vec) => {
+                ToAppMgr::ChangeContent(_s_id, c_id, d_type, data_vec) => {
                     // TODO: make sure we are sending this to correct swarm!
                     // eprintln!("app mgr received CC request, sending to app data");
                     // for data in &data_vec {
@@ -1183,7 +1183,7 @@ async fn serve_app_manager(
                 }
                 ToAppMgr::FromDatastore(
                     // _requestor,
-                    LibResponse::SwarmSyncedExt(s_id, s_name, root_hash, appdata_sender),
+                    LibResponse::SwarmSyncedExt(_s_id, _s_name, _root_hash, _appdata_sender),
                 ) => {
                     eprintln!("Unexpected SwarmSyncedExt message");
                 }
@@ -1996,7 +1996,7 @@ async fn serve_app_manager(
                     // First we need to make sure we have some new SwarmNames
                     // to choose from.
                     // if swarm_swap.has_candidates() {
-                    if let Some((s_thru_id, s_candidate_name, g_thru_id)) =
+                    if let Some((_s_thru_id, s_candidate_name, _g_thru_id)) =
                         swarm_swap.next_candidate()
                     {
                         eprintln!("There are some candidates to swap in: {}", s_candidate_name);
@@ -2127,7 +2127,7 @@ async fn serve_app_manager(
                             // If it is false we query existing swarms, excluding
                             // the one that is ready to get swapped, to provide a list
                             // of neighboring SwarmNames.
-                            let s_i_opt = if let Some((s_name, s_id)) = swap_id_opt {
+                            let s_i_opt = if let Some((_s_name, s_id)) = swap_id_opt {
                                 Some(s_id)
                             } else {
                                 None
@@ -2614,7 +2614,7 @@ async fn serve_app_data(
                 let b_hashes = shell.data_hashes();
                 let mut a_tree = ContentTree::empty(0);
                 for hash in b_hashes {
-                    a_tree.append(Data::empty(hash));
+                    let _ = a_tree.append(Data::empty(hash));
                 }
                 let a_hash = a_tree.hash();
                 if a_hash != post_hash {
@@ -2822,7 +2822,7 @@ async fn serve_app_data(
                     }
                 }
             }
-            ToAppData::MulticastSend(c_id, c_data) => {
+            ToAppData::MulticastSend(_c_id, c_data) => {
                 //TODO: send to AppMgr UploadData message
                 // this logic should be moved to app mgr
                 if m_cast_origin.is_none() {
@@ -2834,7 +2834,7 @@ async fn serve_app_data(
                     }
                     continue;
                 }
-                let (mcast_id, mcast_send) = m_cast_origin.clone().unwrap();
+                let (_mcast_id, mcast_send) = m_cast_origin.clone().unwrap();
                 let send_res = mcast_send.send(c_data);
                 if send_res.is_ok() {
                     eprintln!("Sent MCast data");
@@ -3310,11 +3310,11 @@ async fn serve_swarm(
                     // and apply to app_data
                     eprintln!("Got MCData from {}", c_id.0);
                 }
-                GnomeToApp::BCastUplinkData(c_id, data) => {
+                GnomeToApp::BCastUplinkData(_c_id, data) => {
                     // TODO: send this to app
                     eprintln!("BCUData: {:?}", data);
                 }
-                GnomeToApp::MCastUplinkData(c_id, data) => {
+                GnomeToApp::MCastUplinkData(_c_id, data) => {
                     // TODO: send this to app
                     eprintln!("MCUData: {:?}", data);
                 }
@@ -4372,7 +4372,7 @@ impl ApplicationData {
                     let _ = new_content.pop_data();
                 }
                 let bytes = data.bytes();
-                let mut byte_groups_iter = bytes.chunks_exact(8);
+                let byte_groups_iter = bytes.chunks_exact(8);
                 for chunk in byte_groups_iter {
                     let hsh = u64::from_be_bytes(chunk.try_into().unwrap());
                     let _ = new_content.push_data(Data::empty(hsh));
@@ -4851,7 +4851,7 @@ async fn change_content_task(
             // eprintln!("bhsw {:?}", content_to_work_on.data_hashes());
             for _i in 0..hhd_len {
                 let pop_res = content_to_work_on.pop_data();
-                if let Ok(dta) = pop_res {
+                if let Ok(_dta) = pop_res {
                     // eprintln!("paac prep pop: {}", dta.get_hash());
                 } else {
                     // eprintln!("error poping data: {}", pop_res.err().unwrap());
@@ -5441,7 +5441,7 @@ async fn response_task(
                 d_id,
                 data.len()
             );
-            let (d_type, len) = app_data.get_type_and_len(c_id).unwrap();
+            let (d_type, _len) = app_data.get_type_and_len(c_id).unwrap();
             // eprintln!("Len: {}", len);
             // let bot_hashes = app_data.content_bottom_hashes(c_id).unwrap();
             // for bot in bot_hashes {
@@ -5507,17 +5507,17 @@ async fn response_task(
                 eprintln!("UpdateData failed: {}", res.err().unwrap());
             }
         }
-        SyncMessageType::InsertData(c_id, d_id) => {
+        SyncMessageType::InsertData(_c_id, _d_id) => {
             //TODO
             // app_data.save_content_to_disk(c_id, None).await;
             eprintln!("SyncMessageType::InsertData ");
         }
-        SyncMessageType::ExtendData(c_id, d_id) => {
+        SyncMessageType::ExtendData(_c_id, _d_id) => {
             //TODO
             // app_data.save_content_to_disk(c_id, None).await;
             eprintln!("SyncMessageType::ExtendData ");
         }
-        SyncMessageType::UserDefined(value, c_id, d_id) => {
+        SyncMessageType::UserDefined(value, _c_id, _d_id) => {
             //TODO: should we do req check?
             if app_data.should_auto_forward_heap_msg() {
                 // send immediately to App
@@ -5563,7 +5563,7 @@ async fn custom_request_task(
     // when sideloading Pages via broadcast or other means than SyncMessages.
     if m_type != SYNC_REQUEST {
         eprintln!("Forwarding CustNeighRequest({})", m_type);
-        to_app_mgr_send
+        let _ = to_app_mgr_send
             .send(ToAppMgr::FromDatastore(LibResponse::CustomNeighborRequest(
                 swarm_id,
                 neighbor_id,
@@ -6180,7 +6180,7 @@ async fn custom_response_task(
                 );
                 if let Ok((d_type, _len)) = app_data.get_type_and_len(c_id) {
                     if matches!(d_type, DataType::Link) {
-                        let upd_res =
+                        let _upd_res =
                             app_data.update_transformative_link(true, c_id, part_no, total, hashes);
                         // eprintln!("Update res: {:?}", upd_res);
                     } else {
