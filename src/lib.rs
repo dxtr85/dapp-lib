@@ -354,7 +354,7 @@ impl ReadState {
         }
     }
 
-    pub fn page_arrived(&mut self, p_id: u16) -> bool {
+    pub fn page_arrived_is_done(&mut self, p_id: u16) -> bool {
         self.missing_pages.remove(&p_id);
         self.missing_pages.is_empty()
     }
@@ -4597,9 +4597,10 @@ async fn update_active_reads(
     // eprintln!("update_active_reads");
     if let Some(rs) = active_reads.get_mut(&c_id) {
         // eprintln!("Some rs");
-        if rs.page_arrived(page_no) {
+        if !rs.page_arrived_is_done(page_no) {
             // eprintln!("sending data to user");
             //TODO: send data chunk to user
+            // TODO: store chunk size for every instance
             let next_chunk = if page_no % 64 > 0 {
                 1 + page_no >> 6
             } else {
@@ -6608,7 +6609,7 @@ async fn read_data_task(
             // We have all data for chunk 0, so we should iterate till
             // we no longer have all pages required and then update active_reads
             // if needed
-            if read_to_page_incl < len {
+            if read_to_page_incl < len && read_to_page_incl >= starting_page << 6 {
                 let _ = app_data_send
                     .send(ToAppData::ReadNextChunk(
                         requestor,
