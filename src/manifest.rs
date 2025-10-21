@@ -775,10 +775,13 @@ impl Manifest {
         }
         let first_data_bytes = std::mem::replace(&mut res, Vec::with_capacity(1024));
         let mut output = vec![Data::new(first_data_bytes).unwrap()];
-        eprintln!("o-len 0: {}", output.len());
         let mut tags_to_add = self.tags.len();
+        eprintln!("o-len 0: {},tags: {}", output.len(), tags_to_add);
         let mut elements_pushed = 0;
         for i in 0..=255 {
+            if tags_to_add == 0 {
+                break;
+            }
             if let Some(tag) = self.tags.get(&i) {
                 res.append(&mut tag.bytes());
                 tags_to_add -= 1;
@@ -786,9 +789,6 @@ impl Manifest {
                 res.append(&mut vec![0; 32]);
             }
             elements_pushed += 1;
-            if tags_to_add == 0 {
-                break;
-            }
             if elements_pushed >= 32 {
                 elements_pushed = 0;
                 let next_data_bytes = std::mem::replace(&mut res, Vec::with_capacity(1024));
