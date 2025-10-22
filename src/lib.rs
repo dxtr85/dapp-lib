@@ -4606,6 +4606,7 @@ async fn update_active_reads(
             } else {
                 page_no >> 6
             };
+            // eprintln!("ReadNextChunk 1");
             let _ = app_data_send
                 .send(ToAppData::ReadNextChunk(rs.requestor, *c_id, next_chunk))
                 .await;
@@ -5381,6 +5382,7 @@ async fn response_task(
             }
             // TODO
             let res = app_data.append_data(c_id, data);
+            let (d_type, _d_len) = app_data.get_type_and_len(c_id).unwrap();
             if res.is_ok() {
                 if !requirements.post_validate(c_id, &app_data) {
                     eprintln!("POST validation failed for AppendData");
@@ -5396,6 +5398,9 @@ async fn response_task(
                         app_data.save_content_to_disk(c_id, None).await;
                     }
                     eprintln!("Data appended successfully ({})", hash);
+                    let _to_mgr_res = to_app_mgr_send
+                        .send(ToAppMgr::ContentChanged(swarm_id, c_id, d_type, None))
+                        .await;
                 }
             }
         }
@@ -6508,6 +6513,7 @@ async fn read_data_task(
     };
     if let Some(l_p) = last_page {
         if l_p < read_to_page_incl {
+            // eprintln!("read_to_page_incl is now: {l_p}");
             read_to_page_incl = l_p;
         }
     }
@@ -6570,6 +6576,7 @@ async fn read_data_task(
                 for p_miss in &data_missing {
                     h_miss.insert(*p_miss);
                 }
+                // TODO: rework this entire logic
                 active_reads.insert(
                     c_id,
                     ReadState::new(len, requestor, starting_page >> 6, h_miss),
@@ -6609,7 +6616,11 @@ async fn read_data_task(
             // We have all data for chunk 0, so we should iterate till
             // we no longer have all pages required and then update active_reads
             // if needed
-            if read_to_page_incl < len && read_to_page_incl >= starting_page << 6 {
+            if read_to_page_incl < len && read_to_page_incl > starting_page + 63 {
+                // eprintln!(
+                //     "ReadNextChunk 2 r2pi: {read_to_page_incl}, sp:{}",
+                //     starting_page << 6
+                // );
                 let _ = app_data_send
                     .send(ToAppData::ReadNextChunk(
                         requestor,
