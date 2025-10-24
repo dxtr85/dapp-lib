@@ -176,6 +176,7 @@ pub enum ToApp {
     HeapEmpty(SwarmID),
     CustomNeighborRequest(SwarmID, GnomeId, u8, CastData),
     CustomNeighborResponse(SwarmID, GnomeId, u8, CastData),
+    PolicyNotMet(SwarmID, SyncMessageType, Data),
     Quit,
 }
 
@@ -267,6 +268,7 @@ pub enum LibResponse {
     AuditResult(SwarmID, usize, usize, u8),
     HeapData(SwarmID, AppDefinedMsg, GnomeId),
     HeapEmpty(SwarmID),
+    PolicyNotMet(SwarmID, SyncMessageType, Data),
     CustomNeighborRequest(SwarmID, GnomeId, u8, CastData),
     CustomNeighborResponse(SwarmID, GnomeId, u8, CastData),
 }
@@ -341,6 +343,8 @@ pub enum ToAppData {
     MyName(SwarmName),
     PeekHeap,
     PopHeap,
+    PolicyNotMet(SyncData),
+    PolicyNotMetRcfg(u8, SyncData),
     Terminate,
 }
 struct PartialHashes {
@@ -888,6 +892,10 @@ async fn serve_app_manager(
                     let _ = to_user
                         .send(ToApp::CustomNeighborResponse(s_id, g_id, resp_type, c_data))
                         .await;
+                }
+                ToAppMgr::FromDatastore(LibResponse::PolicyNotMet(s_id, sm_type, data)) => {
+                    //  send it back to App
+                    let _ = to_user.send(ToApp::PolicyNotMet(s_id, sm_type, data)).await;
                 }
                 ToAppMgr::GetCIDsForTags(swarm_id, n_id, tags, all_first_pages) => {
                     eprintln!("We are requesting tags {:?} for {:?} swarm", tags, swarm_id);
@@ -3293,6 +3301,22 @@ async fn serve_app_data(
                         .await;
                 }
             }
+            ToAppData::PolicyNotMet(s_data) => {
+                if let Some(s_msg) = app_data.process(s_data) {
+                    // eprintln!("PolicyNotMet for {:?}", s_msg.m_type);
+                    let _ = to_app_mgr_send
+                        .send(ToAppMgr::FromDatastore(LibResponse::PolicyNotMet(
+                            swarm_id,
+                            s_msg.m_type,
+                            s_msg.data,
+                        )))
+                        .await;
+                }
+            }
+            ToAppData::PolicyNotMetRcfg(conf_id, s_data) => {
+                //TODO: build logic to handle this
+                eprintln!("PolicyNotMet for Reconfigure({})", conf_id);
+            }
             ToAppData::Terminate => {
                 eprintln!("AppData: Terminate");
                 // TODO: determine whether or not we want to store this Swarm on disk
@@ -3419,6 +3443,18 @@ async fn serve_swarm(
                         eprintln!("Unserved Reconfig from {}: {:?}", id, other);
                     }
                 },
+                GnomeToApp::PolicyNotMet(_s_data) => {
+                    // TODO: parse s_data and send it back to App
+                    let _ = to_app_data_send
+                        .send(ToAppData::PolicyNotMet(_s_data))
+                        .await;
+                }
+                GnomeToApp::PolicyNotMetRcfg(conf_id, _s_data) => {
+                    // TODO: parse s_data and send it back to App
+                    let _ = to_app_data_send
+                        .send(ToAppData::PolicyNotMetRcfg(conf_id, _s_data))
+                        .await;
+                }
                 _ => {
                     // println!("UNserved swarm data: {:?}", _res);
                     let _ = to_app_data_send.send(ToAppData::Response(resp)).await;
