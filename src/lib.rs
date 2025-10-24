@@ -1,4 +1,5 @@
 use crate::content::data_to_link;
+use crate::message::MAX_AVAIL_APP_MSG_ID;
 use crate::prelude::SyncRequirements;
 use crate::prelude::TransformInfo;
 use crate::search::SearchMsg;
@@ -65,6 +66,7 @@ use async_std::channel::Sender as ASender;
 
 const SYNC_REQUEST: u8 = 245;
 const SYNC_RESPONSE: u8 = 243;
+
 pub mod prelude {
     pub use crate::app_type::AppType;
     pub use crate::content::{
@@ -84,6 +86,7 @@ pub mod prelude {
     pub use crate::storage::load_content_from_disk;
     pub use crate::storage::read_datastore_from_disk;
     pub use crate::storage::StoragePolicy;
+    pub use crate::AppDefinedMsg;
     pub use crate::ApplicationData;
     pub use crate::ApplicationManager;
     pub use crate::Configuration;
@@ -107,6 +110,45 @@ pub mod prelude {
     pub use gnome::prelude::Transport;
 }
 
+#[derive(Debug, Clone)]
+pub struct AppDefinedMsg {
+    m_type: u8,
+    c_id: u16,
+    d_id: u16,
+    data: Data,
+}
+impl AppDefinedMsg {
+    pub fn new(
+        m_type: u8,
+        c_id: ContentID,
+        d_id: u16,
+        data: Data,
+    ) -> Result<Self, (u8, ContentID, u16, Data)> {
+        if m_type > MAX_AVAIL_APP_MSG_ID {
+            eprintln!("Can not build AppDefinedMsg, max_id:{MAX_AVAIL_APP_MSG_ID}");
+            Err((m_type, c_id, d_id, data))
+        } else {
+            Ok(AppDefinedMsg {
+                m_type,
+                c_id,
+                d_id,
+                data,
+            })
+        }
+    }
+    pub fn m_type(&self) -> u8 {
+        self.m_type
+    }
+    pub fn c_id(&self) -> u16 {
+        self.c_id
+    }
+    pub fn d_id(&self) -> u16 {
+        self.d_id
+    }
+    pub fn data(self) -> Data {
+        self.data
+    }
+}
 #[derive(Debug)]
 pub enum ToApp {
     ActiveSwarm(SwarmName, SwarmID), //TODO: send Vec<Data> from CID=0(Manifest)
@@ -130,7 +172,8 @@ pub enum ToApp {
     RunningPolicies(Vec<(Policy, Requirement)>),
     RunningCapabilities(Vec<(Capabilities, Vec<GnomeId>)>),
     RunningByteSets(Vec<(u8, ByteSet)>),
-    HeapData(SwarmID, u8, Data, GnomeId),
+    HeapData(SwarmID, AppDefinedMsg, GnomeId),
+    HeapEmpty(SwarmID),
     CustomNeighborRequest(SwarmID, GnomeId, u8, CastData),
     CustomNeighborResponse(SwarmID, GnomeId, u8, CastData),
     Quit,
@@ -162,7 +205,7 @@ pub enum ToAppMgr {
     AppendData(SwarmID, ContentID, Data),
     RemoveData(SwarmID, ContentID, u16),
     UpdateData(SwarmID, ContentID, u16, Data),
-    UserDefined(SwarmID, u8, u16, u16, Data),
+    AppDefined(SwarmID, AppDefinedMsg),
     ContentAdded(SwarmID, ContentID, DataType, Data),
     ContentChanged(SwarmID, ContentID, DataType, Option<Data>),
     TransformLinkRequest(Box<SyncData>),
@@ -201,6 +244,8 @@ pub enum LibRequest {
     SetRunningByteSet(SwarmName, u8, ByteSet),
     CustomNeighborRequest(SwarmName, GnomeId, u8, CastData),
     CustomNeighborResponse(SwarmName, GnomeId, u8, CastData),
+    PeekHeap(SwarmID),
+    PopHeap(SwarmID),
 }
 #[derive(Debug)]
 pub enum LibResponse {
@@ -220,7 +265,8 @@ pub enum LibResponse {
     ReadError(SwarmID, ContentID, AppError),
     DownloadingPages(SwarmID, ContentID, DataType),
     AuditResult(SwarmID, usize, usize, u8),
-    HeapData(SwarmID, u8, Data, GnomeId),
+    HeapData(SwarmID, AppDefinedMsg, GnomeId),
+    HeapEmpty(SwarmID),
     CustomNeighborRequest(SwarmID, GnomeId, u8, CastData),
     CustomNeighborResponse(SwarmID, GnomeId, u8, CastData),
 }
@@ -276,7 +322,7 @@ pub enum ToAppData {
     ChangeContent(ContentID, DataType, Vec<Data>),
     ChangeDiameter(u8),
     UpdateData(ContentID, u16, Data),
-    UserDefined(u8, u16, u16, Data),
+    AppDefined(AppDefinedMsg),
     AppendContent(DataType, Data),
     AppendData(ContentID, Data),
     RemoveData(ContentID, u16),
@@ -293,6 +339,8 @@ pub enum ToAppData {
     RunningCapabilitiesReq,
     RunningByteSetsReq,
     MyName(SwarmName),
+    PeekHeap,
+    PopHeap,
     Terminate,
 }
 struct PartialHashes {
@@ -758,13 +806,16 @@ async fn serve_app_manager(
                         );
                     }
                 }
-                // ToAppMgr::FromSearch(LibRequest::ReadAllFirstPages(s_id)) => {
-                //     if let Some(to_app_data) = app_mgr.app_data_store.get(&s_id) {
-                //         let _ = to_app_data
-                //             .send(ToAppData::ReadAllFirstPages(Requestor::Search))
-                //             .await;
-                //     }
-                // }
+                ToAppMgr::FromApp(LibRequest::PeekHeap(s_id)) => {
+                    if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
+                        let _ = sender.send(ToAppData::PeekHeap).await;
+                    }
+                }
+                ToAppMgr::FromApp(LibRequest::PopHeap(s_id)) => {
+                    if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
+                        let _ = sender.send(ToAppData::PopHeap).await;
+                    }
+                }
                 ToAppMgr::FromDatastore(LibResponse::FirstPages(s_id, first_pages)) => {
                     // match requestor {
                     //     Requestor::App => {
@@ -806,11 +857,15 @@ async fn serve_app_manager(
                         ));
                     }
                 }
-                ToAppMgr::FromDatastore(LibResponse::HeapData(s_id, m_type, data, signed_by)) => {
+                ToAppMgr::FromDatastore(LibResponse::HeapData(s_id, app_msg, signed_by)) => {
                     eprintln!("AppMgr sending Heap Data to user",);
                     let _ = to_user
-                        .send(ToApp::HeapData(s_id, m_type, data, signed_by))
+                        .send(ToApp::HeapData(s_id, app_msg, signed_by))
                         .await;
+                }
+                ToAppMgr::FromDatastore(LibResponse::HeapEmpty(s_id)) => {
+                    eprintln!("AppMgr sending HeapEmpty to user",);
+                    let _ = to_user.send(ToApp::HeapEmpty(s_id)).await;
                 }
                 ToAppMgr::FromDatastore(LibResponse::CustomNeighborRequest(
                     s_id,
@@ -1116,11 +1171,9 @@ async fn serve_app_manager(
                         let _ = sender.send(ToAppData::UpdateData(c_id, d_id, data)).await;
                     }
                 }
-                ToAppMgr::UserDefined(s_id, req_id, c_id, d_id, data) => {
+                ToAppMgr::AppDefined(s_id, app_msg) => {
                     if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
-                        let _ = sender
-                            .send(ToAppData::UserDefined(req_id, c_id, d_id, data))
-                            .await;
+                        let _ = sender.send(ToAppData::AppDefined(app_msg)).await;
                     }
                 }
                 // ToAppMgr::AppendShelledDatas(_s_id, c_id, data) => {
@@ -2649,8 +2702,8 @@ async fn serve_app_data(
                 )
                 .await
             }
-            ToAppData::UserDefined(req_id, c_id, d_id, data) => {
-                let _ = user_defined_request_task(req_id, c_id, d_id, data, &to_gnome_sender).await;
+            ToAppData::AppDefined(app_msg) => {
+                let _ = app_defined_request_task(app_msg, &to_gnome_sender).await;
             }
 
             ToAppData::ChangeDiameter(new_diameter) => {
@@ -3214,6 +3267,32 @@ async fn serve_app_data(
             ToAppData::RunningByteSetsReq => {
                 let _ = to_gnome_sender.send(ToGnome::RunningByteSets);
             }
+            ToAppData::PeekHeap => {
+                if let Some((app_msg, orig)) = app_data.heap.peek() {
+                    let _ = to_app_mgr_send
+                        .send(ToAppMgr::FromDatastore(LibResponse::HeapData(
+                            swarm_id, app_msg, orig,
+                        )))
+                        .await;
+                } else {
+                    let _ = to_app_mgr_send
+                        .send(ToAppMgr::FromDatastore(LibResponse::HeapEmpty(swarm_id)))
+                        .await;
+                }
+            }
+            ToAppData::PopHeap => {
+                if let Some((app_msg, orig)) = app_data.heap.pop() {
+                    let _ = to_app_mgr_send
+                        .send(ToAppMgr::FromDatastore(LibResponse::HeapData(
+                            swarm_id, app_msg, orig,
+                        )))
+                        .await;
+                } else {
+                    let _ = to_app_mgr_send
+                        .send(ToAppMgr::FromDatastore(LibResponse::HeapEmpty(swarm_id)))
+                        .await;
+                }
+            }
             ToAppData::Terminate => {
                 eprintln!("AppData: Terminate");
                 // TODO: determine whether or not we want to store this Swarm on disk
@@ -3573,7 +3652,7 @@ struct HeapSmall {
     size: usize,
     start: usize,
     end: usize,
-    the_heap: [(u8, Data, GnomeId); 16],
+    the_heap: [(AppDefinedMsg, GnomeId); 16],
 }
 impl HeapSmall {
     pub fn new(prev_heap_opt: Option<Heap>) -> Self {
@@ -3581,25 +3660,35 @@ impl HeapSmall {
             size: 0,
             start: 0,
             end: 0,
-            the_heap: array::from_fn(|_i| (0, Data::empty(0), GnomeId::any())),
+            the_heap: array::from_fn(|_i| {
+                (
+                    AppDefinedMsg {
+                        m_type: 0,
+                        c_id: 0,
+                        d_id: 0,
+                        data: Data::empty(0),
+                    },
+                    GnomeId::any(),
+                )
+            }),
         };
         if let Some(mut p_heap) = prev_heap_opt {
-            while let Some(item) = p_heap.pop() {
-                heap.push(item);
+            while let Some((item, signed_by)) = p_heap.pop() {
+                heap.push(item, signed_by);
             }
         }
         heap
     }
 
-    pub fn push(&mut self, item: (u8, Data, GnomeId)) {
+    pub fn push(&mut self, item: AppDefinedMsg, signed_by: GnomeId) {
         if self.size >= 16 {
             eprintln!("OVERWRITING HEAP!({})", self.size);
         }
-        self.the_heap[self.end] = item;
+        self.the_heap[self.end] = (item, signed_by);
         self.update_after_push();
     }
 
-    pub fn peek(&self) -> Option<(u8, Data, GnomeId)> {
+    pub fn peek(&self) -> Option<(AppDefinedMsg, GnomeId)> {
         if self.size == 0 {
             None
         } else {
@@ -3607,7 +3696,7 @@ impl HeapSmall {
         }
     }
 
-    pub fn pop(&mut self) -> Option<(u8, Data, GnomeId)> {
+    pub fn pop(&mut self) -> Option<(AppDefinedMsg, GnomeId)> {
         let res = if self.size == 0 {
             None
         } else {
@@ -3627,7 +3716,17 @@ impl HeapSmall {
         self.size = 0;
         self.start = 0;
         self.end = 0;
-        self.the_heap = array::from_fn(|_i| (0, Data::empty(0), GnomeId::any()));
+        self.the_heap = array::from_fn(|_i| {
+            (
+                AppDefinedMsg {
+                    m_type: 0,
+                    c_id: 0,
+                    d_id: 0,
+                    data: Data::empty(0),
+                },
+                GnomeId::any(),
+            )
+        });
     }
 
     fn update_after_push(&mut self) {
@@ -3667,23 +3766,23 @@ enum Heap {
 }
 
 impl Heap {
-    pub fn push(&mut self, item: (u8, Data, GnomeId)) {
+    pub fn push(&mut self, item: AppDefinedMsg, signed_by: GnomeId) {
         match self {
             Self::Small(hs) => {
-                hs.push(item);
+                hs.push(item, signed_by);
             }
             _o => {
                 // do nothing
             }
         }
     }
-    pub fn peek(&self) -> Option<(u8, Data, GnomeId)> {
+    pub fn peek(&self) -> Option<(AppDefinedMsg, GnomeId)> {
         match self {
             Self::Small(hs) => hs.peek(),
             _o => None,
         }
     }
-    pub fn pop(&mut self) -> Option<(u8, Data, GnomeId)> {
+    pub fn pop(&mut self) -> Option<(AppDefinedMsg, GnomeId)> {
         match self {
             Self::Small(hs) => hs.pop(),
             _o => None,
@@ -4517,17 +4616,17 @@ impl ApplicationData {
     }
 
     // pushing comes from Swarm only
-    fn push_heap(&mut self, header: u8, data: Data, signed_by: GnomeId) {
-        eprintln!("Push Heap {header}[len:{}] (© {signed_by})", data.len());
-        self.heap.push((header, data, signed_by));
+    fn push_heap(&mut self, app_msg: AppDefinedMsg, signed_by: GnomeId) {
+        // eprintln!("Push Heap {header}[len:{}] (© {signed_by})", data.len());
+        self.heap.push(app_msg, signed_by);
     }
 
     // TODO: allow App to retrieve this data
-    pub fn pop_heap(&mut self) -> Option<(u8, Data, GnomeId)> {
+    pub fn pop_heap(&mut self) -> Option<(AppDefinedMsg, GnomeId)> {
         self.heap.pop()
     }
 
-    pub fn peek_heap(&self) -> Option<(u8, Data, GnomeId)> {
+    pub fn peek_heap(&self) -> Option<(AppDefinedMsg, GnomeId)> {
         self.heap.peek()
     }
 
@@ -5172,24 +5271,18 @@ async fn change_content_task(
         eprintln!("Unable to change non existing content");
     }
 }
-async fn user_defined_request_task(
-    req_id: u8,
-    c_id: ContentID,
-    d_id: u16,
-    data: Data,
-    to_gnome_sender: &Sender<ToGnome>,
-) {
+async fn app_defined_request_task(app_msg: AppDefinedMsg, to_gnome_sender: &Sender<ToGnome>) {
     let msg = SyncMessage::new(
-        SyncMessageType::UserDefined(req_id, c_id, d_id),
+        SyncMessageType::AppDefined(app_msg.m_type, app_msg.c_id, app_msg.d_id),
         SyncRequirements {
             pre: vec![], // TODO: maybe we should use reqs?
             post: vec![],
         },
-        data,
+        app_msg.data,
     );
     let parts = msg.into_parts();
     for part in parts {
-        eprintln!("ToGnome::AddData(UserDefined({req_id}))");
+        eprintln!("ToGnome::AddData(AppDefined");
         let _ = to_gnome_sender.send(ToGnome::AddData(part));
     }
 }
@@ -5523,20 +5616,21 @@ async fn response_task(
             // app_data.save_content_to_disk(c_id, None).await;
             eprintln!("SyncMessageType::ExtendData ");
         }
-        SyncMessageType::UserDefined(value, _c_id, _d_id) => {
+        SyncMessageType::AppDefined(m_type, c_id, d_id) => {
             //TODO: should we do req check?
+            let app_msg = AppDefinedMsg::new(m_type, c_id, d_id, data).unwrap();
             if app_data.should_auto_forward_heap_msg() {
                 // send immediately to App
                 eprintln!("forwarding heap data directly to app");
                 let _ = to_app_mgr_send
                     .send(ToAppMgr::FromDatastore(LibResponse::HeapData(
-                        swarm_id, value, data, signed_by,
+                        swarm_id, app_msg, signed_by,
                     )))
                     .await;
             } else {
-                app_data.push_heap(value, data, signed_by);
+                app_data.push_heap(app_msg, signed_by);
             }
-            eprintln!("SyncMessageType::UserDefined({})", value);
+            eprintln!("SyncMessageType::UserDefined({})", m_type);
         }
     }
 }
