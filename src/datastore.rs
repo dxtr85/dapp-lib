@@ -214,13 +214,14 @@ impl Datastore {
             Self::Filled(content) => {
                 if c_id == 0 {
                     match content {
-                        Content::Link(s_name, c_id, descr, data, ti) => {
+                        Content::Link(_at, s_name, c_id, descr, data, ti) => {
                             let result = if let Some(ti) = ti {
                                 Ok(ti)
                             } else {
                                 Err(AppError::LinkNonTransformative)
                             };
-                            *self = Self::Filled(Content::Link(s_name, c_id, descr, data, None));
+                            *self =
+                                Self::Filled(Content::Link(_at, s_name, c_id, descr, data, None));
                             result
                         }
                         other => {
@@ -252,9 +253,15 @@ impl Datastore {
             Self::Filled(content) => {
                 if c_id == 0 {
                     match content {
-                        Content::Link(s_name, c_id, descr, data, _ti) => {
-                            *self =
-                                Self::Filled(Content::Link(s_name, c_id, descr, data, Some(ti)));
+                        Content::Link(app_type, s_name, c_id, descr, data, _ti) => {
+                            *self = Self::Filled(Content::Link(
+                                app_type,
+                                s_name,
+                                c_id,
+                                descr,
+                                data,
+                                Some(ti),
+                            ));
                             Ok(())
                         }
                         other => {
@@ -284,7 +291,14 @@ impl Datastore {
             Self::Filled(old_content) => {
                 if c_id == 0 {
                     match old_content {
-                        Content::Link(ref _s_name, _c_id, ref _descr, ref _data, ref ti_opt) => {
+                        Content::Link(
+                            _at,
+                            ref _s_name,
+                            _c_id,
+                            ref _descr,
+                            ref _data,
+                            ref ti_opt,
+                        ) => {
                             if ti_opt.is_some() {
                                 *self = Self::Filled(old_content);
                                 Err(AppError::Smthg)

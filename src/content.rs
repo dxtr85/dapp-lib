@@ -7,6 +7,7 @@ use std::hash::Hash;
 
 use crate::error::SubtreeError;
 use crate::prelude::AppError;
+use crate::prelude::AppType;
 use crate::prelude::Data;
 pub type ContentID = u16;
 
@@ -73,6 +74,7 @@ pub enum Content {
     // this way links with different description but poining to the same
     // content will have the same hash
     Link(
+        AppType,
         SwarmName,
         ContentID,
         Description,
@@ -540,7 +542,7 @@ impl Content {
     }
     pub fn tag_ids(&self) -> Vec<u8> {
         match self {
-            Self::Link(_sn, _c, _descr, d_tags, _ti) => {
+            Self::Link(_at, _sn, _c, _descr, d_tags, _ti) => {
                 if d_tags.is_empty() {
                     return vec![];
                 }
@@ -556,19 +558,19 @@ impl Content {
     }
     pub fn description(&self) -> String {
         match self {
-            Self::Link(_sn, _c, descr, _tags, _ti) => descr.0.clone(),
+            Self::Link(_at, _sn, _c, descr, _tags, _ti) => descr.0.clone(),
             Self::Data(_d_type, _mem, _ct) => String::new(),
         }
     }
     pub fn data_type(&self) -> DataType {
         match self {
-            Self::Link(_sn, _c, _descr, _tags, _ti) => DataType::Link,
+            Self::Link(_at, _sn, _c, _descr, _tags, _ti) => DataType::Link,
             Self::Data(d_type, _mem, _ct) => *d_type,
         }
     }
     pub fn len(&self) -> u16 {
         match self {
-            Self::Link(_sn, _c, _descr, _data, ti) => {
+            Self::Link(_at, _sn, _c, _descr, _data, ti) => {
                 if let Some(ti) = ti {
                     ti.size
                 } else {
@@ -580,8 +582,8 @@ impl Content {
     }
     pub fn to_data(self) -> Result<Data, Self> {
         match self {
-            Content::Link(s_name, c_id, descr, data, ti_opt) => {
-                Ok(link_to_data(s_name, c_id, descr, data, ti_opt))
+            Content::Link(app_type, s_name, c_id, descr, data, ti_opt) => {
+                Ok(link_to_data(app_type, s_name, c_id, descr, data, ti_opt))
             }
             // TODO: here we drop existing Content when it is not a Link!
             other => Err(other),
@@ -590,7 +592,7 @@ impl Content {
     pub fn read_data(&self, data_id: u16) -> Result<Data, AppError> {
         // eprintln!("Internal read_data {}", data_id);
         match self {
-            Self::Link(s_name, c_id, descr, data, ti) => {
+            Self::Link(app_type, s_name, c_id, descr, data, ti) => {
                 // if let Some(ti) = ti {
                 //     if let Some(data) = ti.data.get(&data_id) {
                 //         Ok(data.clone())
@@ -601,6 +603,7 @@ impl Content {
                 if data_id == 0 {
                     // eprintln!("Converting link to data, {} TI: {:?}", s_name, ti.is_some());
                     Ok(link_to_data(
+                        *app_type,
                         s_name.clone(),
                         *c_id,
                         descr.clone(),
@@ -621,7 +624,7 @@ impl Content {
     }
     pub fn read_link_data(&self, d_type: DataType, data_id: u16) -> Result<(Data, u16), AppError> {
         match self {
-            Self::Link(_s_name, _c_id, _descr, _data, ti) => {
+            Self::Link(_at, _s_name, _c_id, _descr, _data, ti) => {
                 if let Some(ti) = ti {
                     if d_type == ti.d_type {
                         if let Some(data) = ti.data.get(&data_id) {
@@ -646,7 +649,7 @@ impl Content {
     // memusechange 2of5
     pub fn push_data(&mut self, data: Data) -> Result<u64, AppError> {
         match self {
-            Self::Link(_s, _c, _descr, _data, _ti) => Err(AppError::DatatypeMismatch),
+            Self::Link(_at, _s, _c, _descr, _data, _ti) => Err(AppError::DatatypeMismatch),
             Self::Data(_dt, _mem, tree) => {
                 if data.is_empty() {
                     tree.append(data)
@@ -664,7 +667,7 @@ impl Content {
     pub fn pop_data(&mut self) -> Result<Data, AppError> {
         // eprintln!("pop_data");
         match self {
-            Self::Link(_s, _c, _descr, _data, _ti) => Err(AppError::DatatypeMismatch),
+            Self::Link(_at, _s, _c, _descr, _data, _ti) => Err(AppError::DatatypeMismatch),
             Self::Data(_dt, _mem, tree) => {
                 if tree.is_empty() {
                     // eprintln!("tree empty");
@@ -685,7 +688,7 @@ impl Content {
 
     pub fn insert(&mut self, d_id: u16, data: Data) -> Result<u64, AppError> {
         match self {
-            Self::Link(_s, _c, _descr, _data, _ti) => Err(AppError::DatatypeMismatch),
+            Self::Link(_at, _s, _c, _descr, _data, _ti) => Err(AppError::DatatypeMismatch),
             Self::Data(_dt, _mem, tree) => {
                 let tree_len_max = tree.len() == u16::MAX;
                 if tree_len_max {
@@ -728,6 +731,7 @@ impl Content {
     pub fn link_params(
         &self,
     ) -> Option<(
+        AppType,
         SwarmName,
         ContentID,
         Description,
@@ -735,7 +739,8 @@ impl Content {
         Option<TransformInfo>,
     )> {
         match self {
-            Self::Link(s_name, c_id, descr, data, ti_opt) => Some((
+            Self::Link(app_type, s_name, c_id, descr, data, ti_opt) => Some((
+                *app_type,
                 s_name.clone(),
                 *c_id,
                 descr.clone(),
@@ -753,22 +758,29 @@ impl Content {
         );
         let new_data_empty = data.is_empty();
         match myself {
-            Self::Link(s_name, c_id, descr, t_data, ti) => {
+            Self::Link(app_type, s_name, c_id, descr, t_data, ti) => {
                 if data_id == 0 {
                     let link_result = data_to_link(data);
                     if let Ok(link) = link_result {
                         *self = link;
-                        Ok(link_to_data(s_name, c_id, descr, t_data, ti))
+                        Ok(link_to_data(app_type, s_name, c_id, descr, t_data, ti))
                     } else {
-                        *self = Self::Link(s_name, c_id, descr, t_data, ti);
+                        *self = Self::Link(app_type, s_name, c_id, descr, t_data, ti);
                         Err(link_result.err().unwrap())
                     }
                     //If data_id == 1 then we only replace t_data
                 } else if data_id == 1 {
-                    *self = Self::Link(s_name.clone(), c_id, descr.clone(), data, ti.clone());
-                    Ok(link_to_data(s_name, c_id, descr, t_data, ti))
+                    *self = Self::Link(
+                        app_type,
+                        s_name.clone(),
+                        c_id,
+                        descr.clone(),
+                        data,
+                        ti.clone(),
+                    );
+                    Ok(link_to_data(app_type, s_name, c_id, descr, t_data, ti))
                 } else {
-                    *self = Self::Link(s_name, c_id, descr, data, ti);
+                    *self = Self::Link(app_type, s_name, c_id, descr, data, ti);
                     Err(AppError::IndexingError)
                 }
             }
@@ -800,7 +812,7 @@ impl Content {
     // memusechange 5of5
     pub fn remove_data(&mut self, d_id: u16) -> Result<Data, AppError> {
         match self {
-            Self::Link(_s, _c, _descr, _data, _ti) => Err(AppError::DatatypeMismatch),
+            Self::Link(_at, _s, _c, _descr, _data, _ti) => Err(AppError::DatatypeMismatch),
             Self::Data(_dt, _mem, tree) => {
                 let result = tree.remove_data(d_id);
                 if let Ok(data) = result {
@@ -816,7 +828,8 @@ impl Content {
 
     pub fn shell(&self) -> Self {
         match self {
-            Self::Link(s_name, c_id, descr, data, ti) => Self::Link(
+            Self::Link(app_type, s_name, c_id, descr, data, ti) => Self::Link(
+                *app_type,
                 s_name.clone(),
                 *c_id,
                 descr.clone(),
@@ -828,9 +841,10 @@ impl Content {
     }
     pub fn hash(&self) -> u64 {
         match self {
-            Self::Link(s_name, c_id, description, data, ti) => {
+            Self::Link(app_type, s_name, c_id, description, data, ti) => {
                 // eprintln!("dAta: {:?}", data);
                 let mut l_data = link_to_data(
+                    *app_type,
                     s_name.clone(),
                     *c_id,
                     description.clone(),
@@ -857,7 +871,7 @@ impl Content {
         }
     }
     pub fn link_ti_hashes(&self) -> Result<Vec<Data>, AppError> {
-        if let Self::Link(_s_name, _, _descr, _data, ti_opt) = self {
+        if let Self::Link(_at, _s_name, _, _descr, _data, ti_opt) = self {
             if let Some(ti) = ti_opt {
                 Ok(ti.data_hashes.clone())
             } else {
@@ -870,7 +884,7 @@ impl Content {
     pub fn data_hashes(&self) -> Vec<u64> {
         let mut v = vec![];
         match self {
-            Self::Link(_s_name, _c_id, _descr, _data, ti_opt) => {
+            Self::Link(_at, _s_name, _c_id, _descr, _data, ti_opt) => {
                 v.push(self.hash());
                 if let Some(transform_info) = ti_opt {
                     for hash in &transform_info.data_hashes {
@@ -904,7 +918,7 @@ impl Content {
     }
     pub fn used_memory_pages(&self) -> usize {
         match self {
-            Self::Link(_s, _c, _descr, _data, ti_opt) => {
+            Self::Link(_at, _s, _c, _descr, _data, ti_opt) => {
                 if let Some(ti) = ti_opt {
                     ti.data.len()
                 } else {
@@ -916,7 +930,7 @@ impl Content {
     }
     fn get_data_hash(&self, d_id: u16) -> Result<u64, AppError> {
         match self {
-            Self::Link(_s, _c, _descr, _data, _ti) => {
+            Self::Link(_at, _s, _c, _descr, _data, _ti) => {
                 if d_id == 0 {
                     // Ok(link_to_data(*_g, _s.clone(), *_c, &_ti).hash())
                     Ok(self.hash())
@@ -934,13 +948,15 @@ pub fn data_to_link(data: Data) -> Result<Content, AppError> {
     let mut bytes_iter = data.bytes().into_iter();
     let len = bytes_iter.len();
     // eprintln!("creating link from {} bytes", len);
-    if len < 11 {
-        // eprintln!("data_to_link too short data {}", len);
+    if len < 12 {
+        eprintln!("data_to_link too short data {}", len);
         return Err(AppError::Smthg);
     }
     let d_len = bytes_iter.next().unwrap();
     // eprintln!("d_len: {}", d_len);
-    let mut d_bytes = Vec::with_capacity(d_len as usize + 1);
+    let app_type_byte = bytes_iter.next().unwrap();
+    let app_type = AppType::from(app_type_byte);
+    let mut d_bytes = Vec::with_capacity(d_len as usize);
     // d_bytes.push(d_len);
     for _i in 0..d_len {
         d_bytes.push(bytes_iter.next().unwrap());
@@ -968,6 +984,7 @@ pub fn data_to_link(data: Data) -> Result<Content, AppError> {
         descr_vec.push(bytes_iter.next().unwrap());
     }
     // data_len byte
+    // TODO: add AppType byte
     // data bytes
     // swarm_name len
     // swarm_name
@@ -1002,11 +1019,13 @@ pub fn data_to_link(data: Data) -> Result<Content, AppError> {
     let description = Description::new(String::from_utf8(descr_vec).unwrap()).unwrap();
     // eprintln!("Link {} {}, data: {:?}", s_name, c_id, data);
 
-    Ok(Content::Link(s_name, c_id, description, data, ti))
+    Ok(Content::Link(app_type, s_name, c_id, description, data, ti))
 }
 
 // TODO: make sure that we do not exceed 1024 bytes
 fn link_to_data(
+    // TODO: include AppType as first byte after len byte
+    app_type: AppType,
     s_name: SwarmName,
     c_id: ContentID,
     description: Description,
@@ -1016,7 +1035,7 @@ fn link_to_data(
     // data_len byte
     // let mut v = data.bytes();
     // eprintln!("link_to_data: d_len: {}({:?})", data.len(), data);
-    let mut v = vec![data.len() as u8];
+    let mut v = vec![data.len() as u8, app_type.byte()];
     // data bytes
     v.append(&mut data.bytes());
     // v.push(data_bytes.len() as u8);

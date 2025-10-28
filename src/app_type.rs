@@ -26,6 +26,16 @@ impl AppType {
     pub fn is_catalog(&self) -> bool {
         matches!(self, Self::Catalog)
     }
+    pub fn list_of_types() -> Vec<String> {
+        vec![format!("Catalog"), format!("Forum")]
+    }
+    pub fn type_byte_from_string(text: &str) -> Option<u8> {
+        match text {
+            "Catalog" => Some(255),
+            "Forum" => Some(254),
+            _ => None,
+        }
+    }
 }
 
 // TODO: move this to each application's logic, since

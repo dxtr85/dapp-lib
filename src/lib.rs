@@ -2795,6 +2795,7 @@ async fn serve_app_data(
                         eprintln!("ContentID: {}", content_id);
                         let pre: Vec<(ContentID, u64)> = vec![(content_id, 0)];
                         let link = Content::Link(
+                            AppType::Catalog,
                             SwarmName {
                                 founder: GnomeId(u64::MAX),
                                 name: String::new(),
@@ -6576,7 +6577,7 @@ async fn read_data_task(
     requestor: Requestor,
     storage: &PathBuf,
     c_id: ContentID,
-    starting_page: u16,
+    mut starting_page: u16,
     last_page: Option<u16>,
     active_reads: &mut HashMap<ContentID, ReadState>,
     datastore_sync: &Option<(u16, HashMap<u16, Vec<(DataType, u64)>>)>,
@@ -6636,13 +6637,18 @@ async fn read_data_task(
     }
     let (d_type, len) = type_and_len_result.unwrap();
     let (t, root_hash) = app_data.content_root_hash(c_id).unwrap();
+    eprintln!("Start page: {starting_page}");
     let mut read_to_page_incl = if len < starting_page + 64 {
         len
     } else {
         starting_page + 64
     };
     if let Some(l_p) = last_page {
-        if l_p < read_to_page_incl {
+        // This is how we ask for last page (maybe in future can be extended to last but Nth page…)
+        if l_p < starting_page {
+            starting_page = len - 1;
+            read_to_page_incl = len - 1;
+        } else if l_p < read_to_page_incl {
             // eprintln!("read_to_page_incl is now: {l_p}");
             read_to_page_incl = l_p;
         }
