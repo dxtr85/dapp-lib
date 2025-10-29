@@ -2926,10 +2926,13 @@ async fn serve_app_data(
             }
             ToAppData::ReadAllFirstPages(requestor, range_opt) => {
                 let mut first_pages_vec = vec![];
+                let mut len = 0;
                 let last_used_idx = if let Some(idx) = app_data.next_c_id() {
                     if idx > 0 {
+                        len = idx - 1;
                         Some(idx - 1)
                     } else {
+                        len = u16::MAX;
                         None
                     }
                 } else {
@@ -2937,7 +2940,10 @@ async fn serve_app_data(
                 };
                 if let Some(last_used_idx) = last_used_idx {
                     let (first_idx, last_idx) = if let Some((f, l)) = range_opt {
-                        if f > last_used_idx {
+                        if l < f {
+                            let difference = f - l;
+                            (len.saturating_sub(difference - 1), len - 1)
+                        } else if f > last_used_idx {
                             (1, 0)
                         } else {
                             (f, l.min(last_used_idx))
@@ -2945,7 +2951,7 @@ async fn serve_app_data(
                     } else {
                         (1, last_used_idx)
                     };
-                    // let last_idx =
+
                     for c_id in first_idx..=last_idx {
                         if let Ok((d_type, _len)) = app_data.get_type_and_len(c_id) {
                             if let Ok(first_page) = app_data.read_data(c_id, 0) {
@@ -6646,7 +6652,8 @@ async fn read_data_task(
     if let Some(l_p) = last_page {
         // This is how we ask for last page (maybe in future can be extended to last but Nth page…)
         if l_p < starting_page {
-            starting_page = len - 1;
+            let difference = starting_page - l_p;
+            starting_page = len.saturating_sub(difference - 1);
             read_to_page_incl = len - 1;
         } else if l_p < read_to_page_incl {
             // eprintln!("read_to_page_incl is now: {l_p}");
