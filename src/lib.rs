@@ -94,6 +94,7 @@ pub mod prelude {
     pub use crate::ToApp;
     pub use gnome::prelude::sha_hash;
     pub use gnome::prelude::ByteSet;
+    pub use gnome::prelude::CapabiliTree;
     pub use gnome::prelude::Capabilities;
     pub use gnome::prelude::CastData;
     pub use gnome::prelude::CastID;

@@ -1103,7 +1103,7 @@ impl Manifest {
             };
             bytes.push(cap.byte());
             bytes.push(g_size);
-            for g_id in &gnomes[0..256] {
+            for g_id in &gnomes {
                 bytes.append(&mut Vec::from(g_id.bytes()));
             }
             //.cache
