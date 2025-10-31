@@ -598,7 +598,7 @@ impl Manifest {
                         ByteSet::empty()
                     };
                     let mut val: [u8; 2] = [0, 0];
-                    for _i in 0..b_s_count {
+                    for _i in 0..b_s_count >> 1 {
                         val[0] = b_bytes.remove(0);
                         val[1] = b_bytes.remove(0);
                         b_set.add_pair(u16::from_be_bytes(val))
