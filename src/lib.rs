@@ -732,6 +732,8 @@ async fn serve_app_manager(
                         //         let _ = to_app_data.send(ToAppData::ReadCancel(cc_cid)).await;
                         //     }
                         // }
+                    } else {
+                        eprintln!("Could not find AppData for {s_id}");
                     }
                 }
                 ToAppMgr::FromApp(LibRequest::ReadDataGlobal(s_name, c_id)) => {
@@ -6646,7 +6648,7 @@ async fn read_data_task(
     let (t, root_hash) = app_data.content_root_hash(c_id).unwrap();
     eprintln!("Start page: {starting_page}");
     let mut read_to_page_incl = if len < starting_page + 64 {
-        len - 1
+        len.saturating_sub(1)
     } else {
         starting_page + 64
     };
