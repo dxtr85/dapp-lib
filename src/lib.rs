@@ -6646,7 +6646,7 @@ async fn read_data_task(
     let (t, root_hash) = app_data.content_root_hash(c_id).unwrap();
     eprintln!("Start page: {starting_page}");
     let mut read_to_page_incl = if len < starting_page + 64 {
-        len
+        len - 1
     } else {
         starting_page + 64
     };
@@ -6663,9 +6663,11 @@ async fn read_data_task(
     }
 
     let get_data_result = if len <= 64 {
-        if read_to_page_incl >= len {
+        if starting_page == 0 && read_to_page_incl >= len {
+            // eprintln!("get_all_data");
             app_data.get_all_data(c_id)
         } else {
+            // eprintln!("get_data_range {starting_page}-{read_to_page_incl}");
             app_data.get_data_range(c_id, starting_page, read_to_page_incl)
         }
     } else {
@@ -6774,7 +6776,10 @@ async fn read_data_task(
                     .await;
             }
         }
-        eprintln!("AppData Sending back contents of {}", c_id);
+        eprintln!(
+            "AppData Sending back contents of {}, starting from: {starting_page}",
+            c_id
+        );
         // let calculated_hash =
         // if c_id == 0 {
         //     eprintln!("Sending read result with {} data blocks", data_vec.len());

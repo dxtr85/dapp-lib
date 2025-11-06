@@ -275,18 +275,29 @@ impl Engine {
         first_pages: Vec<(ContentID, DataType, Data)>,
     ) {
         let mut processed_cids = Vec::with_capacity(first_pages.len());
-        for (c_id, d_type, first_data) in first_pages {
-            let (tag_bytes, mut header) = read_tags_and_header(d_type, first_data);
-            if let Some(tags) = self.tags.get(&s_id) {
-                for t_byte in tag_bytes {
-                    if let Some(tag) = tags.get(&t_byte) {
-                        header.push_str(" ");
-                        header.push_str(&tag.0);
+        let app_type = if let Some(s_l) = self.swarm_links.get(&s_id) {
+            s_l.app_type
+        } else {
+            None
+        };
+        if Some(AppType::Catalog) == app_type {
+            for (c_id, d_type, first_data) in first_pages {
+                let (tag_bytes, mut header) = read_tags_and_header(d_type, first_data);
+                if let Some(tags) = self.tags.get(&s_id) {
+                    for t_byte in tag_bytes {
+                        if let Some(tag) = tags.get(&t_byte) {
+                            header.push_str(" ");
+                            header.push_str(&tag.0);
+                        }
                     }
                 }
+                self.iter_queries(&s_name, c_id, &header);
+                // }
+                processed_cids.push(c_id);
             }
-            self.iter_queries(&s_name, c_id, &header);
-            processed_cids.push(c_id);
+        } else {
+            //TODO
+            eprintln!("TODO: we should process Forum Posts using separate logic!");
         }
         let advance_to_next_swarm = self.state.processing_done(s_id, processed_cids);
         eprintln!(
