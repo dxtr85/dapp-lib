@@ -2675,7 +2675,8 @@ async fn serve_app_data(
                 let pre_hash = app_data.content_root_hash(c_id).unwrap();
                 let pre: Vec<(ContentID, u64)> = vec![(c_id, pre_hash.1)];
                 let prev_data = app_data
-                    .update_data(c_id, d_id, Data::empty(data.get_hash()))
+                    // .update_data(c_id, d_id, Data::empty(data.get_hash()))
+                    .update_data(c_id, d_id, data.clone())
                     .unwrap();
                 let post_hash = app_data.content_root_hash(c_id).unwrap();
                 let post: Vec<(ContentID, u64)> = vec![(c_id, post_hash.1)];

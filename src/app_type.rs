@@ -27,12 +27,12 @@ impl AppType {
         matches!(self, Self::Catalog)
     }
     pub fn list_of_types() -> Vec<String> {
-        vec![format!("Catalog"), format!("Forum")]
+        vec![format!("Link=>Catalog"), format!("Link=>Forum")]
     }
     pub fn type_byte_from_string(text: &str) -> Option<u8> {
         match text {
-            "Catalog" => Some(255),
-            "Forum" => Some(254),
+            "Link=>Catalog" => Some(255),
+            "Link=>Forum" => Some(254),
             _ => None,
         }
     }
