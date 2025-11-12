@@ -223,6 +223,7 @@ pub enum ToAppMgr {
     FromApp(LibRequest),
     // FromSearch(LibRequest),
     FromDatastore(LibResponse),
+    NoOp,
 }
 
 #[derive(Debug)]
@@ -857,11 +858,13 @@ async fn serve_app_manager(
                         u8::max(4, time_period >> 2)
                     };
                     if let Some(s_name) = app_mgr.get_name(s_id) {
-                        spawn(start_a_timer(
-                            to_app_mgr.clone(),
-                            TimeoutType::AuditMemoryForSwarm(s_id, s_name),
-                            Duration::from_secs(60 * time_until_next_audit as u64),
-                        ));
+                        if !quit_application {
+                            spawn(start_a_timer(
+                                to_app_mgr.clone(),
+                                TimeoutType::AuditMemoryForSwarm(s_id, s_name),
+                                Duration::from_secs(60 * time_until_next_audit as u64),
+                            ));
+                        }
                     }
                 }
                 ToAppMgr::FromDatastore(LibResponse::HeapData(s_id, app_msg, signed_by)) => {
@@ -1364,143 +1367,156 @@ async fn serve_app_manager(
                 //             .await;
                 //     }
                 // }
-                ToAppMgr::TimeoutOver(t_type) => match t_type {
-                    TimeoutType::AddToWaitList(s_name) => {
-                        app_mgr.add_swarm_to_wait_list(s_name);
+                ToAppMgr::TimeoutOver(t_type) => {
+                    if quit_application {
+                        eprintln!("Ignoring {t_type:?}, app terminating.");
+                        break;
                     }
-                    TimeoutType::AuditReads => {
-                        for (s_id, c_ids) in app_mgr.read_list() {
+                    match t_type {
+                        TimeoutType::AddToWaitList(s_name) => {
+                            app_mgr.add_swarm_to_wait_list(s_name);
+                        }
+                        TimeoutType::AuditReads => {
+                            for (s_id, c_ids) in app_mgr.read_list() {
+                                if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
+                                    let _ = sender.send(ToAppData::ReadRefresh(c_ids)).await;
+                                } else {
+                                    // TODO: and if it doesn't exist we drop
+                                    // that pair from read list
+                                }
+                            }
+                        }
+                        TimeoutType::AuditMemoryForSwarm(s_id, s_name) => {
+                            // check if s_id & s_name match,
+                            // if so send request to_app_data_send
+                            // if not: ignore, since that swarm instance is gone
                             if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
-                                let _ = sender.send(ToAppData::ReadRefresh(c_ids)).await;
+                                let res = sender.send(ToAppData::RunMemoryUseAudit(1)).await;
+                                if res.is_err() {
+                                    let err = res.err().unwrap();
+                                    eprintln!(
+                                        "{s_id} RunMemoryUseAudit sending failed:\n{:?}\n",
+                                        err.to_string(),
+                                    );
+                                }
                             } else {
-                                // TODO: and if it doesn't exist we drop
-                                // that pair from read list
+                                eprintln!("Can not audit memory for {} {}", s_id, s_name);
                             }
                         }
-                    }
-                    TimeoutType::AuditMemoryForSwarm(s_id, s_name) => {
-                        // check if s_id & s_name match,
-                        // if so send request to_app_data_send
-                        // if not: ignore, since that swarm instance is gone
-                        if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
-                            let res = sender.send(ToAppData::RunMemoryUseAudit(1)).await;
-                            if res.is_err() {
-                                let err = res.err().unwrap();
-                                eprintln!(
-                                    "{s_id} RunMemoryUseAudit sending failed:\n{:?}\n",
-                                    err.to_string(),
-                                );
-                            }
-                        } else {
-                            eprintln!("Can not audit memory for {} {}", s_id, s_name);
-                        }
-                    }
-                    TimeoutType::IsSwarmSynced(s_id, s_name) => {
-                        eprintln!("IsSwarmSynced({},{})", s_id, s_name);
-                        if let Some(s_state) = app_mgr.get_swarm_state(&s_name) {
-                            if s_state.s_id == s_id {
-                                if s_state.is_synced {
-                                    eprintln!("{} Yes it is", s_id);
-                                    spawn(start_a_timer(
-                                        to_app_mgr.clone(),
-                                        TimeoutType::AuditMemoryForSwarm(s_id, s_name.clone()),
-                                        Duration::from_secs(60),
-                                    ));
-                                } else {
-                                    eprintln!("{} No it is not.", s_id);
-                                    if let Some(to_app_data) = app_mgr.app_data_store.get(&s_id) {
-                                        let _ = to_app_data.send(ToAppData::TimeoutSyncCheck);
-                                    }
-                                    spawn(start_a_timer(
-                                        to_app_mgr.clone(),
-                                        TimeoutType::IsSwarmSynced(s_id, s_name.clone()),
-                                        Duration::from_secs(5),
-                                    ));
-                                }
-                            }
-                        } else {
-                            // TODO: if it was generic swarm name,
-                            // then find it's new name and check
-                            if s_name.founder.is_any() {
-                                if let Some(new_name) = app_mgr.get_name(s_id) {
-                                    eprintln!("was generic…");
-                                    spawn(start_a_timer(
-                                        to_app_mgr.clone(),
-                                        TimeoutType::IsSwarmSynced(s_id, new_name.clone()),
-                                        Duration::from_secs(1),
-                                    ));
-                                }
-                            }
-                            eprintln!("{} Swarm {} is no more…", s_id, s_name);
-                        }
-                    }
-                    TimeoutType::Cooldown => {
-                        app_mgr.cooldown_over();
-                        // TODO: use timeout to Join/Leave a new swarm
-                        //
-                        // swarm_swap.set_cooldown(false);
-                        // if app_mgr.number_of_connected_swarms() >= config.max_connected_swarms {
-                        //     let _ = to_app_mgr
-                        //         .send(ToAppMgr::QueryForNeighboringSwarms(None))
-                        //         .await;
-                        // }
-                    }
-                    TimeoutType::NewSwarmsAvailable => {
-                        if has_neighbors {
-                            if let Some((s_id, new_swarms_avail)) =
-                                swarm_swap.pending_new_swarms.take()
-                            {
-                                if app_mgr.has_swarm_id(s_id) {
-                                    let _ = to_app_mgr
-                                        .send(ToAppMgr::FromGMgr(
-                                            FromGnomeManager::NewSwarmsAvailable(
-                                                s_id,
-                                                new_swarms_avail,
-                                            ),
-                                        ))
-                                        .await;
-                                } else if let Some(query_id) = swarm_swap.next_query_item() {
-                                    // If this list is empty, we query next Swarm.
-                                    let _ = to_gnome_mgr
-                                        .send(ToGnomeManager::ProvideNeighboringSwarms(query_id))
-                                        .await;
-                                } else {
-                                    if !swarm_swap.is_cooldown() {
-                                        eprintln!("Cooldown start 1");
+                        TimeoutType::IsSwarmSynced(s_id, s_name) => {
+                            eprintln!("IsSwarmSynced({},{})", s_id, s_name);
+                            if let Some(s_state) = app_mgr.get_swarm_state(&s_name) {
+                                if s_state.s_id == s_id {
+                                    if s_state.is_synced {
+                                        eprintln!("{} Yes it is", s_id);
                                         spawn(start_a_timer(
                                             to_app_mgr.clone(),
-                                            TimeoutType::Cooldown,
+                                            TimeoutType::AuditMemoryForSwarm(s_id, s_name.clone()),
+                                            Duration::from_secs(60),
+                                        ));
+                                    } else {
+                                        eprintln!("{} No it is not.", s_id);
+                                        if let Some(to_app_data) = app_mgr.app_data_store.get(&s_id)
+                                        {
+                                            // if quit_application {
+                                            //     let _ = to_app_data.send(ToAppData::Terminate);
+                                            // } else {
+                                            let _ = to_app_data.send(ToAppData::TimeoutSyncCheck);
+                                            // }
+                                        }
+                                        spawn(start_a_timer(
+                                            to_app_mgr.clone(),
+                                            TimeoutType::IsSwarmSynced(s_id, s_name.clone()),
                                             Duration::from_secs(5),
                                         ));
-                                        swarm_swap.set_cooldown(true);
+                                    }
+                                }
+                            } else {
+                                // TODO: if it was generic swarm name,
+                                // then find it's new name and check
+                                if s_name.founder.is_any() {
+                                    if let Some(new_name) = app_mgr.get_name(s_id) {
+                                        eprintln!("was generic…");
+                                        spawn(start_a_timer(
+                                            to_app_mgr.clone(),
+                                            TimeoutType::IsSwarmSynced(s_id, new_name.clone()),
+                                            Duration::from_secs(1),
+                                        ));
+                                    }
+                                }
+                                eprintln!("{} Swarm {} is no more…", s_id, s_name);
+                            }
+                        }
+                        TimeoutType::Cooldown => {
+                            app_mgr.cooldown_over();
+                            // TODO: use timeout to Join/Leave a new swarm
+                            //
+                            // swarm_swap.set_cooldown(false);
+                            // if app_mgr.number_of_connected_swarms() >= config.max_connected_swarms {
+                            //     let _ = to_app_mgr
+                            //         .send(ToAppMgr::QueryForNeighboringSwarms(None))
+                            //         .await;
+                            // }
+                        }
+                        TimeoutType::NewSwarmsAvailable => {
+                            if has_neighbors {
+                                if let Some((s_id, new_swarms_avail)) =
+                                    swarm_swap.pending_new_swarms.take()
+                                {
+                                    if app_mgr.has_swarm_id(s_id) {
+                                        let _ = to_app_mgr
+                                            .send(ToAppMgr::FromGMgr(
+                                                FromGnomeManager::NewSwarmsAvailable(
+                                                    s_id,
+                                                    new_swarms_avail,
+                                                ),
+                                            ))
+                                            .await;
+                                    } else if let Some(query_id) = swarm_swap.next_query_item() {
+                                        // If this list is empty, we query next Swarm.
+                                        let _ = to_gnome_mgr
+                                            .send(ToGnomeManager::ProvideNeighboringSwarms(
+                                                query_id,
+                                            ))
+                                            .await;
+                                    } else {
+                                        if !swarm_swap.is_cooldown() {
+                                            eprintln!("Cooldown start 1");
+                                            spawn(start_a_timer(
+                                                to_app_mgr.clone(),
+                                                TimeoutType::Cooldown,
+                                                Duration::from_secs(5),
+                                            ));
+                                            swarm_swap.set_cooldown(true);
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                    TimeoutType::PeriodicalCheckForNewSwarms => {
-                        if has_neighbors {
-                            spawn(start_a_timer(
-                                to_app_mgr.clone(),
-                                TimeoutType::PeriodicalCheckForNewSwarms,
-                                Duration::from_secs(15),
-                            ));
-                            app_mgr.update_swap_state_after_leave(None, true).await;
+                        TimeoutType::PeriodicalCheckForNewSwarms => {
+                            if has_neighbors {
+                                spawn(start_a_timer(
+                                    to_app_mgr.clone(),
+                                    TimeoutType::PeriodicalCheckForNewSwarms,
+                                    Duration::from_secs(15),
+                                ));
+                                app_mgr.update_swap_state_after_leave(None, true).await;
+                            }
+                            // if !swarm_swap.is_cooldown() {
+                            //     eprintln!("Periodical Cooldown start");
+                            //     spawn(start_a_timer(
+                            //         to_app_mgr.clone(),
+                            //         TimeoutType::Cooldown,
+                            //         Duration::from_secs(5),
+                            //     ));
+                            //     swarm_swap.set_cooldown(true);
+                            // }
                         }
-                        // if !swarm_swap.is_cooldown() {
-                        //     eprintln!("Periodical Cooldown start");
-                        //     spawn(start_a_timer(
-                        //         to_app_mgr.clone(),
-                        //         TimeoutType::Cooldown,
-                        //         Duration::from_secs(5),
-                        //     ));
-                        //     swarm_swap.set_cooldown(true);
-                        // }
+                        TimeoutType::HasNeighbors => {
+                            has_neighbors = true;
+                        }
                     }
-                    TimeoutType::HasNeighbors => {
-                        has_neighbors = true;
-                    }
-                },
+                }
                 ToAppMgr::FromGMgr(message) => {
                     //TODO: serve this
                     // while let Ok(message) = from_gnome_mgr.recv().await {
@@ -2287,6 +2303,7 @@ async fn serve_app_manager(
                     }
                 }
                 ToAppMgr::Quit => {
+                    // eprintln!("\n\n\nQUIT\n\n\n");
                     quit_application = true;
                     let _res = to_gnome_mgr.send(ToGnomeManager::Quit).await;
                     eprintln!("AppMgr received Quit: {:?}", _res);
@@ -2296,6 +2313,12 @@ async fn serve_app_manager(
                         let _ = app_data.send(ToAppData::Terminate).await;
                     }
                     break;
+                }
+                ToAppMgr::NoOp => {
+                    // if quit_application {
+                    //     eprintln!("Received NoOp({t_type:?}) when about to quit app");
+                    // }
+                    // Do nothing
                 }
             }
         }
@@ -4710,10 +4733,28 @@ pub async fn start_a_timer(
     timeout_type: TimeoutType,
     timeout: Duration,
 ) {
-    // let timeout = Duration::from_secs(5);
-    sleep(timeout).await;
-    eprintln!("{:?} timeout for {:?} is over", timeout, timeout_type);
-    let _ = sender.send(ToAppMgr::TimeoutOver(timeout_type)).await;
+    let sleep_interval = Duration::from_millis(250);
+    let mut elapsed = Duration::new(0, 0);
+    let mut send_response = true;
+    while elapsed < timeout {
+        sleep(sleep_interval).await;
+        elapsed = elapsed + sleep_interval;
+        let res = sender.send(ToAppMgr::NoOp).await;
+        if res.is_err() {
+            eprintln!("Abrupting timeout for {timeout_type:?}");
+            send_response = false;
+            break;
+        }
+    }
+    if send_response {
+        eprintln!("{:?} timeout for {:?} is over", timeout, timeout_type);
+        let _ = sender.send(ToAppMgr::TimeoutOver(timeout_type)).await;
+    } else {
+        eprintln!(
+            "Abruptly terminating timeout for {:?} is over",
+            timeout_type
+        );
+    }
 }
 pub async fn start_cycling_timer(
     sender: ASender<ToAppMgr>,
@@ -4721,7 +4762,20 @@ pub async fn start_cycling_timer(
     timeout: Duration,
 ) {
     loop {
-        sleep(timeout).await;
+        let sleep_interval = Duration::from_millis(250);
+        let mut elapsed = Duration::new(0, 0);
+        // let mut send_response = true;
+        while elapsed < timeout {
+            sleep(sleep_interval).await;
+            elapsed = elapsed + sleep_interval;
+            let res = sender.send(ToAppMgr::NoOp).await;
+            if res.is_err() {
+                eprintln!("Abrupting cycling timeout for {timeout_type:?}");
+                // send_response = false;
+                break;
+            }
+        }
+
         eprintln!(
             "{:?} cycling timeout for {:?} is over",
             timeout, timeout_type

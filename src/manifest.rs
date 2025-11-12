@@ -146,6 +146,9 @@ impl Tag {
     pub fn empty() -> Self {
         Tag(String::new())
     }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
     pub fn new(name: String) -> Result<Self, ()> {
         if name.len() <= 32 {
             Ok(Tag(name))
