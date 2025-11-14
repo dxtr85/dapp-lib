@@ -32,6 +32,33 @@ impl Data {
         // eprintln!("new empty {}", hash);
         Data(hash, vec![])
     }
+    // A way to build a standardized Data block
+    // TODO: should be applied to every first page
+    // of every Content in every AppType
+    // Can also be used for non-first pages.
+    pub fn new_first(
+        tags: Vec<u8>,
+        text: String,
+        additional_data: Option<Vec<u8>>,
+    ) -> Result<Self, Vec<u8>> {
+        let mut bytes = Vec::with_capacity(1024);
+        bytes.push(tags.len() as u8);
+        for t in tags {
+            bytes.push(t);
+        }
+        let slen = (text.len() as u16).to_be_bytes();
+        bytes.push(slen[0]);
+        bytes.push(slen[1]);
+        for b in text.bytes() {
+            bytes.push(b);
+        }
+        if let Some(a_d) = additional_data {
+            for b in a_d {
+                bytes.push(b);
+            }
+        }
+        Data::new(bytes)
+    }
 
     pub fn is_empty(&self) -> bool {
         self.1.is_empty()
@@ -107,17 +134,26 @@ pub fn read_tags_and_header(d_type: DataType, data: Data) -> (Vec<u8>, String) {
             eprintln!("NO TAGS, This should not happen!");
         }
     }
-    let header = if bytes.is_empty() {
-        String::new()
-    } else {
-        String::from_utf8(bytes)
+    let hlen0 = bytes.remove(0);
+    let hlen1 = bytes.remove(0);
+    let hlen = u16::from_be_bytes([hlen0, hlen1]);
+    let mut hstr = Vec::with_capacity(hlen as usize);
+    for _i in 0..hlen {
+        hstr.push(bytes.remove(0));
+    }
+    let header =
+     // if bytes.is_empty() {
+    //     String::new()
+    // } else {
+        String::from_utf8(hstr)
             .unwrap()
             .lines()
             .next()
             .unwrap()
             .trim()
             .to_string()
-    };
+    // }
+        ;
     eprintln!("Hdr: {}", header);
     (tag_ids, header)
 }

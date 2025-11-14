@@ -249,6 +249,10 @@ impl Manifest {
         let first_data = data_iter.next().unwrap();
         let mut iter = first_data.bytes().into_iter();
         if data_count == 1 && iter.len() == 1 {
+            // In case Manifest has only 1 byte then it is AppType
+            // let _tcount = iter.next();
+            // let _dlen0 = iter.next();
+            // let _dlen1 = iter.next();
             return Manifest {
                 app_type: AppType::from(iter.next().unwrap()),
                 pub_ips: CombinedNetworkSettings::new(),
@@ -260,6 +264,19 @@ impl Manifest {
                 byteset_reg: HashMap::new(),
             };
         }
+        let _tcount = iter.next(); //Always zero
+
+        // TODO: make sure we have bytes to read
+        eprintln!("Loading Description…");
+        let dlen0 = iter.next().unwrap();
+        let dlen1 = iter.next().unwrap();
+        let dlen = u16::from_be_bytes([dlen0, dlen1]);
+        let mut dbytes = Vec::with_capacity(dlen as usize);
+        for _i in 0..dlen {
+            dbytes.push(iter.next().unwrap());
+        }
+        let description = String::from_utf8(dbytes).unwrap();
+
         let app_type_byte = iter.next();
         if app_type_byte.is_none() {
             return Manifest {
@@ -445,9 +462,6 @@ impl Manifest {
                 eprintln!("Uncecognized next_byte: {next_byte}");
             }
         }
-        eprintln!("Loading Description…");
-        let description = String::from_utf8(iter.collect()).unwrap();
-
         let mut current_tag_id: u8 = 0;
         // let mut adding_tags = true;
         // let mut tag_pages_read = 0;
@@ -635,6 +649,17 @@ impl Manifest {
     pub fn to_data(&self) -> Vec<Data> {
         eprintln!("{:?} Manifest to_data", self.app_type);
         let mut res = Vec::with_capacity(1024);
+        // TODO: here we also need to respect data format:
+        // TagLen|Tags|DescrLen|Descr|Remainder
+        // but for Manifest TagLen is always 0, so Tags is empty,
+        // then goes 2byte DescrLen and Description followed by other information
+        res.push(0);
+        let dlen = (self.description.len() as u16).to_be_bytes();
+        res.push(dlen[0]);
+        res.push(dlen[1]);
+        for byte in self.description.bytes() {
+            res.push(byte);
+        }
         res.push(self.app_type.byte());
         let tags_len = self.tags.len() as u16;
         eprintln!("tags_len: {tags_len}");
@@ -773,9 +798,6 @@ impl Manifest {
         //         eprintln!("Too many public IPs: {}", other);
         //     }
         // }
-        for byte in self.description.bytes() {
-            res.push(byte);
-        }
         let first_data_bytes = std::mem::replace(&mut res, Vec::with_capacity(1024));
         let mut output = vec![Data::new(first_data_bytes).unwrap()];
         let mut tags_to_add = self.tags.len();

@@ -56,9 +56,10 @@ impl Description {
         self.0.clone()
     }
     pub fn as_bytes(&self) -> Vec<u8> {
-        let len = self.0.len();
-        let mut bytes = Vec::with_capacity(1 + len);
-        bytes.push(len as u8);
+        let len = (self.0.len() as u16).to_be_bytes();
+        let mut bytes = Vec::with_capacity(2 + self.0.len());
+        bytes.push(len[0]);
+        bytes.push(len[1]);
         for b in self.0.bytes() {
             bytes.push(b);
         }
@@ -73,12 +74,15 @@ pub enum Content {
     // When we hash() a Link we always only take first two values
     // this way links with different description but poining to the same
     // content will have the same hash
+    //
+    // replace Data with Vec<u8> to store Tag indices directly
     Link(
         AppType,
         SwarmName,
         ContentID,
+        Vec<u8>,
         Description,
-        Data,
+        // Data,
         Option<TransformInfo>,
     ),
     Data(DataType, u16, ContentTree),
@@ -542,24 +546,65 @@ impl Content {
     }
     pub fn tag_ids(&self) -> Vec<u8> {
         match self {
-            Self::Link(_at, _sn, _c, _descr, d_tags, _ti) => {
-                if d_tags.is_empty() {
-                    return vec![];
-                }
-                let mut t_bytes = d_tags.clone().bytes();
-                let _len = t_bytes.remove(0);
-                t_bytes
+            Self::Link(_at, _sn, _c, d_tags, _descr, _ti) => {
+                // if d_tags.is_empty() {
+                //     return vec![];
+                // }
+                // let mut t_bytes = d_tags.clone().bytes();
+                // let _len = t_bytes.remove(0);
+                // t_bytes
+                d_tags.clone()
             }
-            Self::Data(_d_type, _mem, _ct) => {
-                //TODO
-                vec![]
+            Self::Data(_d_type, _mem, ct) => {
+                //TODO: is it ok?
+                let first_page_res = ct.read(0);
+                if let Ok(first_page) = first_page_res {
+                    if first_page.is_empty() {
+                        vec![]
+                    } else {
+                        let mut b_iter = first_page.bytes().into_iter();
+                        let tags_count = b_iter.next().unwrap();
+                        let mut tags = Vec::with_capacity(tags_count as usize);
+                        for _i in 0..tags_count {
+                            tags.push(b_iter.next().unwrap());
+                        }
+                        tags
+                    }
+                } else {
+                    vec![]
+                }
             }
         }
     }
     pub fn description(&self) -> String {
         match self {
-            Self::Link(_at, _sn, _c, descr, _tags, _ti) => descr.0.clone(),
-            Self::Data(_d_type, _mem, _ct) => String::new(),
+            Self::Link(_at, _sn, _c, _tags, descr, _ti) => descr.0.clone(),
+            Self::Data(_d_type, _mem, ct) => {
+                //TODO: is it ok?
+                let first_page_res = ct.read(0);
+                if let Ok(first_page) = first_page_res {
+                    if first_page.is_empty() {
+                        String::new()
+                    } else {
+                        let mut b_iter = first_page.bytes().into_iter();
+                        let tags_count = b_iter.next().unwrap();
+                        for _i in 0..tags_count {
+                            b_iter.next();
+                        }
+
+                        let cc0 = b_iter.next().unwrap();
+                        let cc1 = b_iter.next().unwrap();
+                        let chars_count = u16::from_be_bytes([cc0, cc1]);
+                        let mut chars = Vec::with_capacity(chars_count as usize);
+                        for _i in 0..chars_count {
+                            chars.push(b_iter.next().unwrap());
+                        }
+                        String::from_utf8(chars).unwrap()
+                    }
+                } else {
+                    String::new()
+                }
+            }
         }
     }
     pub fn data_type(&self) -> DataType {
@@ -582,8 +627,8 @@ impl Content {
     }
     pub fn to_data(self) -> Result<Data, Self> {
         match self {
-            Content::Link(app_type, s_name, c_id, descr, data, ti_opt) => {
-                Ok(link_to_data(app_type, s_name, c_id, descr, data, ti_opt))
+            Content::Link(app_type, s_name, c_id, tags, descr, ti_opt) => {
+                Ok(link_to_data(app_type, s_name, c_id, tags, descr, ti_opt))
             }
             // TODO: here we drop existing Content when it is not a Link!
             other => Err(other),
@@ -734,17 +779,19 @@ impl Content {
         AppType,
         SwarmName,
         ContentID,
+        Vec<u8>,
         Description,
-        Data,
+        // Data,
         Option<TransformInfo>,
     )> {
         match self {
-            Self::Link(app_type, s_name, c_id, descr, data, ti_opt) => Some((
+            Self::Link(app_type, s_name, c_id, tags, descr, ti_opt) => Some((
                 *app_type,
                 s_name.clone(),
                 *c_id,
+                tags.clone(),
                 descr.clone(),
-                data.clone(),
+                // data.clone(),
                 ti_opt.clone(),
             )),
             _ => None,
@@ -758,14 +805,14 @@ impl Content {
         );
         let new_data_empty = data.is_empty();
         match myself {
-            Self::Link(app_type, s_name, c_id, descr, t_data, ti) => {
+            Self::Link(app_type, s_name, c_id, tags, descr, ti) => {
                 if data_id == 0 {
                     let link_result = data_to_link(data);
                     if let Ok(link) = link_result {
                         *self = link;
-                        Ok(link_to_data(app_type, s_name, c_id, descr, t_data, ti))
+                        Ok(link_to_data(app_type, s_name, c_id, tags, descr, ti))
                     } else {
-                        *self = Self::Link(app_type, s_name, c_id, descr, t_data, ti);
+                        *self = Self::Link(app_type, s_name, c_id, tags, descr, ti);
                         Err(link_result.err().unwrap())
                     }
                     //If data_id == 1 then we only replace t_data
@@ -774,13 +821,14 @@ impl Content {
                         app_type,
                         s_name.clone(),
                         c_id,
+                        tags.clone(),
                         descr.clone(),
-                        data,
+                        // data,
                         ti.clone(),
                     );
-                    Ok(link_to_data(app_type, s_name, c_id, descr, t_data, ti))
+                    Ok(link_to_data(app_type, s_name, c_id, tags, descr, ti))
                 } else {
-                    *self = Self::Link(app_type, s_name, c_id, descr, data, ti);
+                    *self = Self::Link(app_type, s_name, c_id, tags, descr, ti);
                     Err(AppError::IndexingError)
                 }
             }
@@ -944,6 +992,21 @@ impl Content {
 }
 
 pub fn data_to_link(data: Data) -> Result<Content, AppError> {
+    // TODO: Rework this logic so that both Link and Data
+    // contain the same Tags and Description at the beginning,
+    // subsequent bytes can differ.
+    // This will aid in Content filtering and searching.
+    // We should have:
+    // 1 byte for Tags count
+    // this many tags
+    // 2 bytes for Description len
+    // this many bytes for description
+    // 1 byte for AppType
+    // 1 byte for SwarmName len
+    // this many bytes with SwarmName
+    // 2 bytes for CID
+    // rest is for TransformInfo opt
+    //
     eprintln!("data_to_link: {:?}", data.get_hash());
     let mut bytes_iter = data.bytes().into_iter();
     let len = bytes_iter.len();
@@ -952,16 +1015,20 @@ pub fn data_to_link(data: Data) -> Result<Content, AppError> {
         eprintln!("data_to_link too short data {}", len);
         return Err(AppError::Smthg);
     }
-    let d_len = bytes_iter.next().unwrap();
-    // eprintln!("d_len: {}", d_len);
-    let app_type_byte = bytes_iter.next().unwrap();
-    let app_type = AppType::from(app_type_byte);
-    let mut d_bytes = Vec::with_capacity(d_len as usize);
+    let tag_len = bytes_iter.next().unwrap();
+    let mut tags = Vec::with_capacity(tag_len as usize);
+    for _i in 0..tag_len {
+        tags.push(bytes_iter.next().unwrap());
+    }
+    let d_len = u16::from_be_bytes([bytes_iter.next().unwrap(), bytes_iter.next().unwrap()]);
+    let mut descr_vec = Vec::with_capacity(d_len as usize);
     // d_bytes.push(d_len);
     for _i in 0..d_len {
-        d_bytes.push(bytes_iter.next().unwrap());
+        descr_vec.push(bytes_iter.next().unwrap());
     }
-    let data = Data::new(d_bytes).unwrap();
+    let app_type_byte = bytes_iter.next().unwrap();
+    let app_type = AppType::from(app_type_byte);
+    // let data = Data::new(d_bytes).unwrap();
     let olds_len = bytes_iter.next().unwrap();
     let s_len = if olds_len < 128 {
         olds_len
@@ -977,12 +1044,12 @@ pub fn data_to_link(data: Data) -> Result<Content, AppError> {
     let next_two = [bytes_iter.next().unwrap(), bytes_iter.next().unwrap()];
     let c_id = u16::from_be_bytes(next_two);
 
-    let descr_len = bytes_iter.next().unwrap();
-    // eprintln!("Descr len: {}", descr_len);
-    let mut descr_vec = Vec::with_capacity(descr_len as usize);
-    for _i in 0..descr_len {
-        descr_vec.push(bytes_iter.next().unwrap());
-    }
+    // let descr_len = bytes_iter.next().unwrap();
+    // // eprintln!("Descr len: {}", descr_len);
+    // let mut descr_vec = Vec::with_capacity(descr_len as usize);
+    // for _i in 0..descr_len {
+    //     descr_vec.push(bytes_iter.next().unwrap());
+    // }
     // data_len byte
     // TODO: add AppType byte
     // data bytes
@@ -1019,7 +1086,7 @@ pub fn data_to_link(data: Data) -> Result<Content, AppError> {
     let description = Description::new(String::from_utf8(descr_vec).unwrap()).unwrap();
     // eprintln!("Link {} {}, data: {:?}", s_name, c_id, data);
 
-    Ok(Content::Link(app_type, s_name, c_id, description, data, ti))
+    Ok(Content::Link(app_type, s_name, c_id, tags, description, ti))
 }
 
 // TODO: make sure that we do not exceed 1024 bytes
@@ -1028,16 +1095,33 @@ fn link_to_data(
     app_type: AppType,
     s_name: SwarmName,
     c_id: ContentID,
+    mut tags: Vec<u8>,
     description: Description,
-    data: Data,
+    // data: Data,
     ti: Option<TransformInfo>,
 ) -> Data {
-    // data_len byte
-    // let mut v = data.bytes();
+    // We should have:
+    // 1 byte for Tags count
+    // this many tags
+    // 2 bytes for Description len
+    // this many bytes for description
+    // 1 byte for AppType
+    // 1 byte for SwarmName len
+    // this many bytes with SwarmName
+    // 2 bytes for CID
+    // rest is for TransformInfo opt
+    //
+    //
+    //
     // eprintln!("link_to_data: d_len: {}({:?})", data.len(), data);
-    let mut v = vec![data.len() as u8, app_type.byte()];
+    let mut v = Vec::with_capacity(1024);
+    v.push(tags.len() as u8);
+    v.append(&mut tags);
+    v.append(&mut description.as_bytes());
+    v.push(app_type.byte());
+    // let mut v = vec![data.len() as u8, app_type.byte()];
     // data bytes
-    v.append(&mut data.bytes());
+    // v.append(&mut data.bytes());
     // v.push(data_bytes.len() as u8);
     // for b in data_bytes {
     //     v.push(b);
@@ -1059,7 +1143,6 @@ fn link_to_data(
     }
     // description len
     // description
-    v.append(&mut description.as_bytes());
     // eprintln!("descr len: {}", d_bytes.len());
     // v.push(d_bytes.len() as u8);
     // for b in d_bytes {

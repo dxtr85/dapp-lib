@@ -945,7 +945,20 @@ async fn serve_app_manager(
                         // // s_state.app_type.is_none() &&
                         // chunk_no == 0 && !data_vec.is_empty() {
                         // if !data_vec[0].is_empty() {
-                        let app_type = AppType::from(data_vec[0].first_byte());
+                        let app_type = if data_vec[0].len() == 1 {
+                            AppType::from(data_vec[0].first_byte())
+                        } else {
+                            let dlen = u16::from_be_bytes([
+                                data_vec[0].second_byte(),
+                                data_vec[0].third_byte(),
+                            ]);
+                            let app_byte = data_vec[0].ref_bytes()[3 + dlen as usize];
+                            // eprintln!("AppType Byte[0]: {}", data_vec[0].first_byte());
+                            // eprintln!("AppType Byte[1]: {}", data_vec[0].second_byte());
+                            // eprintln!("AppType Byte[2]: {}", data_vec[0].third_byte());
+                            // eprintln!("AppType Byte[3]: {}", data_vec[0].forth_byte());
+                            AppType::from(app_byte)
+                        };
                         // s_state.app_type = Some(app_type);
                         app_mgr
                             .update_app_data_founder(s_id, Some(app_type), s_name.clone())
@@ -2828,8 +2841,9 @@ async fn serve_app_data(
                                 name: String::new(),
                             },
                             u16::MAX,
+                            vec![],
                             description,
-                            Data::empty(0),
+                            // Data::empty(0),
                             Some(ti),
                         );
                         let link_hash = link.hash();
