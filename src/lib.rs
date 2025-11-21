@@ -633,6 +633,7 @@ async fn serve_app_manager(
         // sleep(sleep_time).await;
 
         while let Ok(message) = to_app_mgr_recv.recv().await {
+            eprint!(""); // It appears as if sometimes an async task gets skipped...
             match message {
                 ToAppMgr::StorageNeighbors(ns) => {
                     let _ = to_gnome_mgr
@@ -684,6 +685,7 @@ async fn serve_app_manager(
                     }
                 }
                 ToAppMgr::FromApp(LibRequest::ReadAllPages(s_id, c_id)) => {
+                    eprintln!("Mgr got ReadAllPages({s_id}, {c_id})");
                     // TODO: make use of is_volatile
                     // For a given SwarmID there can only be one is_volatile
                     // read request ongoing.
