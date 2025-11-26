@@ -231,8 +231,13 @@ impl Manifest {
     // if all of these bytes are 0,
     // then given Tag is not defined, otherwise given Tag is defined.
     pub fn from(data_vec: Vec<Data>) -> Self {
+        // eprintln!(
+        //     "In Manifest::from data count: {}, first data len: {}",
+        //     data_vec.len(),
+        //     data_vec[0].len()
+        // );
         let data_count = data_vec.len();
-        if data_count == 0 {
+        if data_count == 0 || data_vec[0].is_empty() {
             return Manifest {
                 app_type: AppType::Other(0),
                 pub_ips: CombinedNetworkSettings::new(),

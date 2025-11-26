@@ -4,6 +4,8 @@ use crate::prelude::SyncRequirements;
 use crate::prelude::TransformInfo;
 use crate::search::SearchMsg;
 use crate::search::SwarmLink;
+use crate::storage::load_first_pages_from_disk;
+use crate::storage::store_first_pages_on_disk;
 use crate::storage::write_datastore_to_disk;
 use crate::sync_message::serialize_requests;
 use std::array;
@@ -84,7 +86,9 @@ pub mod prelude {
     pub use crate::message::SyncRequirements;
     pub use crate::search::Hit;
     pub use crate::storage::load_content_from_disk;
+    pub use crate::storage::load_first_pages_from_disk;
     pub use crate::storage::read_datastore_from_disk;
+    pub use crate::storage::store_first_pages_on_disk;
     pub use crate::storage::StoragePolicy;
     pub use crate::AppDefinedMsg;
     pub use crate::ApplicationData;
@@ -3363,7 +3367,7 @@ async fn serve_app_data(
                         .await;
                 }
             }
-            ToAppData::PolicyNotMetRcfg(conf_id, s_data) => {
+            ToAppData::PolicyNotMetRcfg(conf_id, _s_data) => {
                 //TODO: build logic to handle this
                 eprintln!("PolicyNotMet for Reconfigure({})", conf_id);
             }
@@ -4011,7 +4015,13 @@ impl ApplicationData {
                 self.clone_content(c_id).unwrap()
             };
             eprintln!("Writing {c_id} to {:?}…", self.storage);
-            store_content_on_disk(c_id, &self.storage, &content, max_page).await;
+            let write_fresh_file = false;
+            if let Some(first_page) =
+                store_content_on_disk(c_id, &self.storage, &content, max_page, write_fresh_file)
+                    .await
+            {
+                store_first_pages_on_disk(vec![(c_id, first_page)], &self.storage).await;
+            }
             let d_store = self.storage.join("datastore.sync");
             eprintln!("Updating {:?}…", d_store);
             write_datastore_to_disk(d_store, &self).await;
@@ -6180,7 +6190,13 @@ async fn custom_response_task(
                     // our own, and request missing data from neighbors
                     // and load valid data from disk
                     // let c_id = app_data.next_c_id().unwrap();
+                    //
+                    // TODO: now that we have introduced heads.hdr & heads.dat
+                    // those two files come into play,
+                    // so we need to extend following logic.
+                    // We do not want load_content_from_disk read from those files for every CID
                     let mut curr_cid = 0;
+                    let first_pages = load_first_pages_from_disk(&s_storage).await;
 
                     for (swarm_dtype, swarm_hash) in hashes {
                         eprintln!(
@@ -6193,31 +6209,36 @@ async fn custom_response_task(
                                 "{curr_cid} Local DT: {:?} Hash: {}",
                                 local_dtype, local_hash
                             );
+                            // let first_page = first_pages.remove(&curr_cid).unwrap();
 
                             // if let Ok(pg) = app_data.read_data(curr_cid, 0) {
                             //     eprintln!("Local data: {:?}", pg.bytes());
                             // }
                             if swarm_dtype == local_dtype {
                                 if swarm_hash == local_hash {
+                                    eprintln!("lcfd 1, fpages len: {:?}", first_pages.keys());
                                     if let Some(content) = load_content_from_disk(
                                         s_storage.clone(),
                                         curr_cid,
                                         local_dtype,
                                         local_hash,
+                                        &first_pages,
                                     )
                                     .await
                                     {
                                         let main_page = if let Ok(d) = content.read_data(0) {
                                             d
                                         } else {
+                                            eprintln!("unable to read 0!");
                                             Data::empty(0)
                                         };
                                         let _res = app_data.update(curr_cid, content);
                                         eprintln!(
-                                            "Load {} CID-{} from disk ok: {}",
+                                            "Load {} CID-{} from disk ok: {}, first page len: {}",
                                             swarm_id,
                                             curr_cid,
-                                            _res.is_ok()
+                                            _res.is_ok(),
+                                            main_page.len()
                                         );
                                         let _ = to_app_mgr_send
                                             .send(ToAppMgr::ContentLoadedFromDisk(
@@ -6763,8 +6784,9 @@ async fn read_data_task(
             // …and then try to load missing Data either from
             // local storage…
             let disk_path = storage.join(swarm_name.to_path());
+            eprintln!("lcfd 22");
             if let Some(c_from_store) =
-                load_content_from_disk(disk_path, c_id, d_type, root_hash).await
+                load_content_from_disk(disk_path, c_id, d_type, root_hash, &HashMap::new()).await
             {
                 let mut data_filled_from_storage = vec![];
                 for d_id in &data_missing {
@@ -6775,6 +6797,9 @@ async fn read_data_task(
                         {
                             data_vec[(*d_id - starting_page) as usize] = data;
                             data_filled_from_storage.push(*d_id - starting_page);
+                        } else if *d_id == 0 {
+                            // AppData should have first pages loaded already
+                            eprintln!("Should we load first pages here?");
                         }
                     }
                 }

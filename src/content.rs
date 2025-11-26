@@ -722,7 +722,7 @@ impl Content {
                     let res = tree.pop();
                     if let Ok(data) = &res {
                         if !data.is_empty() {
-                            *self = Self::Data(*_dt, *_mem - 1, tree.to_owned());
+                            *self = Self::Data(*_dt, _mem.saturating_sub(1), tree.to_owned());
                         }
                     }
                     res
@@ -1402,32 +1402,35 @@ impl ContentTree {
                     Err(AppError::ContentFull)
                 }
             }
-            Self::Empty(_hash) => {
-                //TODO: what to do if existing hash = 0?
-                // eprintln!("append I am empty {}", _hash);
-                if data.is_empty() {
-                    if *_hash == 0 {
-                        let new_hash = data.get_hash();
-                        *self = ContentTree::Empty(new_hash);
-                        Ok(new_hash)
+            Self::Empty(e_hash) => {
+                let new_hash = data.get_hash();
+                if *e_hash == 0 {
+                    *self = if data.is_empty() {
+                        ContentTree::Empty(new_hash)
                     } else {
-                        let double_hash = double_hash(*_hash, data.get_hash());
-                        // eprintln!("data empty {}", double_hash);
-                        let s_tree = Subtree {
-                            data_count: 2,
-                            hash: double_hash,
-                            left: ContentTree::Empty(*_hash),
-                            right: ContentTree::Empty(data.get_hash()),
-                        };
-                        *self = ContentTree::Hashed(Box::new(s_tree));
-                        // eprintln!("4 Len after append: {}", self.len());
-                        Ok(double_hash)
-                    }
+                        // eprintln!("append data not empty");
+                        ContentTree::Filled(data)
+                        // eprintln!("5 Len after append: {}", self.len());
+                        // Ok(hash)
+                    };
+                    Ok(new_hash)
                 } else {
-                    // eprintln!("append data not empty");
-                    *self = ContentTree::Filled(data);
-                    // eprintln!("5 Len after append: {}", self.len());
-                    Ok(hash)
+                    let double_hash = double_hash(*e_hash, new_hash);
+                    let right = if data.is_empty() {
+                        ContentTree::Empty(new_hash)
+                    } else {
+                        ContentTree::Filled(data)
+                    };
+                    // eprintln!("data empty {}", double_hash);
+                    let s_tree = Subtree {
+                        data_count: 2,
+                        hash: double_hash,
+                        left: ContentTree::Empty(*e_hash),
+                        right,
+                    };
+                    *self = ContentTree::Hashed(Box::new(s_tree));
+                    // eprintln!("4 Len after append: {}", self.len());
+                    Ok(double_hash)
                 }
             }
         }
