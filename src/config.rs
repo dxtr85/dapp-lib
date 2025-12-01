@@ -12,6 +12,7 @@ pub struct Configuration {
     pub autosave: bool,
     pub work_dir: PathBuf,
     pub storage: PathBuf,
+    pub search: PathBuf,
     pub neighbors: Option<Vec<NetworkSettings>>,
     pub max_connected_swarms: u8,
     pub upload_bandwidth: u64,
@@ -27,6 +28,8 @@ impl Configuration {
         } else {
             None
         };
+        let mut storage = dir.join("storage");
+        let mut search = dir.join("search");
         let mut autosave = false;
         let mut max_connected_swarms = 8;
         let mut upload_bandwidth = 8192;
@@ -35,7 +38,8 @@ impl Configuration {
             return Configuration {
                 autosave: false,
                 work_dir: dir.clone(),
-                storage: dir.join("storage"),
+                storage,
+                search,
                 neighbors,
                 max_connected_swarms,
                 upload_bandwidth,
@@ -95,6 +99,16 @@ impl Configuration {
                             }
                         }
                     }
+                    "STORAGE_DIR" => {
+                        if let Some(storage_str) = split.next() {
+                            storage = PathBuf::from(storage_str);
+                        }
+                    }
+                    "SEARCH_DIR" => {
+                        if let Some(search_str) = split.next() {
+                            search = PathBuf::from(search_str);
+                        }
+                    }
                     other => {
                         eprintln!("Unrecognized config line: {}", other);
                     }
@@ -104,7 +118,8 @@ impl Configuration {
         Configuration {
             autosave,
             work_dir: dir.clone(),
-            storage: dir.join("storage"),
+            storage,
+            search,
             neighbors,
             max_connected_swarms,
             upload_bandwidth,

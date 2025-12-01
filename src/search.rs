@@ -11,6 +11,11 @@ use crate::SwarmName;
 use crate::ToAppData;
 use std::collections::HashMap;
 use std::collections::HashSet;
+// TODO: make everything FS-related async
+use std::fs;
+use std::fs::File;
+use std::io::Read;
+use std::path::PathBuf;
 // use std::ops::Index;
 
 // use crate::LibRequest;
@@ -20,6 +25,9 @@ pub use crate::ToApp;
 // pub use crate::ToAppMgr;
 use async_std::channel::Receiver;
 use async_std::channel::Sender;
+use async_std::fs::OpenOptions;
+use async_std::io::BufWriter;
+use async_std::io::WriteExt;
 use gnome::prelude::sha_hash;
 use gnome::prelude::SwarmID;
 
@@ -109,6 +117,7 @@ impl EngineState {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Hit(pub SwarmName, pub ContentID, pub u8);
 struct Engine {
+    search_path: PathBuf,
     queries: HashMap<u64, (Query, HashSet<Hit>)>,
     swarm_links: HashMap<SwarmID, SwarmLink>,
     tags: HashMap<SwarmID, HashMap<u8, Tag>>,
@@ -117,18 +126,37 @@ struct Engine {
     //      so that we do not query non-changed given swarm multiple times
 }
 impl Engine {
-    pub fn new() -> Self {
-        Engine {
+    pub async fn new(search_path: PathBuf) -> Self {
+        // Load permanent searches from search path
+        eprintln!("Should load searches from {search_path:?}");
+        if !fs::exists(search_path.clone()).unwrap() {
+            let _ = fs::create_dir(search_path.clone());
+        }
+        let mut engine = Engine {
+            search_path: search_path.clone(),
             queries: HashMap::new(),
             swarm_links: HashMap::new(),
             tags: HashMap::new(),
             state: EngineState::Idling,
+        };
+        for f_name in fs::read_dir(search_path.clone()).unwrap().into_iter() {
+            // eprintln!("we have: {f_name:?}");
+            if let Ok(f) = f_name {
+                let mut str = String::new();
+                let mut fl = File::open(f.path()).unwrap();
+                if let Ok(count) = fl.read_to_string(&mut str) {
+                    if count > 0 {
+                        engine.add_query(str, true).await;
+                    }
+                }
+            }
         }
+        engine
     }
-    pub async fn add_query(&mut self, phrase: String) {
+    pub async fn add_query(&mut self, phrase: String, is_permanent: bool) {
         let phrase = phrase.trim().to_string();
         let q_hash = sha_hash(phrase.as_bytes());
-        let query = Query::new(phrase);
+        let query = Query::new(phrase, is_permanent);
         self.queries.insert(q_hash, (query, HashSet::new()));
         if self.swarm_links.is_empty() {
             self.state = EngineState::Idling;
@@ -172,14 +200,50 @@ impl Engine {
         }
     }
     pub fn del_query(&mut self, phrase: String) {
-        self.queries.remove(&sha_hash(phrase.as_bytes()));
+        let sha = sha_hash(phrase.as_bytes());
+        if let Some((q, _hm)) = self.queries.remove(&sha) {
+            if q.is_permanent {
+                // TODO: remove file from disk
+                let mut f_path = self.search_path.clone();
+                f_path.push(format!("{}", sha));
+                let _ = fs::remove_file(f_path);
+            }
+        }
     }
-    pub fn get_query(&self, phrase: String) -> (String, Vec<Hit>) {
+    pub fn get_query(&self, phrase: String) -> (String, bool, Vec<Hit>) {
         let q_hash = sha_hash(phrase.as_bytes());
         if let Some((_q, hset)) = self.queries.get(&q_hash) {
-            (phrase, hset.clone().into_iter().collect())
+            (phrase, _q.is_permanent, hset.clone().into_iter().collect())
         } else {
-            (phrase, vec![])
+            (phrase, false, vec![])
+        }
+    }
+
+    pub async fn set_flag(&mut self, phrase: &String, flag: bool) {
+        let q_hash = sha_hash(phrase.as_bytes());
+        if let Some((query, _hset)) = self.queries.get_mut(&q_hash) {
+            query.is_permanent = flag;
+            if flag {
+                // Create query file from disk location
+                let mut f_path = self.search_path.clone();
+                f_path.push(format!("{}", q_hash));
+                let header_file = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .append(true)
+                    .open(f_path)
+                    .await
+                    .unwrap();
+                let mut header_file = BufWriter::new(header_file);
+                let _ = header_file.write(&phrase.clone().into_bytes()).await;
+                let _ = header_file.flush().await;
+                drop(header_file);
+            } else {
+                // Remove file from disk
+                let mut f_path = self.search_path.clone();
+                f_path.push(format!("{}", q_hash));
+                let _ = fs::remove_file(f_path);
+            }
         }
     }
 
@@ -375,14 +439,19 @@ impl Engine {
 struct Query {
     text: String,
     words: HashSet<String>,
+    is_permanent: bool,
 }
 impl Query {
-    pub fn new(text: String) -> Self {
+    pub fn new(text: String, is_permanent: bool) -> Self {
         let mut words = HashSet::new();
         for word in text.split_whitespace() {
             words.insert(word.to_string());
         }
-        Query { text, words }
+        Query {
+            text,
+            words,
+            is_permanent,
+        }
     }
 
     pub fn compare(&self, phrase: &String) -> u8 {
@@ -415,6 +484,7 @@ pub enum SearchMsg {
     DelQuery(String),
     ListQueries,
     GetResults(String),
+    SetFlag(String, bool),
     SwarmSynced(SwarmID, SwarmLink),
     FirstPages(SwarmID, SwarmName, Vec<(ContentID, DataType, Data)>),
     ReadSuccess(SwarmID, SwarmName, ContentID, DataType, Vec<Data>),
@@ -422,19 +492,20 @@ pub enum SearchMsg {
     AppDataTerminated(SwarmID),
 }
 pub async fn serve_search_engine(
+    search_path: PathBuf,
     to_user: Sender<ToApp>,
     // to_app_mgr: Sender<ToAppMgr>,
     //TODO: replace LibResponse with a dedicated struct
     response: Receiver<SearchMsg>,
 ) {
-    let mut engine = Engine::new();
+    let mut engine = Engine::new(search_path).await;
     loop {
         while let Ok(message) = response.recv().await {
             eprintln!("SearchEngine received: {:?}", message);
             match message {
                 SearchMsg::AddQuery(phrase) => {
                     eprintln!("Added new Search");
-                    engine.add_query(phrase).await;
+                    engine.add_query(phrase, false).await;
                     // for link in engine.swarm_links.values() {
                     //     for c_id in 0..=link.max_cid {
                     //         link.sender
@@ -450,8 +521,17 @@ pub async fn serve_search_engine(
                     let _ = to_user.send(ToApp::SearchQueries(engine.summary())).await;
                 }
                 SearchMsg::GetResults(phrase) => {
-                    let (phrase, results) = engine.get_query(phrase);
-                    let _ = to_user.send(ToApp::SearchResults(phrase, results)).await;
+                    let (phrase, is_permanent, results) = engine.get_query(phrase);
+                    let _ = to_user
+                        .send(ToApp::SearchResults(phrase, is_permanent, results))
+                        .await;
+                }
+                SearchMsg::SetFlag(phrase, value) => {
+                    engine.set_flag(&phrase, value).await;
+                    let (phrase, is_permanent, results) = engine.get_query(phrase);
+                    let _ = to_user
+                        .send(ToApp::SearchResults(phrase, is_permanent, results))
+                        .await;
                 }
                 SearchMsg::SwarmSynced(s_id, s_link) => {
                     // TODO: check if root_hash changed

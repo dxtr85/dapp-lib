@@ -27,6 +27,7 @@ mod storage;
 mod sync_message;
 use app_type::AppType;
 use async_std::fs::create_dir_all;
+// use async_std::path::PathBuf;
 use async_std::task::yield_now;
 use message::ChangeContentOperation;
 use search::Hit;
@@ -172,7 +173,7 @@ pub enum ToApp {
     AllNeighborsGone,
     Disconnected(bool, SwarmID, SwarmName), //bool indicates if we try to reconnect
     SearchQueries(Vec<(String, usize)>),
-    SearchResults(String, Vec<Hit>),
+    SearchResults(String, bool, Vec<Hit>), // bool = is_permanent
     // SwitchToApp(AppType, SwarmID, SwarmName),
     RunningPolicies(Vec<(Policy, Requirement)>),
     RunningCapabilities(Vec<(Capabilities, Vec<GnomeId>)>),
@@ -241,6 +242,7 @@ pub enum LibRequest {
     RemoveSearch(String),
     ListSearches,
     GetSearchResults(String),
+    SetSearchPermanentFlag(String, bool),
     SetActiveApp(SwarmName),
     ProvidePublicIPs,
     RunningPolicies(SwarmName),
@@ -566,19 +568,20 @@ pub async fn initialize(
     let (gmgr_send, gmgr_recv, my_id) =
         init(config_dir, Some(neighbors), bandwidth_per_swarm).await;
     let (to_search_engine_send, to_search_engine_recv) = achannel::unbounded();
+    spawn(serve_search_engine(
+        config.search.clone(),
+        to_user_send.clone(),
+        // to_app_mgr_send,
+        to_search_engine_recv,
+    ));
     spawn(serve_app_manager(
         config,
         gmgr_send,
         gmgr_recv,
-        to_user_send.clone(),
+        to_user_send,
         to_app_mgr_send,
         to_app_mgr_recv,
         to_search_engine_send,
-    ));
-    spawn(serve_search_engine(
-        to_user_send,
-        // to_app_mgr_send,
-        to_search_engine_recv,
     ));
     my_id
 }
@@ -669,6 +672,11 @@ async fn serve_app_manager(
                 }
                 ToAppMgr::FromApp(LibRequest::GetSearchResults(phrase)) => {
                     let _ = to_search_enigne.send(SearchMsg::GetResults(phrase)).await;
+                }
+                ToAppMgr::FromApp(LibRequest::SetSearchPermanentFlag(phrase, new_value)) => {
+                    let _ = to_search_enigne
+                        .send(SearchMsg::SetFlag(phrase, new_value))
+                        .await;
                 }
                 ToAppMgr::FromApp(LibRequest::ReadPagesRange(s_id, c_id, p_start, p_end)) => {
                     if let Some(to_app_data) = app_mgr.app_data_store.get(&s_id) {
