@@ -9,6 +9,7 @@ use crate::ContentID;
 use crate::Data;
 use crate::SwarmName;
 use crate::ToAppData;
+use crate::ToAppMgr;
 use std::collections::HashMap;
 use std::collections::HashSet;
 // TODO: make everything FS-related async
@@ -72,6 +73,7 @@ pub struct SwarmLink {
     pub s_tags: HashMap<u8, Tag>,
 }
 
+#[derive(Debug)]
 pub enum EngineState {
     Idling,
     Processing(SwarmID, Sender<ToAppData>, Vec<ContentID>, Vec<SwarmID>),
@@ -122,11 +124,12 @@ struct Engine {
     swarm_links: HashMap<SwarmID, SwarmLink>,
     tags: HashMap<SwarmID, HashMap<u8, Tag>>,
     state: EngineState,
+    to_app_mgr: Sender<ToAppMgr>,
     //TODO: some structure tracking SwarmName to root hash,
     //      so that we do not query non-changed given swarm multiple times
 }
 impl Engine {
-    pub async fn new(search_path: PathBuf) -> Self {
+    pub async fn new(search_path: PathBuf, to_app_mgr: Sender<ToAppMgr>) -> Self {
         // Load permanent searches from search path
         eprintln!("Should load searches from {search_path:?}");
         if !fs::exists(search_path.clone()).unwrap() {
@@ -138,6 +141,7 @@ impl Engine {
             swarm_links: HashMap::new(),
             tags: HashMap::new(),
             state: EngineState::Idling,
+            to_app_mgr,
         };
         for f_name in fs::read_dir(search_path.clone()).unwrap().into_iter() {
             // eprintln!("we have: {f_name:?}");
@@ -154,6 +158,7 @@ impl Engine {
         engine
     }
     pub async fn add_query(&mut self, phrase: String, is_permanent: bool) {
+        // eprintln!("add_query: {phrase}, state: {:?}", self.state);
         let phrase = phrase.trim().to_string();
         let q_hash = sha_hash(phrase.as_bytes());
         let query = Query::new(phrase, is_permanent);
@@ -268,6 +273,10 @@ impl Engine {
     ) {
         if c_id == 0 {
             let manif = Manifest::from(data_vec);
+            // eprintln!(
+            //     "search parse Manifest for {s_id}, app_type: {:?}",
+            //     manif.app_type
+            // );
             let mut phrase = manif.description.clone();
             self.tags.insert(s_id, manif.tags.clone());
             for tag in manif.tags.values() {
@@ -278,6 +287,7 @@ impl Engine {
             if let Some(s_link) = self.swarm_links.get_mut(&s_id) {
                 s_link.s_descr = manif.description;
                 s_link.app_type = Some(manif.app_type);
+                // eprintln!("search parse {s_id} app type: {:?}", manif.app_type);
                 s_link.s_tags = manif.tags;
                 if self.queries.is_empty() {
                     return;
@@ -322,7 +332,12 @@ impl Engine {
             // if state is Processing, we remove this CID from list of processing cids
             let advance_to_next_swarm = self.state.processing_done(s_id, vec![c_id]);
             if advance_to_next_swarm {
-                self.advance_to_next_swarm().await;
+                let any_swarm_queried = self.advance_to_next_swarm().await;
+                if !any_swarm_queried {
+                    // TODO: we are done searching, we should send results to manager
+                    // to adjust storage policy
+                    self.notify_manager_about_searches().await;
+                }
                 // TODO: when we are Processing and done with current SwarmID,
                 // take next from list and change state to that one
                 // or to Idling in case all swarms have been searched for
@@ -338,14 +353,20 @@ impl Engine {
         s_name: SwarmName,
         first_pages: Vec<(ContentID, DataType, Data)>,
     ) {
+        // eprintln!("search parse_first_pages {s_id}");
         let mut processed_cids = Vec::with_capacity(first_pages.len());
         let app_type = if let Some(s_l) = self.swarm_links.get(&s_id) {
             s_l.app_type
         } else {
             None
         };
+        // eprintln!("app_type: {:?}", app_type);
         if Some(AppType::Catalog) == app_type {
             for (c_id, d_type, first_data) in first_pages {
+                if c_id == 0 {
+                    // eprintln!("search cid {c_id}");
+                    continue;
+                }
                 let (tag_bytes, mut header) = read_tags_and_header(d_type, first_data);
                 if let Some(tags) = self.tags.get(&s_id) {
                     for t_byte in tag_bytes {
@@ -360,8 +381,13 @@ impl Engine {
                 processed_cids.push(c_id);
             }
         } else {
-            //TODO
-            eprintln!("TODO: we should process Forum Posts using separate logic!");
+            eprintln!("search Don't know app_type, requesting Manifest 2");
+            if let Some(s_l) = self.swarm_links.get(&s_id) {
+                let _ = s_l
+                    .sender
+                    .send(ToAppData::ReadAllPages(Requestor::Search, 0))
+                    .await;
+            }
         }
         let advance_to_next_swarm = self.state.processing_done(s_id, processed_cids);
         eprintln!(
@@ -369,7 +395,12 @@ impl Engine {
             advance_to_next_swarm
         );
         if advance_to_next_swarm {
-            self.advance_to_next_swarm().await;
+            let any_swarm_queried = self.advance_to_next_swarm().await;
+            if !any_swarm_queried {
+                // TODO: we are done searching, we should send results to manager
+                // to adjust storage policy
+                self.notify_manager_about_searches().await;
+            }
         }
     }
 
@@ -388,7 +419,8 @@ impl Engine {
         }
         anything_added
     }
-    async fn advance_to_next_swarm(&mut self) {
+    async fn advance_to_next_swarm(&mut self) -> bool {
+        let mut any_swarm_inquired = false;
         eprintln!("In advance_to_next_swarm");
         let current_state = std::mem::replace(&mut self.state, EngineState::Idling);
         match current_state {
@@ -396,13 +428,14 @@ impl Engine {
                 eprintln!("Not advancing to search next SwarmID when Idling");
                 // Avoid infinite loop — do nothing, we only transition from Idling
                 // when new swarm is synced or new query arrived
+                any_swarm_inquired
             }
-            EngineState::Processing(s_id, sender, empty_vec, mut swarms_to_inquire) => {
-                if !empty_vec.is_empty() {
+            EngineState::Processing(s_id, sender, cids_todo, mut swarms_to_inquire) => {
+                if !cids_todo.is_empty() {
                     eprintln!("We should not advance to search next swarm!");
                     self.state =
-                        EngineState::Processing(s_id, sender, empty_vec, swarms_to_inquire);
-                    return;
+                        EngineState::Processing(s_id, sender, cids_todo, swarms_to_inquire);
+                    return true;
                 }
                 eprintln!("Searching through next swarm, if any.");
                 // When we are Processing and done with current SwarmID,
@@ -410,7 +443,15 @@ impl Engine {
                 // or to Idling in case all swarms have been searched for
                 while let Some(s_id) = swarms_to_inquire.pop() {
                     if let Some(s_link) = self.swarm_links.get(&s_id) {
-                        // do smthg
+                        if s_link.app_type.is_none() {
+                            //TODO: read Manifest
+                            eprintln!("search Don't know app_type, requesting Manifest");
+                            let _ = s_link
+                                .sender
+                                .send(ToAppData::ReadAllPages(Requestor::Search, 0))
+                                .await;
+                        }
+                        any_swarm_inquired = true;
                         let mut queried_cids = vec![];
                         for c_id in 1..=s_link.max_cid {
                             queried_cids.push(c_id);
@@ -432,8 +473,35 @@ impl Engine {
                         eprintln!(" Could not find SwarmLink for {}", s_id);
                     }
                 }
+                any_swarm_inquired
             }
         }
+    }
+    async fn notify_manager_about_searches(&self) {
+        eprintln!("in notify_manager_about_searches");
+        // TODO: needs rework
+        //TODO: first we need to collect CIDs by SwarmID
+        let mut s_res: HashMap<SwarmName, HashSet<u16>> = HashMap::new();
+        for (_hsh, (q, hits)) in &self.queries {
+            for hit in hits {
+                if let Some(c_vec) = s_res.get_mut(&hit.0) {
+                    c_vec.insert(hit.1);
+                } else {
+                    let mut n_set = HashSet::new();
+                    n_set.insert(hit.1);
+                    s_res.insert(hit.0.clone(), n_set);
+                }
+            }
+        }
+        let mut s_res_vec: Vec<(SwarmName, Vec<ContentID>)> = Vec::with_capacity(s_res.len());
+        for (s_n, cid_set) in s_res {
+            let cid_vec: Vec<ContentID> = cid_set.into_iter().collect();
+            s_res_vec.push((s_n, cid_vec));
+        }
+        let _ = self
+            .to_app_mgr
+            .send(ToAppMgr::SearchSummary(s_res_vec))
+            .await;
     }
 }
 struct Query {
@@ -494,17 +562,17 @@ pub enum SearchMsg {
 pub async fn serve_search_engine(
     search_path: PathBuf,
     to_user: Sender<ToApp>,
-    // to_app_mgr: Sender<ToAppMgr>,
+    to_app_mgr: Sender<ToAppMgr>,
     //TODO: replace LibResponse with a dedicated struct
     response: Receiver<SearchMsg>,
 ) {
-    let mut engine = Engine::new(search_path).await;
+    let mut engine = Engine::new(search_path, to_app_mgr).await;
     loop {
         while let Ok(message) = response.recv().await {
             eprintln!("SearchEngine received: {:?}", message);
             match message {
                 SearchMsg::AddQuery(phrase) => {
-                    eprintln!("Added new Search");
+                    eprintln!("Added new Search, slinks: {}", engine.swarm_links.len());
                     engine.add_query(phrase, false).await;
                     // for link in engine.swarm_links.values() {
                     //     for c_id in 0..=link.max_cid {
@@ -534,6 +602,7 @@ pub async fn serve_search_engine(
                         .await;
                 }
                 SearchMsg::SwarmSynced(s_id, s_link) => {
+                    // eprintln!("search SwarmSynced {s_id}");
                     // TODO: check if root_hash changed
                     // TODO: create a mechanism to enqueue subsequent swarms
                     //       until we are done with current one,
@@ -554,16 +623,21 @@ pub async fn serve_search_engine(
                     }
                 }
                 SearchMsg::ReadSuccess(s_id, s_name, c_id, d_type, data_vec) => {
-                    // if engine.has_queries() {
                     engine
                         .parse_content(s_id, s_name, c_id, d_type, data_vec)
                         .await;
                     // }
                 }
                 SearchMsg::ReadError(s_id, c_id, _err) => {
+                    eprintln!("search ReadError {s_id}-{c_id} {:?}", _err);
                     let advance_to_next_swarm = engine.state.processing_done(s_id, vec![c_id]);
                     if advance_to_next_swarm {
-                        engine.advance_to_next_swarm().await;
+                        let any_swarm_queried = engine.advance_to_next_swarm().await;
+                        if !any_swarm_queried {
+                            // TODO: we are done searching, we should send results to manager
+                            // to adjust storage policy
+                            engine.notify_manager_about_searches().await;
+                        }
                     }
                 }
                 SearchMsg::AppDataTerminated(s_id) => {

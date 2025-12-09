@@ -1,6 +1,9 @@
 use crate::content::ContentID;
 use crate::content::DataType;
+use crate::determine_storage_policy;
 use crate::prelude::AppType;
+use crate::storage::StorageCondition;
+use crate::storage::StoragePolicy;
 use crate::ToApp;
 use crate::ToAppMgr;
 use crate::{start_a_timer, TimeoutType};
@@ -12,6 +15,7 @@ use gnome::prelude::{GnomeId, SwarmID, SwarmName};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::path::PathBuf;
 use std::time::Duration;
 // use std::time::Duration;
 
@@ -23,14 +27,22 @@ pub struct SwarmState {
     pub app_type: Option<AppType>,
     pub is_synced: bool,
     pub is_busy: bool,
+    pub is_any_content_marked_by_search_engine: bool,
 }
 impl SwarmState {
-    pub fn new(s_id: SwarmID, app_type: Option<AppType>, is_synced: bool, is_busy: bool) -> Self {
+    pub fn new(
+        s_id: SwarmID,
+        app_type: Option<AppType>,
+        is_synced: bool,
+        is_busy: bool,
+        is_any_content_marked_by_search_engine: bool,
+    ) -> Self {
         SwarmState {
             s_id,
             app_type,
             is_synced,
             is_busy,
+            is_any_content_marked_by_search_engine,
         }
     }
 }
@@ -220,6 +232,7 @@ pub struct ApplicationManager {
     pub my_name: SwarmName,
     pub app_data_store: HashMap<SwarmID, Sender<ToAppData>>,
     pub active_app_data: (SwarmID, Sender<ToAppData>),
+    storage_path: PathBuf,
     name_to_id: HashMap<SwarmName, SwarmState>,
     swap_state: SwapState,
     read_state: ReadState,
@@ -232,6 +245,7 @@ impl ApplicationManager {
     pub fn new(
         gnome_id: GnomeId,
         max_swarms: u8,
+        storage_path: PathBuf,
         (to_gnome_mgr, to_user, to_app_mgr): (
             Sender<ToGnomeManager>,
             Sender<ToApp>,
@@ -254,11 +268,20 @@ impl ApplicationManager {
                 process: SwapProcess::Idle,
                 to_join: vec![],
             },
+            storage_path,
             read_state: ReadState::new(),
             to_gnome_mgr,
             to_user,
             to_app_mgr,
         }
+    }
+
+    pub fn update_swarm_search_state(&mut self, s_name: &SwarmName, new_state: bool) {
+        // if let Some(s_name) = self.get_name(s_id) {
+        if let Some(state) = self.name_to_id.get_mut(s_name) {
+            state.is_any_content_marked_by_search_engine = new_state;
+        }
+        // }
     }
 
     pub fn get_swarm_state(&self, s_name: &SwarmName) -> Option<SwarmState> {
@@ -332,7 +355,7 @@ impl ApplicationManager {
             e_state.app_type = app_type;
             e_state
         } else {
-            SwarmState::new(s_id, app_type, false, true)
+            SwarmState::new(s_id, app_type, false, true, false)
         };
         self.name_to_id.insert(s_name.clone(), s_state);
         let empty = SwarmName {
@@ -651,6 +674,62 @@ impl ApplicationManager {
             }
         }
     }
+
+    pub async fn apply_new_storage_rules(
+        &self,
+        new_rules: &Vec<(StorageCondition, StoragePolicy)>,
+    ) {
+        // DONE: Also application should inform manager about changes to storage.rules.
+        // Then manager should update policy for every swarm running.
+        for s_id in self.app_data_store.keys() {
+            if let Some(s_name) = self.get_name(*s_id) {
+                self.update_storage_policy_for(&s_name, new_rules, vec![])
+                    .await;
+            }
+        }
+    }
+
+    pub async fn update_storage_policy_for(
+        &self,
+        s_name: &SwarmName,
+        // s_id: SwarmID,
+        storage_rules: &Vec<(StorageCondition, StoragePolicy)>,
+        cid_vec: Vec<ContentID>,
+    ) {
+        // TODO: manager should get informed by search engine about
+        // contents that match any search query for each swarm.
+        // Then manager should determine new storage policy for that swarm.
+        //
+        // SwarmState should only hold a flag indicating if any content
+        // from that swarm is in search results.
+        // Therefore we might send an update to AppData with some Match-policy,
+        // but with an empty list of CIDs.
+        // Then AppData should reuse it's existing list of CIDs for that new policy.
+        //
+        // if let Some(s_name) = self.get_name(s_id) {
+        // self.update_swarm_search_state(&s_name, !cid_vec.is_empty());
+        if let Some(s_state) = self.get_swarm_state(s_name) {
+            let new_policy = determine_storage_policy(
+                self.my_name.founder,
+                s_state.app_type,
+                &s_name,
+                s_state.is_any_content_marked_by_search_engine,
+                storage_rules,
+            );
+            eprintln!("New StoragePolicy for {s_name}: {:?}", new_policy);
+
+            if let Some(sender) = self.app_data_store.get(&s_state.s_id) {
+                let _ = sender
+                    .send(ToAppData::SetStoragePolicy(
+                        self.storage_path.join(s_name.to_path()),
+                        new_policy,
+                        cid_vec,
+                    ))
+                    .await;
+            }
+        }
+        // }
+    }
     // async fn update_swap_state(&mut self, s_id: SwarmID, can_be_swapped: bool) {
     //     eprintln!(
     //         "update_swap_state {} can be swapped {}",
@@ -742,7 +821,7 @@ impl ApplicationManager {
         //     AppType::Other(0)
         // };
         self.name_to_id
-            .insert(s_name, SwarmState::new(s_id, app_type, false, true));
+            .insert(s_name, SwarmState::new(s_id, app_type, false, true, false));
         for val in self.name_to_id.values() {
             eprintln!("n2id {} {:?}", val.s_id, val.app_type);
         }

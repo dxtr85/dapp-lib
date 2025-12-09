@@ -1,12 +1,12 @@
 use std::fs::File;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
+use std::str::{Chars, FromStr};
 
-use gnome::prelude::{Nat, NetworkSettings, PortAllocationRule, Transport};
+use gnome::prelude::{GnomeId, Nat, NetworkSettings, PortAllocationRule, SwarmName, Transport};
 
-use crate::storage::StoragePolicy;
+use crate::storage::{StorageCondition, StoragePolicy};
 
 pub struct Configuration {
     pub autosave: bool,
@@ -16,7 +16,7 @@ pub struct Configuration {
     pub neighbors: Option<Vec<NetworkSettings>>,
     pub max_connected_swarms: u8,
     pub upload_bandwidth: u64,
-    pub store_data_on_disk: StoragePolicy,
+    pub storage_rules: Vec<(StorageCondition, StoragePolicy)>,
 }
 
 impl Configuration {
@@ -33,7 +33,7 @@ impl Configuration {
         let mut autosave = false;
         let mut max_connected_swarms = 8;
         let mut upload_bandwidth = 8192;
-        let mut store_data_on_disk = StoragePolicy::Everything;
+        let mut store_data_on_disk = vec![(StorageCondition::Default, StoragePolicy::All)];
         if !conf_path.exists() {
             return Configuration {
                 autosave: false,
@@ -43,8 +43,12 @@ impl Configuration {
                 neighbors,
                 max_connected_swarms,
                 upload_bandwidth,
-                store_data_on_disk,
+                storage_rules: store_data_on_disk,
             };
+        }
+        let storage_rules_file_path = dir.join("storage.rules");
+        if storage_rules_file_path.exists() {
+            store_data_on_disk = read_storage_rules_from_file(storage_rules_file_path);
         }
         let lines_iter = read_lines(conf_path).unwrap().into_iter();
         for line in lines_iter {
@@ -82,23 +86,7 @@ impl Configuration {
                             }
                         }
                     }
-                    "STORE_DATA_ON_DISK" => {
-                        if let Some(number_str) = split.next() {
-                            if let Ok(number) = u8::from_str_radix(number_str, 10) {
-                                match number {
-                                    1 => store_data_on_disk = StoragePolicy::Everything,
-                                    0 => store_data_on_disk = StoragePolicy::Datastore,
-                                    other => {
-                                        eprintln!(
-                                            "Invalid config value for STORE_DATA_ON_DISK: {}",
-                                            other
-                                        );
-                                        eprintln!("Allowed values: 0 - no data storage\n\t\t 1 - data storage enabled");
-                                    }
-                                }
-                            }
-                        }
-                    }
+
                     "STORAGE_DIR" => {
                         if let Some(storage_str) = split.next() {
                             storage = PathBuf::from(storage_str);
@@ -123,7 +111,231 @@ impl Configuration {
             neighbors,
             max_connected_swarms,
             upload_bandwidth,
-            store_data_on_disk,
+            storage_rules: store_data_on_disk,
+        }
+    }
+}
+
+pub fn write_storage_rules_to_file(
+    rules: &Vec<(StorageCondition, StoragePolicy)>,
+    file_path: PathBuf,
+) {
+    //TODO
+    eprintln!("in write_storage_rules_to_file");
+    let mut entire_str = String::new();
+    for (cond, pol) in rules {
+        let line = format!("{} {}\n", cond.get_string(), pol.get_string());
+        entire_str.push_str(&line);
+    }
+    let mut f = File::create(file_path).unwrap();
+    let _ = write!(f, "{}", entire_str);
+    drop(f);
+    eprintln!("write is over");
+}
+
+pub fn read_storage_rules_from_file(file_path: PathBuf) -> Vec<(StorageCondition, StoragePolicy)> {
+    let mut rules = vec![];
+    // TODO: move storage rules to a separate file called 'storage.rules'
+    let lines_iter = read_lines(file_path).unwrap().into_iter();
+    for line in lines_iter {
+        let ls = line.unwrap().to_string();
+        if let Some(rule) = parse_for_storage_rule(ls) {
+            eprintln!("Add storage rule");
+            rules.push(rule);
+        }
+    }
+    rules
+}
+
+fn parse_for_storage_rule(line: String) -> Option<(StorageCondition, StoragePolicy)> {
+    if line.starts_with('#') || line.is_empty() {
+        eprintln!("Ignoring Line: {}", line);
+        None
+    } else {
+        eprintln!("Parsing Line: {}", line);
+        let mut chars = line.trim().chars();
+        let mut cond_chars: Vec<char> = vec![];
+        let mut is_space_char = false;
+        while !is_space_char {
+            if let Some(char) = chars.next() {
+                if char.is_whitespace() {
+                    is_space_char = true;
+                } else {
+                    cond_chars.push(char);
+                }
+            } else {
+                is_space_char = true;
+            }
+        }
+        let cond_str: String = cond_chars.into_iter().collect();
+        match cond_str.as_str() {
+            "IamFounder" => {
+                if let Some(pol) = read_policy(&mut chars) {
+                    return Some((StorageCondition::IamFounder, pol));
+                }
+            }
+            // FounderIs(GnomeId),
+            "FounderIs" => {
+                if let Some(g_id) = read_gnome_id(&mut chars) {
+                    if let Some(pol) = read_policy(&mut chars) {
+                        return Some((StorageCondition::FounderIs(g_id), pol));
+                    }
+                } else {
+                    eprintln!("Failed reading Founder GnomeId");
+                }
+            }
+            // SwarmName(SwarmName),
+            "SwarmName" => {
+                if let Some(g_id) = read_gnome_id(&mut chars) {
+                    if let Some(name) = read_swarm_name(&mut chars) {
+                        if let Some(pol) = read_policy(&mut chars) {
+                            if let Ok(s_name) = SwarmName::new(g_id, name) {
+                                return Some((StorageCondition::SwarmName(s_name), pol));
+                            }
+                        }
+                    } else {
+                        eprintln!("Failed reading SwarmName");
+                    }
+                } else {
+                    eprintln!("Failed reading Founder GnomeId");
+                }
+            }
+            // ,
+            "CatalogApp" => {
+                //TODO: read policy
+                if let Some(pol) = read_policy(&mut chars) {
+                    return Some((StorageCondition::CatalogApp, pol));
+                }
+            }
+            // ,
+            "ForumApp" => {
+                //TODO: read policy
+                if let Some(pol) = read_policy(&mut chars) {
+                    return Some((StorageCondition::ForumApp, pol));
+                }
+            }
+            // ,
+            "SearchMatch" => {
+                //TODO: read policy
+                if let Some(pol) = read_policy(&mut chars) {
+                    return Some((StorageCondition::SearchMatch, pol));
+                }
+            }
+            // ,
+            "Default" => {
+                //TODO: read policy
+                if let Some(pol) = read_policy(&mut chars) {
+                    return Some((StorageCondition::Default, pol));
+                }
+            }
+            _other => {
+                eprintln!("Unrecognized StorageCondition: {_other}");
+            }
+        }
+        None
+    }
+}
+
+fn read_gnome_id(chars: &mut Chars) -> Option<GnomeId> {
+    //skip all whitespace chars
+    // read all non whitespace chars
+    // try to construct GnomeId
+    let mut non_whitespace_chars_started = false;
+    let mut gid_chars = vec![];
+    while !non_whitespace_chars_started {
+        if let Some(char) = chars.next() {
+            if !char.is_whitespace() {
+                gid_chars.push(char);
+                non_whitespace_chars_started = true;
+            }
+        }
+    }
+    while non_whitespace_chars_started {
+        if let Some(char) = chars.next() {
+            if char.is_whitespace() {
+                non_whitespace_chars_started = false;
+            } else {
+                gid_chars.push(char);
+            }
+        }
+    }
+    GnomeId::from_string(gid_chars.into_iter().collect())
+}
+
+fn read_swarm_name(chars: &mut Chars) -> Option<String> {
+    //skip all whitespace chars
+    // read first non-whitespace char as name delimiter
+    // read all non whitespace chars until delimiter
+    // try to construct SwarmName (len <=32 bytes)
+    let mut delimiter_determined = false;
+    let mut delimiter = '"';
+    while !delimiter_determined {
+        if let Some(char) = chars.next() {
+            if !char.is_whitespace() {
+                delimiter = char;
+                delimiter_determined = true;
+            }
+        }
+    }
+    let mut name_chars = vec![];
+    while delimiter_determined {
+        if let Some(char) = chars.next() {
+            if char == delimiter {
+                delimiter_determined = false;
+            } else {
+                name_chars.push(char);
+            }
+        }
+    }
+    let name: String = name_chars.into_iter().collect();
+    if name.len() <= 32 {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+fn read_policy(chars: &mut Chars) -> Option<StoragePolicy> {
+    //skip all whitespace chars
+    // read all non whitespace chars
+    // try to construct GnomeId
+    let mut non_whitespace_chars_started = false;
+    let mut pol_chars = vec![];
+    while !non_whitespace_chars_started {
+        if let Some(char) = chars.next() {
+            if !char.is_whitespace() {
+                pol_chars.push(char);
+                non_whitespace_chars_started = true;
+            }
+        } else {
+            return None;
+        }
+    }
+    while non_whitespace_chars_started {
+        if let Some(char) = chars.next() {
+            if char.is_whitespace() {
+                non_whitespace_chars_started = false;
+            } else {
+                pol_chars.push(char);
+            }
+        } else {
+            break;
+        }
+    }
+    let pol_string: String = pol_chars.into_iter().collect();
+    match pol_string.as_str() {
+        "All" => Some(StoragePolicy::All),
+        "Datastore" => Some(StoragePolicy::Datastore),
+        "Manifest" => Some(StoragePolicy::Manifest),
+        "FirstPages" => Some(StoragePolicy::FirstPages),
+        "MatchOrFirstPages" => Some(StoragePolicy::MatchOrFirstPages),
+        "MatchOrForget" => Some(StoragePolicy::MatchOrForget),
+        "MatchAndManifestOrFirstPages" => Some(StoragePolicy::MatchAndManifestOrFirstPages),
+        "MatchAndManifestOrForget" => Some(StoragePolicy::MatchAndManifestOrForget),
+        "Forget" => Some(StoragePolicy::Forget),
+        _other => {
+            eprintln!("Unrecognized StoragePolicy: {_other}");
+            None
         }
     }
 }

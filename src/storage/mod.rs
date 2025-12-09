@@ -3,12 +3,14 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 // use async_std::channel::Sender;
-use async_std::fs::{File, OpenOptions};
+use async_std::fs::{self, File, OpenOptions};
 use async_std::io::prelude::SeekExt;
 use async_std::io::{BufReader, BufWriter, ReadExt, WriteExt};
+use gnome::prelude::{GnomeId, SwarmName};
 // use gnome::prelude::{GnomeId, SwarmName};
 
 use crate::content::{data_to_link, Content, ContentID, ContentTree, DataType};
+use crate::prelude::AppType;
 use crate::{ApplicationData, Data};
 
 // TODO: We need to define different storage policies given swarm can have:
@@ -20,15 +22,210 @@ use crate::{ApplicationData, Data};
 // - Everything - Datastore + MainPages + all other pages
 //
 // Depending on what storage policy we are provided with we decide what to do with data
+#[derive(Clone, Debug)]
+pub enum StorageCondition {
+    IamFounder,
+    FounderIs(GnomeId),
+    SwarmName(SwarmName),
+    CatalogApp,
+    ForumApp,
+    SearchMatch,
+    Default,
+}
+impl StorageCondition {
+    pub fn get(id: usize) -> Self {
+        match id {
+            0 => Self::IamFounder,
+            1 => Self::FounderIs(GnomeId(0)),
+            2 => Self::SwarmName(SwarmName {
+                founder: GnomeId(0),
+                name: "".to_string(),
+            }),
+            3 => Self::CatalogApp,
+            4 => Self::ForumApp,
+            5 => Self::SearchMatch,
+            _o => Self::Default,
+        }
+    }
+    pub fn get_string(&self) -> String {
+        match self {
+            Self::IamFounder => "IamFounder".to_string(),
+            Self::FounderIs(g_id) => {
+                format!("FounderIs {g_id}")
+            }
+            Self::SwarmName(s_n) => {
+                let delimiter = 31 as char;
+                format!(
+                    "SwarmName {} {delimiter}{}{delimiter}",
+                    s_n.founder.to_string(),
+                    s_n.name
+                )
+            }
+            Self::CatalogApp => "CatalogApp".to_string(),
+            Self::ForumApp => "ForumApp".to_string(),
+            Self::SearchMatch => "SearchMatch".to_string(),
+            Self::Default => "Default".to_string(),
+        }
+    }
+    pub fn get_id(&self) -> usize {
+        match self {
+            Self::IamFounder => 0,
+            Self::FounderIs(_id) => 1,
+            Self::SwarmName(_n) => 2,
+            Self::CatalogApp => 3,
+            Self::ForumApp => 4,
+            Self::SearchMatch => 5,
+            Self::Default => 6,
+        }
+    }
+    pub fn string_vec() -> Vec<String> {
+        vec![
+            "IamFounder".to_string(),
+            "FounderIs".to_string(),
+            "SwarmName".to_string(),
+            "CatalogApp".to_string(),
+            "ForumApp".to_string(),
+            "SearchMatch".to_string(),
+            "Default".to_string(),
+        ]
+    }
+    pub fn update(&self, gid_opt: Option<GnomeId>, n_opt: Option<String>) -> Self {
+        match self {
+            Self::FounderIs(_old_gid) => {
+                if let Some(new_gid) = gid_opt {
+                    Self::FounderIs(new_gid)
+                } else {
+                    Self::FounderIs(*_old_gid)
+                }
+            }
+            Self::SwarmName(old_name) => {
+                if let Some(new_gid) = gid_opt {
+                    if let Some(new_name) = n_opt {
+                        let sn = SwarmName::new(new_gid, new_name).unwrap();
+                        Self::SwarmName(sn)
+                    } else {
+                        let sn = SwarmName::new(new_gid, old_name.name.clone()).unwrap();
+                        Self::SwarmName(sn)
+                    }
+                } else {
+                    if let Some(new_name) = n_opt {
+                        let sn = SwarmName::new(old_name.founder, new_name).unwrap();
+                        Self::SwarmName(sn)
+                    } else {
+                        Self::SwarmName(old_name.clone())
+                    }
+                }
+            }
+            other => (*other).clone(),
+        }
+    }
+    pub fn is_met(
+        &self,
+        my_id: GnomeId,
+        app_type: Option<AppType>,
+        s_name: &SwarmName,
+        is_any_content_marked_by_search_engine: bool,
+    ) -> bool {
+        match self {
+            StorageCondition::IamFounder => my_id.0 == s_name.founder.0,
+            StorageCondition::FounderIs(g_id) => g_id.0 == s_name.founder.0,
+            StorageCondition::SwarmName(s_n) => {
+                s_n.founder.0 == s_name.founder.0 && s_n.name == s_name.name
+            }
+            StorageCondition::CatalogApp => {
+                if let Some(a_t) = app_type {
+                    a_t.is_catalog()
+                } else {
+                    false
+                }
+            }
+            StorageCondition::ForumApp => {
+                if let Some(a_t) = app_type {
+                    a_t.is_forum()
+                } else {
+                    false
+                }
+            }
+            StorageCondition::SearchMatch => is_any_content_marked_by_search_engine,
+            StorageCondition::Default => true,
+        }
+    }
+}
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum StoragePolicy {
-    Discard,
+    All,
     Datastore,
-    SelectMainPages(Vec<ContentID>),
-    MainPages,
-    SelectedContents(bool, Vec<ContentID>),
-    Everything,
+    Manifest,
+    FirstPages,
+    MatchOrFirstPages,
+    MatchOrForget,
+    MatchAndManifestOrFirstPages,
+    MatchAndManifestOrForget,
+    Forget,
+}
+impl StoragePolicy {
+    pub fn get(id: usize) -> Self {
+        match id {
+            0 => Self::All,
+            1 => Self::Datastore,
+            2 => Self::Manifest,
+            3 => Self::FirstPages,
+            4 => Self::MatchOrFirstPages,
+            5 => Self::MatchOrForget,
+            6 => Self::MatchAndManifestOrFirstPages,
+            7 => Self::MatchAndManifestOrForget,
+            _o => Self::Forget,
+        }
+    }
+    pub fn get_string(&self) -> String {
+        match self {
+            Self::All => "All".to_string(),
+            Self::Datastore => "Datastore".to_string(),
+            Self::Manifest => "Manifest".to_string(),
+            Self::FirstPages => "FirstPages".to_string(),
+            Self::MatchOrFirstPages => "MatchOrFirstPages".to_string(),
+            Self::MatchOrForget => "MatchOrForget".to_string(),
+            Self::MatchAndManifestOrFirstPages => "MatchAndManifestOrFirstPages".to_string(),
+            Self::MatchAndManifestOrForget => "MatchAndManifestOrForget".to_string(),
+            Self::Forget => "Forget".to_string(),
+        }
+    }
+    pub fn get_id(&self) -> usize {
+        match self {
+            Self::All => 0,
+            Self::Datastore => 1,
+            Self::Manifest => 2,
+            Self::FirstPages => 3,
+            Self::MatchOrFirstPages => 4,
+            Self::MatchOrForget => 5,
+            Self::MatchAndManifestOrFirstPages => 6,
+            Self::MatchAndManifestOrForget => 7,
+            Self::Forget => 8,
+        }
+    }
+    pub fn string_vec() -> Vec<String> {
+        vec![
+            "All".to_string(),
+            "Datastore".to_string(),
+            "Manifest".to_string(),
+            "FirstPages".to_string(),
+            "MatchOrFirstPages".to_string(),
+            "MatchOrForget".to_string(),
+            "MatchAndManifestOrFirstPages".to_string(),
+            "MatchAndManifestOrForget".to_string(),
+            "Forget".to_string(),
+        ]
+    }
+    pub fn is_a_match_policy(&self) -> bool {
+        match self {
+            Self::MatchOrFirstPages => true,
+            Self::MatchOrForget => true,
+            Self::MatchAndManifestOrFirstPages => true,
+            Self::MatchAndManifestOrForget => true,
+            _other => false,
+        }
+    }
 }
 
 async fn parse_datastore_file(
@@ -68,6 +265,7 @@ async fn parse_datastore_file(
     }
     highest_inserted_id
 }
+
 pub async fn read_datastore_from_disk(
     storage: PathBuf,
     autosave: bool,
@@ -85,7 +283,8 @@ pub async fn read_datastore_from_disk(
         parse_datastore_file(file_path.clone(), &mut temp_store, &mut root_hash).await;
 
     let heap_auto_forward = false;
-    let mut app_data = ApplicationData::empty(storage, autosave, policy, heap_auto_forward);
+    let mut app_data =
+        ApplicationData::empty(storage, autosave, (policy, vec![]), heap_auto_forward);
     for i in 0..=highest_inserted_id {
         if let Some((dtype, hash)) = temp_store.remove(&i) {
             eprintln!("Disk read CID-{} with hash: {}", i, hash);
@@ -131,10 +330,14 @@ pub async fn read_datastore_from_disk(
     app_data
 }
 
-pub fn should_store_content_on_disk(policy: &StoragePolicy, c_id: ContentID) -> (bool, u16) {
+pub fn should_store_content_on_disk(
+    policy: &(StoragePolicy, Vec<ContentID>),
+    c_id: ContentID,
+) -> (bool, u16) {
+    // TODO: rewrite this logic
     let default_p_count = if c_id == 0 { 64 } else { 0 };
-    match policy {
-        StoragePolicy::Discard => (false, 0),
+    match policy.0 {
+        StoragePolicy::Forget => (false, 0),
         StoragePolicy::Datastore => {
             if c_id == 0 {
                 (true, default_p_count)
@@ -142,24 +345,60 @@ pub fn should_store_content_on_disk(policy: &StoragePolicy, c_id: ContentID) -> 
                 (false, default_p_count)
             }
         }
-        StoragePolicy::MainPages => (true, default_p_count),
-        StoragePolicy::SelectMainPages(c_ids) => (c_ids.contains(&c_id), default_p_count),
-        StoragePolicy::SelectedContents(store_main_pages, c_ids) => {
-            if c_ids.contains(&c_id) {
+        StoragePolicy::Manifest => {
+            if c_id == 0 {
                 (true, u16::MAX)
-            } else if *store_main_pages {
-                (true, default_p_count)
-            } else if c_id == 0 {
-                (true, default_p_count)
             } else {
-                (false, default_p_count)
+                (false, 0)
             }
         }
-        StoragePolicy::Everything => (true, u16::MAX),
+        StoragePolicy::FirstPages => (true, default_p_count),
+        // StoragePolicy::SelectMainPages(c_ids) => (c_ids.contains(&c_id), default_p_count),
+        // StoragePolicy::SelectedContents(store_main_pages, c_ids) => {
+        //     if c_ids.contains(&c_id) {
+        //         (true, u16::MAX)
+        //     } else if *store_main_pages {
+        //         (true, default_p_count)
+        //     } else if c_id == 0 {
+        //         (true, default_p_count)
+        //     } else {
+        //         (false, default_p_count)
+        //     }
+        // }
+        StoragePolicy::MatchOrFirstPages => {
+            if policy.1.contains(&c_id) {
+                (true, u16::MAX)
+            } else {
+                (true, 0)
+            }
+        }
+        StoragePolicy::MatchOrForget => {
+            if policy.1.contains(&c_id) {
+                (true, u16::MAX)
+            } else {
+                (false, 0)
+            }
+        }
+        StoragePolicy::MatchAndManifestOrFirstPages => {
+            if c_id == 0 || policy.1.contains(&c_id) {
+                (true, u16::MAX)
+            } else {
+                (true, 0)
+            }
+        }
+        StoragePolicy::MatchAndManifestOrForget => {
+            if c_id == 0 || policy.1.contains(&c_id) {
+                (true, u16::MAX)
+            } else {
+                (false, 0)
+            }
+        }
+        StoragePolicy::All => (true, u16::MAX),
     }
 }
+
 pub async fn store_data_on_disk(s_storage: PathBuf, mut app_data: ApplicationData) {
-    if matches!(app_data.policy, StoragePolicy::Discard) {
+    if matches!(app_data.policy.0, StoragePolicy::Forget) {
         eprintln!("STORAGE: Not writing to disk: Discard Policy");
         return;
     }
@@ -194,7 +433,7 @@ pub async fn store_data_on_disk(s_storage: PathBuf, mut app_data: ApplicationDat
         }
     }
 
-    if matches!(app_data.policy, StoragePolicy::Datastore) {
+    if matches!(app_data.policy.0, StoragePolicy::Datastore) {
         return;
     }
     for c_id in 1..=last_defined_c_id {
@@ -527,6 +766,11 @@ pub async fn store_content_on_disk(
         // }
     } else {
         eprintln!("Creating new header and data for CID-{}", c_id);
+        // eprintln!("H: {:?}", header_file);
+        // eprintln!("D: {:?}", data_file);
+        if !s_storage.exists() {
+            let _ = fs::create_dir(s_storage).await;
+        }
         let mut header_file = BufWriter::new(File::create(header_file).await.unwrap());
         let mut data_file = BufWriter::new(File::create(data_file).await.unwrap());
         let mut byte_pointer: u32 = 0;

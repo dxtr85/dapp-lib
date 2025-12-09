@@ -26,6 +26,9 @@ impl AppType {
     pub fn is_catalog(&self) -> bool {
         matches!(self, Self::Catalog)
     }
+    pub fn is_forum(&self) -> bool {
+        matches!(self, Self::Forum)
+    }
     pub fn list_of_types() -> Vec<String> {
         vec![format!("Link=>Catalog"), format!("Link=>Forum")]
     }

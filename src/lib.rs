@@ -1,5 +1,6 @@
 use crate::content::data_to_link;
 use crate::message::MAX_AVAIL_APP_MSG_ID;
+use crate::prelude::Manifest;
 use crate::prelude::SyncRequirements;
 use crate::prelude::TransformInfo;
 use crate::search::SearchMsg;
@@ -7,6 +8,7 @@ use crate::search::SwarmLink;
 use crate::storage::load_first_pages_from_disk;
 use crate::storage::store_first_pages_on_disk;
 use crate::storage::write_datastore_to_disk;
+use crate::storage::StorageCondition;
 use crate::sync_message::serialize_requests;
 use std::array;
 use std::collections::VecDeque;
@@ -72,6 +74,8 @@ const SYNC_RESPONSE: u8 = 243;
 
 pub mod prelude {
     pub use crate::app_type::AppType;
+    pub use crate::config::read_storage_rules_from_file;
+    pub use crate::config::write_storage_rules_to_file;
     pub use crate::content::{
         data_to_link, double_hash, Content, ContentID, ContentTree, DataType, Description,
         TransformInfo,
@@ -90,6 +94,7 @@ pub mod prelude {
     pub use crate::storage::load_first_pages_from_disk;
     pub use crate::storage::read_datastore_from_disk;
     pub use crate::storage::store_first_pages_on_disk;
+    pub use crate::storage::StorageCondition;
     pub use crate::storage::StoragePolicy;
     pub use crate::AppDefinedMsg;
     pub use crate::ApplicationData;
@@ -226,7 +231,7 @@ pub enum ToAppMgr {
     // TODO: move above into below
     FromGMgr(FromGnomeManager),
     FromApp(LibRequest),
-    // FromSearch(LibRequest),
+    SearchSummary(Vec<(SwarmName, Vec<ContentID>)>),
     FromDatastore(LibResponse),
     NoOp,
 }
@@ -255,6 +260,7 @@ pub enum LibRequest {
     CustomNeighborResponse(SwarmName, GnomeId, u8, CastData),
     PeekHeap(SwarmID),
     PopHeap(SwarmID),
+    NewStoragePolicy(Vec<(StorageCondition, StoragePolicy)>),
 }
 #[derive(Debug)]
 pub enum LibResponse {
@@ -353,6 +359,7 @@ pub enum ToAppData {
     PopHeap,
     PolicyNotMet(SyncData),
     PolicyNotMetRcfg(u8, SyncData),
+    SetStoragePolicy(PathBuf, StoragePolicy, Vec<u16>),
     Terminate,
 }
 struct PartialHashes {
@@ -571,7 +578,7 @@ pub async fn initialize(
     spawn(serve_search_engine(
         config.search.clone(),
         to_user_send.clone(),
-        // to_app_mgr_send,
+        to_app_mgr_send.clone(),
         to_search_engine_recv,
     ));
     spawn(serve_app_manager(
@@ -589,7 +596,7 @@ pub async fn initialize(
 async fn serve_app_manager(
     // storage: PathBuf,
     // max_connected_swarms: u8,
-    config: Configuration,
+    mut config: Configuration,
     to_gnome_mgr: ASender<ToGnomeManager>,
     from_gnome_mgr: AReceiver<FromGnomeManager>,
     to_user: ASender<ToApp>,
@@ -621,6 +628,7 @@ async fn serve_app_manager(
     let mut app_mgr = ApplicationManager::new(
         my_name.founder,
         config.max_connected_swarms,
+        config.storage.clone(),
         (to_gnome_mgr.clone(), to_user.clone(), to_app_mgr.clone()),
     );
 
@@ -1060,6 +1068,10 @@ async fn serve_app_manager(
                             .await;
                     }
                 }
+                ToAppMgr::FromApp(LibRequest::NewStoragePolicy(sp_v)) => {
+                    config.storage_rules = sp_v;
+                    app_mgr.apply_new_storage_rules(&config.storage_rules).await;
+                }
                 ToAppMgr::StartUnicast => {
                     let _ = app_mgr
                         .active_app_data
@@ -1301,6 +1313,11 @@ async fn serve_app_manager(
                     if !own_swarm_started && was_own_swarm {
                         own_swarm_started = true;
                         own_swarm_activated = true;
+                    }
+                    if let Some(s_name) = app_mgr.get_name(s_id) {
+                        app_mgr
+                            .update_storage_policy_for(&s_name, &config.storage_rules, vec![])
+                            .await;
                     }
                     // eprintln!("SwarmSynced {}", s_id);
                     // if !own_swarm_activated && own_swarm_started {
@@ -1921,11 +1938,22 @@ async fn serve_app_manager(
                                 app_type,
                                 to_app_data_send.clone(),
                             );
+
+                            let is_any_content_marked_by_search_engine = false;
+                            // TODO: we should run following fn after we discover SwarmName
+                            let storage_rule = determine_storage_policy(
+                                my_name.founder,
+                                app_type,
+                                &s_name,
+                                is_any_content_marked_by_search_engine,
+                                &config.storage_rules,
+                            );
+
                             let app_data = ApplicationData::new(
                                 app_type,
                                 config.storage.join(s_name.to_path()),
                                 config.autosave,
-                                config.store_data_on_disk.clone(),
+                                (storage_rule, vec![]),
                                 false, // heap auto forward
                             );
                             spawn(serve_app_data(
@@ -2329,6 +2357,15 @@ async fn serve_app_manager(
                         let _ = to_user.send(ToApp::RunningByteSets(vec![])).await;
                     }
                 }
+                ToAppMgr::SearchSummary(summary) => {
+                    // TODO: update storage policy
+                    for (s_name, cid_vec) in summary {
+                        app_mgr.update_swarm_search_state(&s_name, !cid_vec.is_empty());
+                        app_mgr
+                            .update_storage_policy_for(&s_name, &config.storage_rules, cid_vec)
+                            .await;
+                    }
+                }
                 ToAppMgr::Quit => {
                     // eprintln!("\n\n\nQUIT\n\n\n");
                     quit_application = true;
@@ -2468,7 +2505,7 @@ async fn serve_app_data(
                         s_storage.clone(), // dsync_store.clone(),
                         // app_data_send.clone(),
                         app_data.autosave,
-                        app_data.policy.clone(),
+                        app_data.policy.0.clone(),
                     )
                     .await;
                 } else {
@@ -3379,6 +3416,9 @@ async fn serve_app_data(
                 //TODO: build logic to handle this
                 eprintln!("PolicyNotMet for Reconfigure({})", conf_id);
             }
+            ToAppData::SetStoragePolicy(s_path, pol, c_ids) => {
+                app_data.set_new_storage_policy(s_path, pol, c_ids);
+            }
             ToAppData::Terminate => {
                 eprintln!("AppData: Terminate");
                 // TODO: determine whether or not we want to store this Swarm on disk
@@ -3910,7 +3950,7 @@ impl Heap {
 pub struct ApplicationData {
     storage: PathBuf,
     autosave: bool,
-    policy: StoragePolicy,
+    policy: (StoragePolicy, Vec<u16>),
     change_reg: ChangeRegistry,
     contents: Datastore,
     hash_to_temp_idx: HashMap<u64, u16>,
@@ -4013,7 +4053,7 @@ impl ApplicationData {
         c_id: ContentID,
         content: Option<Content>,
     ) {
-        eprintln!("save_content_to_disk");
+        eprintln!("save_content_to_disk: {:?}", self.storage);
         // TODO: respect storage policy
         let (should_store, max_page) = should_store_content_on_disk(&self.policy, c_id);
         if should_store {
@@ -4042,7 +4082,7 @@ impl ApplicationData {
         app_type: Option<AppType>,
         storage: PathBuf,
         autosave: bool,
-        policy: StoragePolicy,
+        policy: (StoragePolicy, Vec<ContentID>),
         heap_auto_forward: bool,
     ) -> Self {
         let contents = if let Some(at) = &app_type {
@@ -4067,7 +4107,7 @@ impl ApplicationData {
     pub fn empty(
         storage: PathBuf,
         autosave: bool,
-        policy: StoragePolicy,
+        policy: (StoragePolicy, Vec<ContentID>),
         heap_auto_forward: bool,
     ) -> Self {
         eprintln!("ApplicationData::empty(storage: {storage:?})");
@@ -4230,7 +4270,22 @@ impl ApplicationData {
     pub fn set_disk_hash(&mut self) {
         self.disk_root_hash = self.root_hash();
     }
-    pub fn root_hash(&self) -> u64 {
+
+    pub fn set_new_storage_policy(
+        &mut self,
+        s_storage: PathBuf,
+        policy: StoragePolicy,
+        cid_vec: Vec<ContentID>,
+    ) {
+        // eprintln!("old:{:?} new:{:?}", self.storage, s_storage);
+        self.storage = s_storage;
+        if policy.is_a_match_policy() && cid_vec.is_empty() {
+            self.policy.0 = policy;
+        } else {
+            self.policy = (policy, cid_vec);
+        }
+    }
+    fn root_hash(&self) -> u64 {
         self.contents.hash()
     }
 
@@ -6401,9 +6456,34 @@ async fn custom_response_task(
                     } else {
                         u16::MAX
                     };
+                    let app_type = if let Ok(d_vec) = app_data.get_all_data(0) {
+                        if d_vec.is_empty() {
+                            None
+                        } else {
+                            let manif = Manifest::from(d_vec);
+                            Some(manif.app_type)
+                        }
+                    } else {
+                        None
+                    };
+
+                    if app_type.is_none() {
+                        let _ = to_gnome_sender.send(ToGnome::AskData(
+                            GnomeId::any(),
+                            None,
+                            NeighborRequest::Custom(
+                                SYNC_REQUEST,
+                                CastData::new(serialize_requests(vec![SyncRequest::AllPages(
+                                    vec![0],
+                                )]))
+                                .unwrap(),
+                            ),
+                        ));
+                    }
+
                     let s_link = SwarmLink {
                         s_name: swarm_name.clone(),
-                        app_type: None,
+                        app_type,
                         max_cid,
                         sender: app_data_send.clone(),
                         root_hash: app_data.root_hash(),
@@ -6413,7 +6493,6 @@ async fn custom_response_task(
                     let _ = to_search_enigne
                         .send(SearchMsg::SwarmSynced(swarm_id, s_link))
                         .await;
-                    // }
                 } else {
                     eprintln!("Datastore is synced, why sent this?");
                 }
@@ -6558,6 +6637,14 @@ async fn custom_response_task(
                             let res = app_data.update_data(c_id, page_no, data.clone());
                             if res.is_ok() && !d_empty {
                                 update_active_reads(active_reads, &c_id, page_no, app_data_send)
+                                    .await;
+                                let _ = to_search_enigne
+                                    // FirstPages(SwarmID, SwarmName, Vec<(ContentID, DataType, Data)>),
+                                    .send(SearchMsg::FirstPages(
+                                        swarm_id,
+                                        swarm_name.clone(),
+                                        vec![(c_id, d_type, data.clone())],
+                                    ))
                                     .await;
                                 // We send an update to print content
                                 // on screen
@@ -6748,7 +6835,7 @@ async fn read_data_task(
     }
     let (d_type, len) = type_and_len_result.unwrap();
     let (t, root_hash) = app_data.content_root_hash(c_id).unwrap();
-    eprintln!("Start page: {starting_page}");
+    eprintln!("Start page: {starting_page},last: {:?}", last_page);
     let mut read_to_page_incl = if len < starting_page + 64 {
         len.saturating_sub(1)
     } else {
@@ -6843,7 +6930,7 @@ async fn read_data_task(
                 for dmc in dmall {
                     let sync_requests: Vec<SyncRequest> =
                         vec![SyncRequest::Pages(c_id, d_type, dmc.to_vec())];
-                    let _ = to_gnome_sender.send(ToGnome::AskData(
+                    let _res = to_gnome_sender.send(ToGnome::AskData(
                         GnomeId::any(),
                         None,
                         NeighborRequest::Custom(
@@ -6855,7 +6942,7 @@ async fn read_data_task(
                 if !rmd.is_empty() {
                     let sync_requests: Vec<SyncRequest> =
                         vec![SyncRequest::Pages(c_id, d_type, rmd.to_vec())];
-                    let _ = to_gnome_sender.send(ToGnome::AskData(
+                    let _rem = to_gnome_sender.send(ToGnome::AskData(
                         GnomeId::any(),
                         None,
                         NeighborRequest::Custom(
@@ -6972,6 +7059,52 @@ async fn read_data_task(
                 .await;
         }
     }
+}
+
+fn determine_storage_policy(
+    my_id: GnomeId,
+    app_type: Option<AppType>,
+    s_name: &SwarmName,
+    is_any_content_marked_by_search_engine: bool,
+    storage_rules: &Vec<(StorageCondition, StoragePolicy)>,
+) -> StoragePolicy {
+    // TODO: determine what storage rule to follow
+    // There can be different scenarios where such rule can change
+    // For example if a user changes search queries some contents
+    // from a swarm might get included for storage,
+    // others might get removed.
+    // Also when user modifies storage rules a swarm might need to
+    // change its policy.
+    // So, in order for this to work we need to define a mechanism
+    // to cover all such cases.
+    // In order to work we need to know if any Content from given Swarm
+    // is marked as a search result. if it is, we need a list of those
+    // contents.
+    // So this is a task for search engine to inform every swarm that
+    // has some valuable contents for the user.
+    //
+    // Also if some contents are no longer important search engine
+    // should inform given Swarm about it.
+    // Then we apply one of general rules.
+    //
+    // So upon startup we pick a rule from general rules.
+    // And if we get a notification from Search Engine,
+    // we toggle between general and SearchMatching rules.
+    //
+    // We should always pick a rule that is higher in storage.rules file.
+    eprintln!("in determine_storage_policy");
+    eprintln!(" my id: {my_id}, app_type: {app_type:?}, s_name: {s_name}, search match: {is_any_content_marked_by_search_engine}");
+    for (cond, pol) in storage_rules {
+        if cond.is_met(
+            my_id,
+            app_type,
+            s_name,
+            is_any_content_marked_by_search_engine,
+        ) {
+            return pol.clone();
+        }
+    }
+    StoragePolicy::Forget
 }
 // An entire application data consists of a structure called Datastore.
 // There is also a helper change_reg useful for syncing.
