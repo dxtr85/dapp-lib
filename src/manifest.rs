@@ -2,7 +2,7 @@ use crate::app_type::AppType;
 use crate::Data;
 use gnome::prelude::sha_hash;
 use gnome::prelude::ByteSet;
-use gnome::prelude::CapabiliTree;
+use gnome::prelude::CapabiLeaf;
 use gnome::prelude::Capabilities;
 use gnome::prelude::GnomeId;
 use gnome::prelude::Nat;
@@ -109,7 +109,7 @@ pub struct Manifest {
     // TODO: store Swarm's Policy
     pub policy_reg: HashMap<Policy, Requirement>,
     // TODO: store Swarm's Capabilities
-    pub capability_reg: HashMap<Capabilities, CapabiliTree>,
+    pub capability_reg: HashMap<Capabilities, CapabiLeaf>,
     // TODO: store Swarm's ByteSets
     pub byteset_reg: HashMap<u8, ByteSet>,
     // Above should be loaded only when needed,
@@ -571,7 +571,7 @@ impl Manifest {
             let mut ctree = if let Some(ct) = capability_reg.remove(&cap) {
                 ct
             } else {
-                CapabiliTree::create()
+                CapabiLeaf::create()
             };
 
             for _i in 0..how_many {
