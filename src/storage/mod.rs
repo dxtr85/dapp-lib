@@ -3,10 +3,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 // use async_std::channel::Sender;
-use async_std::fs::{self, File, OpenOptions};
-use async_std::io::prelude::SeekExt;
-use async_std::io::{BufReader, BufWriter, ReadExt, WriteExt};
+// use async_std::fs::{self, File, OpenOptions};
+use smol::fs::{self, File, OpenOptions};
+// use async_std::io::prelude::SeekExt;
+// use async_std::io::{BufReader, BufWriter, ReadExt, WriteExt};
 use gnome::prelude::{GnomeId, SwarmName};
+use smol::io::AsyncSeekExt as SeekExt;
+use smol::io::{AsyncReadExt as ReadExt, AsyncWriteExt as WriteExt, BufReader, BufWriter};
 // use gnome::prelude::{GnomeId, SwarmName};
 
 use crate::content::{data_to_link, Content, ContentID, ContentTree, DataType};

@@ -24,13 +24,18 @@ use std::path::PathBuf;
 use crate::Requestor;
 pub use crate::ToApp;
 // pub use crate::ToAppMgr;
-use async_std::channel::Receiver;
-use async_std::channel::Sender;
-use async_std::fs::OpenOptions;
-use async_std::io::BufWriter;
-use async_std::io::WriteExt;
+// use async_std::channel::Receiver;
+use smol::channel::Receiver;
+// use async_std::channel::Sender;
+use smol::channel::Sender;
+use smol::fs::OpenOptions;
+// use async_std::fs::OpenOptions;
+// use async_std::io::BufWriter;
+// use async_std::io::WriteExt;
 use gnome::prelude::sha_hash;
 use gnome::prelude::SwarmID;
+use smol::io::AsyncWriteExt as WriteExt;
+use smol::io::BufWriter;
 
 // TODO: build a search engine.
 // It should be run against every Catalog Swarm,

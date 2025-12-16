@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 gnome = {path="/home/dxtr/projects/gnome"}
+smol = "2.0.2"
 
-[dependencies.async-std]
-    version = "1.12"
+# [dependencies.async-std]
+#     version = "1.12"

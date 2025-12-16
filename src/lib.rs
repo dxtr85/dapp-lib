@@ -13,6 +13,7 @@ use crate::sync_message::serialize_requests;
 use std::array;
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 mod app_type;
 mod config;
@@ -28,11 +29,14 @@ mod search;
 mod storage;
 mod sync_message;
 use app_type::AppType;
-use async_std::fs::create_dir_all;
+// use async_std::fs::create_dir_all;
+use smol::fs::create_dir_all;
 // use async_std::path::PathBuf;
-use async_std::task::yield_now;
+// use async_std::task::yield_now;
 use message::ChangeContentOperation;
 use search::Hit;
+use smol::future::yield_now;
+use smol::Executor;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use storage::load_content_from_disk;
@@ -46,8 +50,6 @@ use sync_message::SyncResponse;
 
 use crate::content::double_hash;
 use crate::search::serve_search_engine;
-use async_std::task::sleep;
-use async_std::task::spawn;
 pub use config::Configuration;
 use content::ContentTree;
 use content::DataType;
@@ -59,15 +61,19 @@ use gnome::prelude::*;
 pub use manager::ApplicationManager;
 use message::{SyncMessage, SyncMessageType};
 use registry::ChangeRegistry;
+use smol::Timer;
 use storage::read_datastore_from_disk;
 // TODO: probably better to use async channels for this lib where possible
 use std::sync::mpsc::channel;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
 
-use async_std::channel as achannel;
-use async_std::channel::Receiver as AReceiver;
-use async_std::channel::Sender as ASender;
+// use async_std::channel as achannel;
+// use async_std::channel::Receiver as AReceiver;
+// use async_std::channel::Sender as ASender;
+use smol::channel as achannel;
+use smol::channel::Receiver as AReceiver;
+use smol::channel::Sender as ASender;
 
 const SYNC_REQUEST: u8 = 245;
 const SYNC_RESPONSE: u8 = 243;
@@ -549,12 +555,15 @@ impl SwarmSwap {
 // fn parse_sync(sync_data: SyncData) -> AppMessage {}
 
 pub async fn initialize(
+    my_name_send: ASender<SwarmName>,
+    executor: Arc<Executor<'_>>, //use this executor everywhere,
+    _terminator: ASender<()>, // send signal here, when user wants to quit and all processing is done
     to_user_send: ASender<ToApp>,
     to_app_mgr_send: ASender<ToAppMgr>,
     to_app_mgr_recv: AReceiver<ToAppMgr>,
     config_dir: PathBuf,
     mut neighbors: Vec<(GnomeId, NetworkSettings)>,
-) -> SwarmName {
+) {
     // TODO: neighbors contain also our own public IP, get rid of it!
     eprintln!("Storage neighbors: {:?}", neighbors);
     let config = Configuration::new(config_dir.clone());
@@ -572,30 +581,42 @@ pub async fn initialize(
     // let neighbors =
     // let (gmgr_send, gmgr_recv, my_id) = init(config_dir, config.neighbors);
     let bandwidth_per_swarm = config.upload_bandwidth / config.max_connected_swarms as u64;
+    let c_ex = executor.clone();
+    // So we are running init within current thread now...
     let (gmgr_send, gmgr_recv, my_id) =
-        init(config_dir, Some(neighbors), bandwidth_per_swarm).await;
+        init(c_ex, config_dir, Some(neighbors), bandwidth_per_swarm).await;
+    // let _ = my_name_send.send(my_id).await;
+
     let (to_search_engine_send, to_search_engine_recv) = achannel::unbounded();
-    spawn(serve_search_engine(
-        config.search.clone(),
-        to_user_send.clone(),
-        to_app_mgr_send.clone(),
-        to_search_engine_recv,
-    ));
-    spawn(serve_app_manager(
-        config,
-        gmgr_send,
-        gmgr_recv,
-        to_user_send,
-        to_app_mgr_send,
-        to_app_mgr_recv,
-        to_search_engine_send,
-    ));
-    my_id
+    executor
+        .spawn(serve_search_engine(
+            config.search.clone(),
+            to_user_send.clone(),
+            to_app_mgr_send.clone(),
+            to_search_engine_recv,
+        ))
+        .detach();
+    let c_ex = executor.clone();
+    executor
+        .spawn(serve_app_manager(
+            c_ex,
+            _terminator,
+            config,
+            gmgr_send,
+            gmgr_recv,
+            to_user_send,
+            to_app_mgr_send,
+            to_app_mgr_recv,
+            to_search_engine_send,
+        ))
+        .detach();
+    let mnsr = my_name_send.send(my_id).await;
+    eprintln!("My name send res: {mnsr:?}");
 }
 
 async fn serve_app_manager(
-    // storage: PathBuf,
-    // max_connected_swarms: u8,
+    _executor: Arc<Executor<'_>>, //use this executor everywhere,
+    _terminator: ASender<()>, // send signal here, when user wants to quit and all processing is done
     mut config: Configuration,
     to_gnome_mgr: ASender<ToGnomeManager>,
     from_gnome_mgr: AReceiver<FromGnomeManager>,
@@ -638,12 +659,16 @@ async fn serve_app_manager(
     let mut quit_application = false;
     let mut swarm_swap = SwarmSwap::new();
     let mut swarm_start_requested = None;
-    spawn(serve_gnome_mgr_requests(from_gnome_mgr, to_app_mgr.clone()));
-    spawn(start_cycling_timer(
-        to_app_mgr.clone(),
-        TimeoutType::AuditReads,
-        Duration::from_secs(20),
-    ));
+    _executor
+        .spawn(serve_gnome_mgr_requests(from_gnome_mgr, to_app_mgr.clone()))
+        .detach();
+    _executor
+        .spawn(start_cycling_timer(
+            to_app_mgr.clone(),
+            TimeoutType::AuditReads,
+            Duration::from_secs(20),
+        ))
+        .detach();
     'outer: loop {
         // sleep(sleep_time).await;
 
@@ -881,11 +906,13 @@ async fn serve_app_manager(
                     };
                     if let Some(s_name) = app_mgr.get_name(s_id) {
                         if !quit_application {
-                            spawn(start_a_timer(
-                                to_app_mgr.clone(),
-                                TimeoutType::AuditMemoryForSwarm(s_id, s_name),
-                                Duration::from_secs(60 * time_until_next_audit as u64),
-                            ));
+                            _executor
+                                .spawn(start_a_timer(
+                                    to_app_mgr.clone(),
+                                    TimeoutType::AuditMemoryForSwarm(s_id, s_name),
+                                    Duration::from_secs(60 * time_until_next_audit as u64),
+                                ))
+                                .detach();
                         }
                     }
                 }
@@ -1453,11 +1480,16 @@ async fn serve_app_manager(
                                 if s_state.s_id == s_id {
                                     if s_state.is_synced {
                                         eprintln!("{} Yes it is", s_id);
-                                        spawn(start_a_timer(
-                                            to_app_mgr.clone(),
-                                            TimeoutType::AuditMemoryForSwarm(s_id, s_name.clone()),
-                                            Duration::from_secs(60),
-                                        ));
+                                        _executor
+                                            .spawn(start_a_timer(
+                                                to_app_mgr.clone(),
+                                                TimeoutType::AuditMemoryForSwarm(
+                                                    s_id,
+                                                    s_name.clone(),
+                                                ),
+                                                Duration::from_secs(60),
+                                            ))
+                                            .detach();
                                     } else {
                                         eprintln!("{} No it is not.", s_id);
                                         if let Some(to_app_data) = app_mgr.app_data_store.get(&s_id)
@@ -1468,11 +1500,13 @@ async fn serve_app_manager(
                                             let _ = to_app_data.send(ToAppData::TimeoutSyncCheck);
                                             // }
                                         }
-                                        spawn(start_a_timer(
-                                            to_app_mgr.clone(),
-                                            TimeoutType::IsSwarmSynced(s_id, s_name.clone()),
-                                            Duration::from_secs(5),
-                                        ));
+                                        _executor
+                                            .spawn(start_a_timer(
+                                                to_app_mgr.clone(),
+                                                TimeoutType::IsSwarmSynced(s_id, s_name.clone()),
+                                                Duration::from_secs(5),
+                                            ))
+                                            .detach();
                                     }
                                 }
                             } else {
@@ -1481,11 +1515,13 @@ async fn serve_app_manager(
                                 if s_name.founder.is_any() {
                                     if let Some(new_name) = app_mgr.get_name(s_id) {
                                         eprintln!("was generic…");
-                                        spawn(start_a_timer(
-                                            to_app_mgr.clone(),
-                                            TimeoutType::IsSwarmSynced(s_id, new_name.clone()),
-                                            Duration::from_secs(1),
-                                        ));
+                                        _executor
+                                            .spawn(start_a_timer(
+                                                to_app_mgr.clone(),
+                                                TimeoutType::IsSwarmSynced(s_id, new_name.clone()),
+                                                Duration::from_secs(1),
+                                            ))
+                                            .detach();
                                     }
                                 }
                                 eprintln!("{} Swarm {} is no more…", s_id, s_name);
@@ -1526,11 +1562,13 @@ async fn serve_app_manager(
                                     } else {
                                         if !swarm_swap.is_cooldown() {
                                             eprintln!("Cooldown start 1");
-                                            spawn(start_a_timer(
-                                                to_app_mgr.clone(),
-                                                TimeoutType::Cooldown,
-                                                Duration::from_secs(5),
-                                            ));
+                                            _executor
+                                                .spawn(start_a_timer(
+                                                    to_app_mgr.clone(),
+                                                    TimeoutType::Cooldown,
+                                                    Duration::from_secs(5),
+                                                ))
+                                                .detach();
                                             swarm_swap.set_cooldown(true);
                                         }
                                     }
@@ -1539,11 +1577,13 @@ async fn serve_app_manager(
                         }
                         TimeoutType::PeriodicalCheckForNewSwarms => {
                             if has_neighbors {
-                                spawn(start_a_timer(
-                                    to_app_mgr.clone(),
-                                    TimeoutType::PeriodicalCheckForNewSwarms,
-                                    Duration::from_secs(15),
-                                ));
+                                _executor
+                                    .spawn(start_a_timer(
+                                        to_app_mgr.clone(),
+                                        TimeoutType::PeriodicalCheckForNewSwarms,
+                                        Duration::from_secs(15),
+                                    ))
+                                    .detach();
                                 app_mgr.update_swap_state_after_leave(None, true).await;
                             }
                             // if !swarm_swap.is_cooldown() {
@@ -1583,12 +1623,14 @@ async fn serve_app_manager(
                             my_name = m_name
                         }
                         FromGnomeManager::SwarmFounderDetermined(swarm_id, s_name) => {
-                            spawn(start_a_timer(
-                                to_app_mgr.clone(),
-                                TimeoutType::HasNeighbors,
-                                Duration::from_millis(3000),
-                                // Duration::from_millis(5),
-                            ));
+                            _executor
+                                .spawn(start_a_timer(
+                                    to_app_mgr.clone(),
+                                    TimeoutType::HasNeighbors,
+                                    Duration::from_millis(3000),
+                                    // Duration::from_millis(5),
+                                ))
+                                .detach();
                             // eprintln!("SwarmFounderDet {}: {}", swarm_id, s_name.founder);
                             // if s_name.founder != my_name.founder {
                             //     eprintln!("Starting timer");
@@ -1612,11 +1654,13 @@ async fn serve_app_manager(
                             // This is in order to trigger initial home swarm activation
                             app_mgr.active_app_data =
                                 (SwarmID(255), app_mgr.active_app_data.1.clone());
-                            spawn(start_a_timer(
-                                to_app_mgr.clone(),
-                                TimeoutType::PeriodicalCheckForNewSwarms,
-                                Duration::from_secs(60),
-                            ));
+                            _executor
+                                .spawn(start_a_timer(
+                                    to_app_mgr.clone(),
+                                    TimeoutType::PeriodicalCheckForNewSwarms,
+                                    Duration::from_secs(60),
+                                ))
+                                .detach();
                         }
                         FromGnomeManager::MyPublicIPs(ip_list) => {
                             // eprintln!("dapp_lib got list of my public IP");
@@ -1894,11 +1938,13 @@ async fn serve_app_manager(
                             // TODO: make sure we are not running multiple timers
                             // for the same swarm
                             // TODO: first we have to make sure that given swarm is synced, and only after that should we run audit
-                            spawn(start_a_timer(
-                                to_app_mgr.clone(),
-                                TimeoutType::IsSwarmSynced(s_id, s_name.clone()),
-                                Duration::from_secs(5),
-                            ));
+                            _executor
+                                .spawn(start_a_timer(
+                                    to_app_mgr.clone(),
+                                    TimeoutType::IsSwarmSynced(s_id, s_name.clone()),
+                                    Duration::from_secs(5),
+                                ))
+                                .detach();
                             swarm_swap.not_a_candidate(&s_name);
                             // if swarm_swap.has_candidates() {
                             //     eprintln!("SwapNewSwarm 4");
@@ -1956,22 +2002,30 @@ async fn serve_app_manager(
                                 (storage_rule, vec![]),
                                 false, // heap auto forward
                             );
-                            spawn(serve_app_data(
-                                config.storage.clone(),
-                                max_pages_in_memory,
-                                s_id,
-                                app_data,
-                                to_app_data_send.clone(),
-                                to_app_data_recv,
-                                to_swarm,
-                                to_app_mgr.clone(),
-                                to_search_enigne.clone(),
-                            ));
-                            spawn(serve_swarm(
-                                Duration::from_millis(64),
-                                from_swarm,
-                                to_app_data_send.clone(),
-                            ));
+                            let c_ex = _executor.clone();
+                            _executor
+                                .spawn(serve_app_data(
+                                    c_ex,
+                                    config.storage.clone(),
+                                    max_pages_in_memory,
+                                    s_id,
+                                    app_data,
+                                    to_app_data_send.clone(),
+                                    to_app_data_recv,
+                                    to_swarm,
+                                    to_app_mgr.clone(),
+                                    to_search_enigne.clone(),
+                                ))
+                                .detach();
+                            let c_ex = _executor.clone();
+                            _executor
+                                .spawn(serve_swarm(
+                                    c_ex,
+                                    Duration::from_millis(64),
+                                    from_swarm,
+                                    to_app_data_send.clone(),
+                                ))
+                                .detach();
                         }
 
                         // FromGnomeManager::SwarmTerminated(swarm_id, s_name) => {
@@ -2115,11 +2169,13 @@ async fn serve_app_manager(
                         }
                         if !swarm_swap.is_cooldown() {
                             eprintln!("Cooldown start 0");
-                            spawn(start_a_timer(
-                                to_app_mgr.clone(),
-                                TimeoutType::Cooldown,
-                                Duration::from_secs(5),
-                            ));
+                            _executor
+                                .spawn(start_a_timer(
+                                    to_app_mgr.clone(),
+                                    TimeoutType::Cooldown,
+                                    Duration::from_secs(5),
+                                ))
+                                .detach();
                             swarm_swap.set_cooldown(true);
                         }
                         continue;
@@ -2299,11 +2355,13 @@ async fn serve_app_manager(
                         eprintln!("We have no one to query for new SwarmNames");
                         if !swarm_swap.is_cooldown() {
                             eprintln!("Cooldown start 2");
-                            spawn(start_a_timer(
-                                to_app_mgr.clone(),
-                                TimeoutType::Cooldown,
-                                Duration::from_secs(5),
-                            ));
+                            _executor
+                                .spawn(start_a_timer(
+                                    to_app_mgr.clone(),
+                                    TimeoutType::Cooldown,
+                                    Duration::from_secs(5),
+                                ))
+                                .detach();
                             swarm_swap.set_cooldown(true);
                         }
                         continue;
@@ -2387,7 +2445,9 @@ async fn serve_app_manager(
             }
         }
     }
-    eprintln!("Done serving AppMgr");
+    // TODO: this does not work
+    let _tr = _terminator.send(()).await;
+    eprintln!("Done serving AppMgr {_tr:?}");
 }
 
 async fn serve_gnome_mgr_requests(
@@ -2400,6 +2460,7 @@ async fn serve_gnome_mgr_requests(
     }
 }
 async fn serve_app_data(
+    _executor: Arc<Executor<'_>>,
     storage: PathBuf,
     max_pages_in_memory: usize,
     swarm_id: SwarmID, //TODO: in future swarm_id should be mutable!
@@ -2944,14 +3005,17 @@ async fn serve_app_data(
                         eprintln!("duplicating hashes");
                         hash_bytes.append(&mut hash_bytes.clone());
                         eprintln!("spawning serve_broadcast_origin");
-                        spawn(serve_broadcast_origin(
-                            broadcast_id,
-                            Duration::from_millis(512),
-                            bcast_send.clone(),
-                            hash_bytes,
-                            done_send.clone(),
-                        ));
-                        sleep(sleep_time).await;
+                        _executor
+                            .spawn(serve_broadcast_origin(
+                                broadcast_id,
+                                Duration::from_millis(512),
+                                bcast_send.clone(),
+                                hash_bytes,
+                                done_send.clone(),
+                            ))
+                            .detach();
+                        // sleep(sleep_time).await;
+                        Timer::after(sleep_time).await;
                         let _done_res = done_recv.recv();
                         eprintln!("Hashes sent: {}", _done_res.is_ok());
                         // TODO
@@ -2966,13 +3030,15 @@ async fn serve_app_data(
                                     .to_cast(),
                             )
                         }
-                        spawn(serve_broadcast_origin(
-                            broadcast_id,
-                            Duration::from_millis(512),
-                            bcast_send.clone(),
-                            c_data_vec,
-                            done_send.clone(),
-                        ));
+                        _executor
+                            .spawn(serve_broadcast_origin(
+                                broadcast_id,
+                                Duration::from_millis(512),
+                                bcast_send.clone(),
+                                c_data_vec,
+                                done_send.clone(),
+                            ))
+                            .detach();
                     }
                 }
             }
@@ -3444,12 +3510,14 @@ async fn serve_app_data(
 }
 
 async fn serve_swarm(
+    _executor: Arc<Executor<'_>>,
     sleep_time: Duration,
     user_res: Receiver<GnomeToApp>,
     to_app_data_send: ASender<ToAppData>,
 ) {
     loop {
-        sleep(sleep_time).await;
+        // sleep(sleep_time).await;
+        Timer::after(sleep_time).await;
         while let Ok(resp) = user_res.try_recv() {
             // println!("SUR: {:?}", resp);
             match resp {
@@ -3460,52 +3528,64 @@ async fn serve_swarm(
                         .await;
                 }
                 GnomeToApp::Broadcast(_s_id, c_id, recv_d) => {
-                    spawn(serve_broadcast(
-                        c_id,
-                        Duration::from_millis(100),
-                        recv_d,
-                        to_app_data_send.clone(),
-                    ));
+                    _executor
+                        .spawn(serve_broadcast(
+                            c_id,
+                            Duration::from_millis(100),
+                            recv_d,
+                            to_app_data_send.clone(),
+                        ))
+                        .detach();
                 }
                 GnomeToApp::Multicast(_s_id, c_id, recv_d) => {
-                    spawn(serve_multicast(
-                        c_id,
-                        Duration::from_millis(100),
-                        recv_d,
-                        to_app_data_send.clone(),
-                    ));
+                    _executor
+                        .spawn(serve_multicast(
+                            c_id,
+                            Duration::from_millis(100),
+                            recv_d,
+                            to_app_data_send.clone(),
+                        ))
+                        .detach();
                 }
                 GnomeToApp::Unicast(_s_id, c_id, recv_d) => {
-                    spawn(serve_unicast(c_id, Duration::from_millis(100), recv_d));
+                    _executor
+                        .spawn(serve_unicast(c_id, Duration::from_millis(100), recv_d))
+                        .detach();
                 }
                 GnomeToApp::BroadcastOrigin(_s_id, ref c_id, cast_data_send, cast_data_recv) => {
-                    spawn(serve_broadcast(
-                        *c_id,
-                        Duration::from_millis(100),
-                        cast_data_recv,
-                        to_app_data_send.clone(),
-                    ));
+                    _executor
+                        .spawn(serve_broadcast(
+                            *c_id,
+                            Duration::from_millis(100),
+                            cast_data_recv,
+                            to_app_data_send.clone(),
+                        ))
+                        .detach();
                     let _ = to_app_data_send
                         .send(ToAppData::BCastOrigin(*c_id, cast_data_send))
                         .await;
                 }
                 GnomeToApp::MulticastOrigin(_s_id, ref c_id, cast_data_send, cast_data_recv) => {
-                    spawn(serve_multicast(
-                        *c_id,
-                        Duration::from_millis(100),
-                        cast_data_recv,
-                        to_app_data_send.clone(),
-                    ));
+                    _executor
+                        .spawn(serve_multicast(
+                            *c_id,
+                            Duration::from_millis(100),
+                            cast_data_recv,
+                            to_app_data_send.clone(),
+                        ))
+                        .detach();
                     let _ = to_app_data_send
                         .send(ToAppData::MCastOrigin(*c_id, cast_data_send))
                         .await;
                 }
                 GnomeToApp::UnicastOrigin(_s_id, c_id, send_d) => {
-                    spawn(serve_unicast_origin(
-                        c_id,
-                        Duration::from_millis(500),
-                        send_d,
-                    ));
+                    _executor
+                        .spawn(serve_unicast_origin(
+                            c_id,
+                            Duration::from_millis(500),
+                            send_d,
+                        ))
+                        .detach();
                 }
                 GnomeToApp::BCastData(c_id, _data) => {
                     // TODO: convert it to local BCastMessage
@@ -3606,7 +3686,8 @@ async fn serve_unicast(c_id: CastID, sleep_time: Duration, user_res: Receiver<Ca
         if let Ok(data) = recv_res {
             eprintln!("U{:?}: {}", c_id, data);
         }
-        sleep(sleep_time).await;
+        // sleep(sleep_time).await;
+        Timer::after(sleep_time).await;
     }
 }
 async fn serve_broadcast_origin(
@@ -3617,7 +3698,8 @@ async fn serve_broadcast_origin(
     done: Sender<()>,
 ) {
     eprintln!("Originating broadcast {:?}", c_id);
-    sleep(Duration::from_secs(2)).await;
+    // sleep(Duration::from_secs(2)).await;
+    Timer::after(Duration::from_secs(2)).await;
     eprintln!("Initial sleep is over");
     // TODO: indexing
     for (i, data) in data_vec.into_iter().enumerate() {
@@ -3632,7 +3714,8 @@ async fn serve_broadcast_origin(
             break;
         }
         // println!("About to go to sleep for: {:?}", sleep_time);
-        sleep(sleep_time).await;
+        // sleep(sleep_time).await;
+        Timer::after(sleep_time).await;
     }
     let _ = done.send(());
 }
@@ -3652,7 +3735,8 @@ async fn serve_broadcast(
                 .send(ToAppData::BCastData(c_id, data))
                 .await;
         }
-        sleep(sleep_time).await;
+        // sleep(sleep_time).await;
+        Timer::after(sleep_time).await;
     }
 }
 async fn serve_multicast(
@@ -3670,7 +3754,8 @@ async fn serve_multicast(
                 .send(ToAppData::MCastData(c_id, data))
                 .await;
         }
-        sleep(sleep_time).await;
+        // sleep(sleep_time).await;
+        Timer::after(sleep_time).await;
     }
 }
 
@@ -3689,7 +3774,8 @@ async fn serve_unicast_origin(c_id: CastID, sleep_time: Duration, user_res: Send
         }
         i = i.wrapping_add(1);
 
-        sleep(sleep_time).await;
+        // sleep(sleep_time).await;
+        Timer::after(sleep_time).await;
     }
 }
 
@@ -4827,7 +4913,8 @@ pub async fn start_a_timer(
     let mut elapsed = Duration::new(0, 0);
     let mut send_response = true;
     while elapsed < timeout {
-        sleep(sleep_interval).await;
+        // sleep(sleep_interval).await;
+        Timer::after(sleep_interval).await;
         elapsed = elapsed + sleep_interval;
         let res = sender.send(ToAppMgr::NoOp).await;
         if res.is_err() {
@@ -4856,7 +4943,8 @@ pub async fn start_cycling_timer(
         let mut elapsed = Duration::new(0, 0);
         // let mut send_response = true;
         while elapsed < timeout {
-            sleep(sleep_interval).await;
+            // sleep(sleep_interval).await;
+            Timer::after(sleep_interval).await;
             elapsed = elapsed + sleep_interval;
             let res = sender.send(ToAppMgr::NoOp).await;
             if res.is_err() {

@@ -7,11 +7,14 @@ use crate::storage::StoragePolicy;
 use crate::ToApp;
 use crate::ToAppMgr;
 use crate::{start_a_timer, TimeoutType};
-use async_std::channel;
-use async_std::channel::Sender;
-use async_std::task::spawn;
+// use async_std::channel;
+use smol::channel;
+// use async_std::channel::Sender;
+use smol::channel::Sender;
+// use async_std::task::spawn;
 use gnome::prelude::ToGnomeManager;
 use gnome::prelude::{GnomeId, SwarmID, SwarmName};
+use smol::spawn;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter, Result as FmtResult};
@@ -560,7 +563,8 @@ impl ApplicationManager {
                             self.to_app_mgr.clone(),
                             TimeoutType::Cooldown,
                             Duration::from_millis(1024),
-                        ));
+                        ))
+                        .detach();
                         // and when it triggers reset swap_state.process to Idle.
                     }
                     eprintln!("Reseting SwapProcess after Leaving");
@@ -597,7 +601,8 @@ impl ApplicationManager {
                 self.to_app_mgr.clone(),
                 TimeoutType::AddToWaitList(s_name.clone()),
                 Duration::from_millis(1024),
-            ));
+            ))
+            .detach();
             // self.swap_state.to_join.push(s_name.clone());
         }
 
