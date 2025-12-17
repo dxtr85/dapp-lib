@@ -29,6 +29,7 @@ mod search;
 mod storage;
 mod sync_message;
 use app_type::AppType;
+use smol::channel::unbounded;
 // use async_std::fs::create_dir_all;
 use smol::fs::create_dir_all;
 // use async_std::path::PathBuf;
@@ -61,19 +62,11 @@ use gnome::prelude::*;
 pub use manager::ApplicationManager;
 use message::{SyncMessage, SyncMessageType};
 use registry::ChangeRegistry;
-use smol::Timer;
-use storage::read_datastore_from_disk;
-// TODO: probably better to use async channels for this lib where possible
-use std::sync::mpsc::channel;
-use std::sync::mpsc::Receiver;
-use std::sync::mpsc::Sender;
-
-// use async_std::channel as achannel;
-// use async_std::channel::Receiver as AReceiver;
-// use async_std::channel::Sender as ASender;
 use smol::channel as achannel;
 use smol::channel::Receiver as AReceiver;
 use smol::channel::Sender as ASender;
+use smol::Timer;
+use storage::read_datastore_from_disk;
 
 const SYNC_REQUEST: u8 = 245;
 const SYNC_RESPONSE: u8 = 243;
@@ -338,9 +331,9 @@ pub enum ToAppData {
     ListNeighbors,
     SwarmReady(SwarmName, bool), //bool indicates whether or not we are founder
     BCastData(CastID, CastData),
-    BCastOrigin(CastID, Sender<CastData>),
+    BCastOrigin(CastID, ASender<CastData>),
     MCastData(CastID, CastData),
-    MCastOrigin(CastID, Sender<CastData>),
+    MCastOrigin(CastID, ASender<CastData>),
     ChangeContent(ContentID, DataType, Vec<Data>),
     ChangeDiameter(u8),
     UpdateData(ContentID, u16, Data),
@@ -1497,7 +1490,8 @@ async fn serve_app_manager(
                                             // if quit_application {
                                             //     let _ = to_app_data.send(ToAppData::Terminate);
                                             // } else {
-                                            let _ = to_app_data.send(ToAppData::TimeoutSyncCheck);
+                                            let _ =
+                                                to_app_data.send(ToAppData::TimeoutSyncCheck).await;
                                             // }
                                         }
                                         _executor
@@ -2467,7 +2461,7 @@ async fn serve_app_data(
     mut app_data: ApplicationData,
     app_data_send: ASender<ToAppData>,
     app_data_recv: AReceiver<ToAppData>,
-    to_gnome_sender: Sender<ToGnome>,
+    to_gnome_sender: ASender<ToGnome>,
     to_app_mgr_send: ASender<ToAppMgr>,
     to_search_enigne: ASender<SearchMsg>,
 ) {
@@ -2529,8 +2523,8 @@ async fn serve_app_data(
     // let mut store_on_disk = false;
     let mut swarm_name = SwarmName::new(GnomeId::any(), "".to_string()).unwrap();
     // eprintln!("Storage root app data: {:?}", storage);
-    let mut b_cast_origin: Option<(CastID, Sender<CastData>)> = None;
-    let mut m_cast_origin: Option<(CastID, Sender<CastData>)> = None;
+    let mut b_cast_origin: Option<(CastID, ASender<CastData>)> = None;
+    let mut m_cast_origin: Option<(CastID, ASender<CastData>)> = None;
     let mut link_with_transform_info: Option<ContentID> = None;
     let mut b_req_sent = false;
     let mut m_req_sent = false;
@@ -2609,52 +2603,61 @@ async fn serve_app_data(
                     // SyncRequest::AllPages(vec![0, 1, 2, 3]),
                 ];
 
-                let _ = to_gnome_sender.send(ToGnome::AskData(
-                    GnomeId::any(),
-                    None,
-                    NeighborRequest::Custom(
-                        SYNC_REQUEST,
-                        CastData::new(serialize_requests(sync_requests)).unwrap(),
-                    ),
-                ));
+                let _ = to_gnome_sender
+                    .send(ToGnome::AskData(
+                        GnomeId::any(),
+                        None,
+                        NeighborRequest::Custom(
+                            SYNC_REQUEST,
+                            CastData::new(serialize_requests(sync_requests)).unwrap(),
+                        ),
+                    ))
+                    .await;
             }
             ToAppData::StartUnicast => {
-                let res =
-                    to_gnome_sender.send(ToGnome::StartUnicast(GnomeId(15561580566906229863)));
+                let res = to_gnome_sender
+                    .send(ToGnome::StartUnicast(GnomeId(15561580566906229863)))
+                    .await;
                 eprintln!("UnicastReq: {:?}", res);
             }
             ToAppData::StartBroadcast => {
-                let res = to_gnome_sender.send(ToGnome::StartBroadcast);
+                let res = to_gnome_sender.send(ToGnome::StartBroadcast).await;
                 b_req_sent = res.is_ok();
             }
             ToAppData::StartMulticast => {
                 eprintln!("ToAppData::StartMulticast");
-                let res = to_gnome_sender.send(ToGnome::StartMulticast);
+                let res = to_gnome_sender.send(ToGnome::StartMulticast).await;
                 m_req_sent = res.is_ok();
             }
             ToAppData::UnsubscribeBroadcast => {
                 // TODO: get this from app's logic
                 let c_id = CastID(0);
-                let res = to_gnome_sender.send(ToGnome::UnsubscribeBroadcast(c_id));
+                let res = to_gnome_sender
+                    .send(ToGnome::UnsubscribeBroadcast(c_id))
+                    .await;
                 b_req_sent = res.is_ok();
             }
             ToAppData::SubscribeMulticast => {
                 // TODO: get this from app's logic
                 let c_id = CastID(0);
-                let res = to_gnome_sender.send(ToGnome::SubscribeMulticast(c_id));
+                let res = to_gnome_sender
+                    .send(ToGnome::SubscribeMulticast(c_id))
+                    .await;
                 m_req_sent = res.is_ok();
             }
             ToAppData::UnsubscribeMulticast => {
                 // TODO: get this from app's logic
                 let c_id = CastID(0);
-                let res = to_gnome_sender.send(ToGnome::UnsubscribeMulticast(c_id));
+                let res = to_gnome_sender
+                    .send(ToGnome::UnsubscribeMulticast(c_id))
+                    .await;
                 m_req_sent = res.is_ok();
             }
             ToAppData::EndBroadcast => {
                 eprintln!("ToAppData::EndBroadcast");
                 if let Some((c_id, _sender)) = b_cast_origin {
                     // eprintln!("Some");
-                    let res = to_gnome_sender.send(ToGnome::EndBroadcast(c_id));
+                    let res = to_gnome_sender.send(ToGnome::EndBroadcast(c_id)).await;
                     b_req_sent = res.is_ok();
                     b_cast_origin = None;
                 } else {
@@ -2665,7 +2668,7 @@ async fn serve_app_data(
                 eprintln!("ToAppData::EndMulticast");
                 if let Some((c_id, _sender)) = m_cast_origin {
                     // eprintln!("Some");
-                    let res = to_gnome_sender.send(ToGnome::EndMulticast(c_id));
+                    let res = to_gnome_sender.send(ToGnome::EndMulticast(c_id)).await;
                     m_req_sent = res.is_ok();
                     m_cast_origin = None;
                 } else {
@@ -2674,11 +2677,15 @@ async fn serve_app_data(
             }
             ToAppData::SendToBCastSource(bc_id, data) => {
                 eprintln!("ToAppData::SendToBCastSource {:?}", bc_id);
-                let _ = to_gnome_sender.send(ToGnome::SendToBCastSource(bc_id, data));
+                let _ = to_gnome_sender
+                    .send(ToGnome::SendToBCastSource(bc_id, data))
+                    .await;
             }
             ToAppData::SendToMCastSource(bc_id, data) => {
                 eprintln!("ToAppData::SendToMCastSource {:?}", bc_id);
-                let _ = to_gnome_sender.send(ToGnome::SendToMCastSource(bc_id, data));
+                let _ = to_gnome_sender
+                    .send(ToGnome::SendToMCastSource(bc_id, data))
+                    .await;
             }
             ToAppData::AppendShelledDatas(c_id, hash_data, data_vec) => {
                 eprintln!("evaluating AppendShelledDatas");
@@ -2714,7 +2721,7 @@ async fn serve_app_data(
                     let parts = msg.into_parts();
                     for part in parts {
                         eprintln!("ToGnome::AddData");
-                        let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                        let _ = to_gnome_sender.send(ToGnome::AddData(part)).await;
                     }
                     let reqs = SyncRequirements {
                         pre: vec![(c_id, post_hash)],
@@ -2734,7 +2741,7 @@ async fn serve_app_data(
                         for part in parts {
                             // eprintln!("SyncData len: {}", part.len());
                             eprintln!("ToGnome::AddData 2");
-                            let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                            let _ = to_gnome_sender.send(ToGnome::AddData(part)).await;
                         }
                     }
                 }
@@ -2755,7 +2762,7 @@ async fn serve_app_data(
                     let msg = SyncMessage::new(SyncMessageType::AppendContent(d_type), reqs, data);
                     let parts = msg.into_parts();
                     for part in parts {
-                        let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                        let _ = to_gnome_sender.send(ToGnome::AddData(part)).await;
                     }
                     // next_val += 1;
                 }
@@ -2785,7 +2792,7 @@ async fn serve_app_data(
                 let msg = SyncMessage::new(SyncMessageType::AppendData(c_id), reqs, data);
                 let parts = msg.into_parts();
                 for part in parts {
-                    let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                    let _ = to_gnome_sender.send(ToGnome::AddData(part)).await;
                 }
             }
             // A local request from application to synchronize with swarm
@@ -2810,7 +2817,7 @@ async fn serve_app_data(
                 let msg = SyncMessage::new(SyncMessageType::UpdateData(c_id, d_id), reqs, data);
                 let parts = msg.into_parts();
                 for part in parts {
-                    let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                    let _ = to_gnome_sender.send(ToGnome::AddData(part)).await;
                 }
             }
             ToAppData::RemoveData(c_id, d_id) => {
@@ -2847,7 +2854,7 @@ async fn serve_app_data(
                 );
                 let parts = msg.into_parts();
                 for part in parts {
-                    let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                    let _ = to_gnome_sender.send(ToGnome::AddData(part)).await;
                 }
             }
             // A local request from application to synchronize with swarm
@@ -2868,17 +2875,21 @@ async fn serve_app_data(
 
             ToAppData::ChangeDiameter(new_diameter) => {
                 eprintln!("Requesting gnome to change diameter to:{}", new_diameter);
-                let _ = to_gnome_sender.send(ToGnome::ChangeDiameter(new_diameter));
+                let _ = to_gnome_sender
+                    .send(ToGnome::ChangeDiameter(new_diameter))
+                    .await;
             }
             ToAppData::ListNeighbors => {
                 eprintln!("Requesting neighbors from gnome");
-                let _ = to_gnome_sender.send(ToGnome::ListNeighbors);
+                let _ = to_gnome_sender.send(ToGnome::ListNeighbors).await;
             }
             ToAppData::TransformLinkRequest(_sync_data) => {
                 eprintln!("Sending TransformLinkRequest to gnome");
                 if let Some(c_id) = link_with_transform_info {
                     let sync_data = SyncData::new(c_id.to_be_bytes().into()).unwrap();
-                    let _ = to_gnome_sender.send(ToGnome::Reconfigure(0, sync_data));
+                    let _ = to_gnome_sender
+                        .send(ToGnome::Reconfigure(0, sync_data))
+                        .await;
                     link_with_transform_info = None;
                 } else {
                     eprintln!("No link with TransformInfo defined for transformation to begin");
@@ -2899,7 +2910,7 @@ async fn serve_app_data(
                     eprintln!("Unable to upload - no active broadcast.");
                     if !b_req_sent {
                         eprintln!("Requesting broadcast channel.");
-                        let res = to_gnome_sender.send(ToGnome::StartBroadcast);
+                        let res = to_gnome_sender.send(ToGnome::StartBroadcast).await;
                         b_req_sent = res.is_ok();
                     }
                     continue;
@@ -2974,13 +2985,13 @@ async fn serve_app_data(
                         );
                         let parts = msg.into_parts();
                         for part in parts {
-                            let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                            let _ = to_gnome_sender.send(ToGnome::AddData(part)).await;
                         }
                         //TODO: we need to set this upon receiving Gnome's confirmation
                         link_with_transform_info = Some(content_id);
                         // next_val += 1;
                         eprintln!("// 8. For each Link Send computed Hashes via broadcast");
-                        let (done_send, done_recv) = channel();
+                        let (done_send, done_recv) = unbounded();
                         let mut hash_bytes = vec![];
                         let chunks = hashes.chunks(128);
                         let total = chunks.len() - 1;
@@ -3016,7 +3027,7 @@ async fn serve_app_data(
                             .detach();
                         // sleep(sleep_time).await;
                         Timer::after(sleep_time).await;
-                        let _done_res = done_recv.recv();
+                        let _done_res = done_recv.recv().await;
                         eprintln!("Hashes sent: {}", _done_res.is_ok());
                         // TODO
                         // 9. SyncMessage::Transform a Link into Data
@@ -3049,13 +3060,13 @@ async fn serve_app_data(
                     eprintln!("Unable to upload - no active multicast.");
                     if !m_req_sent {
                         eprintln!("Requesting multicast channel.");
-                        let res = to_gnome_sender.send(ToGnome::StartMulticast);
+                        let res = to_gnome_sender.send(ToGnome::StartMulticast).await;
                         m_req_sent = res.is_ok();
                     }
                     continue;
                 }
                 let (_mcast_id, mcast_send) = m_cast_origin.clone().unwrap();
-                let send_res = mcast_send.send(c_data);
+                let send_res = mcast_send.send(c_data).await;
                 if send_res.is_ok() {
                     eprintln!("Sent MCast data");
                 } else {
@@ -3071,13 +3082,15 @@ async fn serve_app_data(
                 let (data_type, len) = app_data.get_type_and_len(c_id).unwrap();
                 let sync_response = SyncResponse::Page(c_id, data_type, 0, len, data);
                 // println!("Sending bytes: {:?}", bytes);
-                let res = to_gnome_sender.send(ToGnome::SendData(
-                    n_id,
-                    NeighborResponse::Custom(
-                        SYNC_RESPONSE,
-                        CastData::new(sync_response.serialize()).unwrap(),
-                    ),
-                ));
+                let res = to_gnome_sender
+                    .send(ToGnome::SendData(
+                        n_id,
+                        NeighborResponse::Custom(
+                            SYNC_RESPONSE,
+                            CastData::new(sync_response.serialize()).unwrap(),
+                        ),
+                    ))
+                    .await;
                 if res.is_ok() {
                     eprintln!("SFP Main page of {} sent successfully.", c_id,);
                 }
@@ -3259,7 +3272,7 @@ async fn serve_app_data(
                     let missing_pages = rs.what_is_missing();
                     if !missing_pages.is_empty() {
                         let sync_request = SyncRequest::Pages(c_id, d_type, missing_pages);
-                        to_gnome_sender
+                        let _ = to_gnome_sender
                             .send(ToGnome::AskData(
                                 GnomeId::any(),
                                 None,
@@ -3268,7 +3281,7 @@ async fn serve_app_data(
                                     CastData::new(serialize_requests(vec![sync_request])).unwrap(),
                                 ),
                             ))
-                            .unwrap();
+                            .await;
                     }
                 }
                 if !c_ids.is_empty() {
@@ -3296,7 +3309,7 @@ async fn serve_app_data(
                             eprintln!("Missing hashes: {:?}", missing_hashes);
                             let sync_request =
                                 SyncRequest::Hashes(a_msg.content_id, missing_hashes);
-                            to_gnome_sender
+                            let _ = to_gnome_sender
                                 .send(ToGnome::AskData(
                                     GnomeId::any(),
                                     None,
@@ -3306,14 +3319,14 @@ async fn serve_app_data(
                                             .unwrap(),
                                     ),
                                 ))
-                                .unwrap();
+                                .await;
                         }
                         if !missing_data.is_empty() {
                             //TODO: there can be multiple SyncRequests
                             eprintln!("Missing data: {:?}", missing_data);
                             let sync_request =
                                 SyncRequest::Pages(a_msg.content_id, d_type, missing_data);
-                            to_gnome_sender
+                            let _ = to_gnome_sender
                                 .send(ToGnome::AskData(
                                     GnomeId::any(),
                                     None,
@@ -3323,7 +3336,7 @@ async fn serve_app_data(
                                             .unwrap(),
                                     ),
                                 ))
-                                .unwrap();
+                                .await;
                         }
                     } else {
                         eprintln!("Unable to update: {:?}", upd_res);
@@ -3338,14 +3351,16 @@ async fn serve_app_data(
                     // spawn(sync_timeout(app_data_send.clone()));
                     eprintln!("{} Sending SyncRequest::Datastore again", swarm_id);
                     let sync_requests: Vec<SyncRequest> = vec![SyncRequest::Datastore];
-                    let _ = to_gnome_sender.send(ToGnome::AskData(
-                        GnomeId::any(),
-                        None,
-                        NeighborRequest::Custom(
-                            SYNC_REQUEST,
-                            CastData::new(serialize_requests(sync_requests)).unwrap(),
-                        ),
-                    ));
+                    let _ = to_gnome_sender
+                        .send(ToGnome::AskData(
+                            GnomeId::any(),
+                            None,
+                            NeighborRequest::Custom(
+                                SYNC_REQUEST,
+                                CastData::new(serialize_requests(sync_requests)).unwrap(),
+                            ),
+                        ))
+                        .await;
                 }
             }
             // ToAppData::MemoryPagesUsed(additional_used_pages_count) => {
@@ -3432,13 +3447,13 @@ async fn serve_app_data(
                 eprintln!("{} Freed {} pages from memory", swarm_id, purged);
             }
             ToAppData::RunningPoliciesReq => {
-                let _ = to_gnome_sender.send(ToGnome::RunningPolicies);
+                let _ = to_gnome_sender.send(ToGnome::RunningPolicies).await;
             }
             ToAppData::RunningCapabilitiesReq => {
-                let _ = to_gnome_sender.send(ToGnome::RunningCapabilities);
+                let _ = to_gnome_sender.send(ToGnome::RunningCapabilities).await;
             }
             ToAppData::RunningByteSetsReq => {
-                let _ = to_gnome_sender.send(ToGnome::RunningByteSets);
+                let _ = to_gnome_sender.send(ToGnome::RunningByteSets).await;
             }
             ToAppData::PeekHeap => {
                 if let Some((app_msg, orig)) = app_data.heap.peek() {
@@ -3512,7 +3527,7 @@ async fn serve_app_data(
 async fn serve_swarm(
     _executor: Arc<Executor<'_>>,
     sleep_time: Duration,
-    user_res: Receiver<GnomeToApp>,
+    user_res: AReceiver<GnomeToApp>,
     to_app_data_send: ASender<ToAppData>,
 ) {
     loop {
@@ -3648,13 +3663,13 @@ async fn serve_swarm(
     }
 }
 
-fn request_content_from_any_neighbor(
+async fn request_content_from_any_neighbor(
     cid: u16,
     hashes: bool,
     // first_page: bool,
     all_pages: bool,
     exclude: Option<GnomeId>,
-    to_gnome_sender: Sender<ToGnome>,
+    to_gnome_sender: ASender<ToGnome>,
 ) {
     eprintln!(
         "Sending a request for CID-{} (hashes: {}, all_pages: {})",
@@ -3670,16 +3685,18 @@ fn request_content_from_any_neighbor(
     if all_pages {
         sync_requests.push(SyncRequest::AllPages(vec![cid]));
     }
-    let _ = to_gnome_sender.send(ToGnome::AskData(
-        GnomeId::any(),
-        exclude,
-        NeighborRequest::Custom(
-            SYNC_REQUEST,
-            CastData::new(serialize_requests(sync_requests)).unwrap(),
-        ),
-    ));
+    let _ = to_gnome_sender
+        .send(ToGnome::AskData(
+            GnomeId::any(),
+            exclude,
+            NeighborRequest::Custom(
+                SYNC_REQUEST,
+                CastData::new(serialize_requests(sync_requests)).unwrap(),
+            ),
+        ))
+        .await;
 }
-async fn serve_unicast(c_id: CastID, sleep_time: Duration, user_res: Receiver<CastData>) {
+async fn serve_unicast(c_id: CastID, sleep_time: Duration, user_res: AReceiver<CastData>) {
     eprintln!("Serving unicast {:?}", c_id);
     loop {
         let recv_res = user_res.try_recv();
@@ -3693,9 +3710,9 @@ async fn serve_unicast(c_id: CastID, sleep_time: Duration, user_res: Receiver<Ca
 async fn serve_broadcast_origin(
     c_id: CastID,
     sleep_time: Duration,
-    user_res: Sender<CastData>,
+    user_res: ASender<CastData>,
     data_vec: Vec<CastData>,
-    done: Sender<()>,
+    done: ASender<()>,
 ) {
     eprintln!("Originating broadcast {:?}", c_id);
     // sleep(Duration::from_secs(2)).await;
@@ -3703,7 +3720,7 @@ async fn serve_broadcast_origin(
     eprintln!("Initial sleep is over");
     // TODO: indexing
     for (i, data) in data_vec.into_iter().enumerate() {
-        let send_res = user_res.send(data);
+        let send_res = user_res.send(data).await;
         if send_res.is_ok() {
             print!("BCed: {}\t", i + 1);
         } else {
@@ -3717,13 +3734,13 @@ async fn serve_broadcast_origin(
         // sleep(sleep_time).await;
         Timer::after(sleep_time).await;
     }
-    let _ = done.send(());
+    let _ = done.send(()).await;
 }
 
 async fn serve_broadcast(
     c_id: CastID,
     sleep_time: Duration,
-    cast_data_recv: Receiver<CastData>,
+    cast_data_recv: AReceiver<CastData>,
     to_app_data_send: ASender<ToAppData>,
 ) {
     eprintln!("Serving broadcast {:?}", c_id);
@@ -3742,7 +3759,7 @@ async fn serve_broadcast(
 async fn serve_multicast(
     c_id: CastID,
     sleep_time: Duration,
-    cast_data_recv: Receiver<CastData>,
+    cast_data_recv: AReceiver<CastData>,
     to_app_data_send: ASender<ToAppData>,
 ) {
     eprintln!("Serving multicast {:?}", c_id);
@@ -3759,11 +3776,11 @@ async fn serve_multicast(
     }
 }
 
-async fn serve_unicast_origin(c_id: CastID, sleep_time: Duration, user_res: Sender<CastData>) {
+async fn serve_unicast_origin(c_id: CastID, sleep_time: Duration, user_res: ASender<CastData>) {
     eprintln!("Originating unicast {:?}", c_id);
     let mut i: u8 = 0;
     loop {
-        let send_res = user_res.send(CastData::new(vec![i]).unwrap());
+        let send_res = user_res.send(CastData::new(vec![i]).unwrap()).await;
         if send_res.is_ok() {
             eprintln!("Unicasted {}", i);
         } else {
@@ -5004,7 +5021,7 @@ async fn change_content_task(
     data_vec: Vec<Data>,
     app_data: &mut ApplicationData,
     app_data_send: &ASender<ToAppData>,
-    to_gnome_sender: &Sender<ToGnome>,
+    to_gnome_sender: &ASender<ToGnome>,
 ) {
     if let Ok((curr_d_type, curr_content_len)) = app_data.get_type_and_len(c_id) {
         // eprintln!(
@@ -5197,7 +5214,7 @@ async fn change_content_task(
             let parts = msg.into_parts();
             for part in parts {
                 eprintln!("ToGnome::AddData(DropAndAppend)");
-                let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                let _ = to_gnome_sender.send(ToGnome::AddData(part)).await;
             }
             // now we have to send updates that do not change
             // hash of our Content
@@ -5211,7 +5228,7 @@ async fn change_content_task(
                 let parts = msg.into_parts();
                 for part in parts {
                     eprintln!("ToGnome::AddData (UpdateData)");
-                    let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                    let _ = to_gnome_sender.send(ToGnome::AddData(part)).await;
                 }
             }
             //
@@ -5264,7 +5281,7 @@ async fn change_content_task(
             let parts = msg.into_parts();
             for part in parts {
                 eprintln!("ToGnome::AddData (PopAndAppendConverted)");
-                let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                let _ = to_gnome_sender.send(ToGnome::AddData(part)).await;
             }
             // TODO: Now we need to fill those appended Data::empty(hash) slots with actual data.
             // This Data blocks contain all of the bottom hashes of our Content ID.
@@ -5288,7 +5305,7 @@ async fn change_content_task(
                         curr_content_len + d_id as u16,
                         part.len()
                     );
-                    let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                    let _ = to_gnome_sender.send(ToGnome::AddData(part)).await;
                 }
             }
             //
@@ -5319,7 +5336,7 @@ async fn change_content_task(
             let parts = msg.into_parts();
             for part in parts {
                 eprintln!("ToGnome::AddData (PopAndCTreeRebuild)");
-                let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                let _ = to_gnome_sender.send(ToGnome::AddData(part)).await;
             }
 
             // send all Data Blocks
@@ -5333,7 +5350,7 @@ async fn change_content_task(
                 let parts = msg.into_parts();
                 for part in parts {
                     eprintln!("ToGnome::AddData (update #2)");
-                    let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                    let _ = to_gnome_sender.send(ToGnome::AddData(part)).await;
                 }
             }
             // TODO: we can not send that many messages to Gnome
@@ -5390,7 +5407,7 @@ async fn change_content_task(
             let parts = msg.into_parts();
             for part in parts {
                 eprintln!("ToGnome::AddData(DirectCTreeRebuild)");
-                let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                let _ = to_gnome_sender.send(ToGnome::AddData(part)).await;
             }
 
             //TODO: now we need to send actual Data as well
@@ -5414,7 +5431,7 @@ async fn change_content_task(
                 let parts = msg.into_parts();
                 for part in parts {
                     eprintln!("ToGnome::AddData(Update after Direct)");
-                    let _ = to_gnome_sender.send(ToGnome::AddData(part));
+                    let _ = to_gnome_sender.send(ToGnome::AddData(part)).await;
                 }
             }
         }
@@ -5551,7 +5568,7 @@ async fn change_content_task(
         eprintln!("Unable to change non existing content");
     }
 }
-async fn app_defined_request_task(app_msg: AppDefinedMsg, to_gnome_sender: &Sender<ToGnome>) {
+async fn app_defined_request_task(app_msg: AppDefinedMsg, to_gnome_sender: &ASender<ToGnome>) {
     let msg = SyncMessage::new(
         SyncMessageType::AppDefined(app_msg.m_type, app_msg.c_id, app_msg.d_id),
         SyncRequirements {
@@ -5563,7 +5580,7 @@ async fn app_defined_request_task(app_msg: AppDefinedMsg, to_gnome_sender: &Send
     let parts = msg.into_parts();
     for part in parts {
         eprintln!("ToGnome::AddData(AppDefined");
-        let _ = to_gnome_sender.send(ToGnome::AddData(part));
+        let _ = to_gnome_sender.send(ToGnome::AddData(part)).await;
     }
 }
 async fn response_task(
@@ -5920,7 +5937,7 @@ async fn custom_request_task(
     cast_data: CastData,
     app_data: &mut ApplicationData,
     to_app_mgr_send: &ASender<ToAppMgr>,
-    to_gnome_sender: &Sender<ToGnome>,
+    to_gnome_sender: &ASender<ToGnome>,
     swarm_id: SwarmID,
 ) {
     //TODO: Cases not cover here should be allowed to be served by dapp-lib's user
@@ -5960,24 +5977,28 @@ async fn custom_request_task(
     let partial_hashes = app_data.get_partial_hashes();
     for hdata in partial_hashes.into_iter() {
         let sync_response = SyncResponse::Partial(true, hdata);
-        let _ = to_gnome_sender.send(ToGnome::SendData(
-            neighbor_id,
-            NeighborResponse::Custom(
-                SYNC_RESPONSE,
-                CastData::new(sync_response.serialize()).unwrap(),
-            ),
-        ));
+        let _ = to_gnome_sender
+            .send(ToGnome::SendData(
+                neighbor_id,
+                NeighborResponse::Custom(
+                    SYNC_RESPONSE,
+                    CastData::new(sync_response.serialize()).unwrap(),
+                ),
+            ))
+            .await;
     }
     let partial_datas = app_data.get_partial_data();
     for hdata in partial_datas.into_iter() {
         let sync_response = SyncResponse::Partial(false, hdata);
-        let _ = to_gnome_sender.send(ToGnome::SendData(
-            neighbor_id,
-            NeighborResponse::Custom(
-                SYNC_RESPONSE,
-                CastData::new(sync_response.serialize()).unwrap(),
-            ),
-        ));
+        let _ = to_gnome_sender
+            .send(ToGnome::SendData(
+                neighbor_id,
+                NeighborResponse::Custom(
+                    SYNC_RESPONSE,
+                    CastData::new(sync_response.serialize()).unwrap(),
+                ),
+            ))
+            .await;
     }
     eprintln!("Sent Partial response");
     let mut sync_req_iter = sync_requests.into_iter();
@@ -5993,13 +6014,15 @@ async fn custom_request_task(
                 for (part_no, group) in hashes.into_iter().enumerate() {
                     let sync_response =
                         SyncResponse::Datastore(part_no as u16, hashes_len - 1, group);
-                    let _ = to_gnome_sender.send(ToGnome::SendData(
-                        neighbor_id,
-                        NeighborResponse::Custom(
-                            SYNC_RESPONSE,
-                            CastData::new(sync_response.serialize()).unwrap(),
-                        ),
-                    ));
+                    let _ = to_gnome_sender
+                        .send(ToGnome::SendData(
+                            neighbor_id,
+                            NeighborResponse::Custom(
+                                SYNC_RESPONSE,
+                                CastData::new(sync_response.serialize()).unwrap(),
+                            ),
+                        ))
+                        .await;
                 }
                 eprintln!("{} Sent Datastore response", swarm_id);
             }
@@ -6040,13 +6063,15 @@ async fn custom_request_task(
                             let (data_type, len) = app_data.get_type_and_len(c_id).unwrap();
                             let sync_response = SyncResponse::Page(c_id, data_type, 0, len, data);
                             // println!("Sending bytes: {:?}", bytes);
-                            let res = to_gnome_sender.send(ToGnome::SendData(
-                                neighbor_id,
-                                NeighborResponse::Custom(
-                                    SYNC_RESPONSE,
-                                    CastData::new(sync_response.serialize()).unwrap(),
-                                ),
-                            ));
+                            let res = to_gnome_sender
+                                .send(ToGnome::SendData(
+                                    neighbor_id,
+                                    NeighborResponse::Custom(
+                                        SYNC_RESPONSE,
+                                        CastData::new(sync_response.serialize()).unwrap(),
+                                    ),
+                                ))
+                                .await;
                             if res.is_ok() {
                                 eprintln!("Main page of {} sent successfully.", c_id,);
                             }
@@ -6079,13 +6104,15 @@ async fn custom_request_task(
                                     std::mem::replace(&mut hashes[i as usize], Data::empty(0));
                                 let sync_response =
                                     SyncResponse::Hashes(c_id, i, hashes_len, hash_data);
-                                let res = to_gnome_sender.send(ToGnome::SendData(
-                                    neighbor_id,
-                                    NeighborResponse::Custom(
-                                        SYNC_RESPONSE,
-                                        CastData::new(sync_response.serialize()).unwrap(),
-                                    ),
-                                ));
+                                let res = to_gnome_sender
+                                    .send(ToGnome::SendData(
+                                        neighbor_id,
+                                        NeighborResponse::Custom(
+                                            SYNC_RESPONSE,
+                                            CastData::new(sync_response.serialize()).unwrap(),
+                                        ),
+                                    ))
+                                    .await;
                                 if res.is_ok() {
                                     eprintln!("Hashes [{}/{}] of {} sent", i, hashes_len, c_id);
                                 } else {
@@ -6101,13 +6128,15 @@ async fn custom_request_task(
                                     );
                                     let sync_response =
                                         SyncResponse::Hashes(c_id, h_id, hashes_len, hash_data);
-                                    let res = to_gnome_sender.send(ToGnome::SendData(
-                                        neighbor_id,
-                                        NeighborResponse::Custom(
-                                            SYNC_RESPONSE,
-                                            CastData::new(sync_response.serialize()).unwrap(),
-                                        ),
-                                    ));
+                                    let res = to_gnome_sender
+                                        .send(ToGnome::SendData(
+                                            neighbor_id,
+                                            NeighborResponse::Custom(
+                                                SYNC_RESPONSE,
+                                                CastData::new(sync_response.serialize()).unwrap(),
+                                            ),
+                                        ))
+                                        .await;
                                     if res.is_ok() {
                                         eprintln!(
                                             "Hashes [{}/{}] of {} sent",
@@ -6140,13 +6169,15 @@ async fn custom_request_task(
                                     }
                                     let sync_response =
                                         SyncResponse::Page(c_id, data_type, p_id, total, data);
-                                    let r = to_gnome_sender.send(ToGnome::SendData(
-                                        neighbor_id,
-                                        NeighborResponse::Custom(
-                                            SYNC_RESPONSE,
-                                            CastData::new(sync_response.serialize()).unwrap(),
-                                        ),
-                                    ));
+                                    let r = to_gnome_sender
+                                        .send(ToGnome::SendData(
+                                            neighbor_id,
+                                            NeighborResponse::Custom(
+                                                SYNC_RESPONSE,
+                                                CastData::new(sync_response.serialize()).unwrap(),
+                                            ),
+                                        ))
+                                        .await;
                                     if r.is_ok() {
                                         eprintln!("Sent {}[{}/{}]", c_id, p_id, total);
                                     } else {
@@ -6161,13 +6192,15 @@ async fn custom_request_task(
                                 eprintln!("Got link data len: {}", data_vec.len());
                                 let data = data_vec.remove(0);
                                 let sync_response = SyncResponse::Page(c_id, data_type, 0, 0, data);
-                                let r = to_gnome_sender.send(ToGnome::SendData(
-                                    neighbor_id,
-                                    NeighborResponse::Custom(
-                                        SYNC_RESPONSE,
-                                        CastData::new(sync_response.serialize()).unwrap(),
-                                    ),
-                                ));
+                                let r = to_gnome_sender
+                                    .send(ToGnome::SendData(
+                                        neighbor_id,
+                                        NeighborResponse::Custom(
+                                            SYNC_RESPONSE,
+                                            CastData::new(sync_response.serialize()).unwrap(),
+                                        ),
+                                    ))
+                                    .await;
                                 if r.is_ok() {
                                     eprintln!("Sent {} link ", c_id);
                                 } else {
@@ -6186,13 +6219,15 @@ async fn custom_request_task(
                                 {
                                     let sync_response =
                                         SyncResponse::Page(c_id, d_type, p_id, size, data);
-                                    let r = to_gnome_sender.send(ToGnome::SendData(
-                                        neighbor_id,
-                                        NeighborResponse::Custom(
-                                            SYNC_RESPONSE,
-                                            CastData::new(sync_response.serialize()).unwrap(),
-                                        ),
-                                    ));
+                                    let r = to_gnome_sender
+                                        .send(ToGnome::SendData(
+                                            neighbor_id,
+                                            NeighborResponse::Custom(
+                                                SYNC_RESPONSE,
+                                                CastData::new(sync_response.serialize()).unwrap(),
+                                            ),
+                                        ))
+                                        .await;
                                     if r.is_ok() {
                                         eprintln!("Sent {}[{}/{}]", c_id, p_id, total);
                                     } else {
@@ -6236,13 +6271,15 @@ async fn custom_request_task(
                             }
                             let sync_response =
                                 SyncResponse::Page(c_id, data_type, part_no as u16, total, data);
-                            let _res = to_gnome_sender.send(ToGnome::SendData(
-                                neighbor_id,
-                                NeighborResponse::Custom(
-                                    SYNC_RESPONSE,
-                                    CastData::new(sync_response.serialize()).unwrap(),
-                                ),
-                            ));
+                            let _res = to_gnome_sender
+                                .send(ToGnome::SendData(
+                                    neighbor_id,
+                                    NeighborResponse::Custom(
+                                        SYNC_RESPONSE,
+                                        CastData::new(sync_response.serialize()).unwrap(),
+                                    ),
+                                ))
+                                .await;
                             // eprintln!("To Gnome send result: {:?}", res);
                         }
                     } else {
@@ -6271,7 +6308,7 @@ async fn custom_response_task(
     active_reads: &mut HashMap<ContentID, ReadState>,
     incomplete_bottom_hashes: &mut HashMap<ContentID, PartialHashes>,
     swarm_name: &SwarmName,
-    to_gnome_sender: &Sender<ToGnome>,
+    to_gnome_sender: &ASender<ToGnome>,
     s_storage: &PathBuf,
     i_am_founder: bool,
     max_pages_in_memory: usize,
@@ -6410,7 +6447,8 @@ async fn custom_response_task(
                                             true,
                                             None,
                                             to_gnome_sender.clone(),
-                                        );
+                                        )
+                                        .await;
                                         let _ = to_app_mgr_send
                                             .send(ToAppMgr::ContentRequestedFromNeighbor(
                                                 swarm_id,
@@ -6458,7 +6496,8 @@ async fn custom_response_task(
                                         true,
                                         Some(neighbor_id),
                                         to_gnome_sender.clone(),
-                                    );
+                                    )
+                                    .await;
                                     let _ = to_app_mgr_send
                                         .send(ToAppMgr::ContentRequestedFromNeighbor(
                                             swarm_id,
@@ -6485,7 +6524,8 @@ async fn custom_response_task(
                                     true,
                                     None,
                                     to_gnome_sender.clone(),
-                                );
+                                )
+                                .await;
                                 let _ = to_app_mgr_send
                                     .send(ToAppMgr::ContentRequestedFromNeighbor(
                                         swarm_id,
@@ -6509,7 +6549,8 @@ async fn custom_response_task(
                                 true,
                                 None,
                                 to_gnome_sender.clone(),
-                            );
+                            )
+                            .await;
                             let _ = to_app_mgr_send
                                 .send(ToAppMgr::ContentRequestedFromNeighbor(
                                     swarm_id,
@@ -6556,17 +6597,19 @@ async fn custom_response_task(
                     };
 
                     if app_type.is_none() {
-                        let _ = to_gnome_sender.send(ToGnome::AskData(
-                            GnomeId::any(),
-                            None,
-                            NeighborRequest::Custom(
-                                SYNC_REQUEST,
-                                CastData::new(serialize_requests(vec![SyncRequest::AllPages(
-                                    vec![0],
-                                )]))
-                                .unwrap(),
-                            ),
-                        ));
+                        let _ = to_gnome_sender
+                            .send(ToGnome::AskData(
+                                GnomeId::any(),
+                                None,
+                                NeighborRequest::Custom(
+                                    SYNC_REQUEST,
+                                    CastData::new(serialize_requests(vec![SyncRequest::AllPages(
+                                        vec![0],
+                                    )]))
+                                    .unwrap(),
+                                ),
+                            ))
+                            .await;
                     }
 
                     let s_link = SwarmLink {
@@ -6871,7 +6914,7 @@ async fn read_data_task(
     swarm_id: SwarmID,
     app_data: &mut ApplicationData,
     swarm_name: &SwarmName,
-    to_gnome_sender: &Sender<ToGnome>,
+    to_gnome_sender: &ASender<ToGnome>,
     app_data_send: &ASender<ToAppData>,
     to_search_enigne: &ASender<SearchMsg>,
 ) {
@@ -7018,26 +7061,30 @@ async fn read_data_task(
                 for dmc in dmall {
                     let sync_requests: Vec<SyncRequest> =
                         vec![SyncRequest::Pages(c_id, d_type, dmc.to_vec())];
-                    let _res = to_gnome_sender.send(ToGnome::AskData(
-                        GnomeId::any(),
-                        None,
-                        NeighborRequest::Custom(
-                            SYNC_REQUEST,
-                            CastData::new(serialize_requests(sync_requests)).unwrap(),
-                        ),
-                    ));
+                    let _res = to_gnome_sender
+                        .send(ToGnome::AskData(
+                            GnomeId::any(),
+                            None,
+                            NeighborRequest::Custom(
+                                SYNC_REQUEST,
+                                CastData::new(serialize_requests(sync_requests)).unwrap(),
+                            ),
+                        ))
+                        .await;
                 }
                 if !rmd.is_empty() {
                     let sync_requests: Vec<SyncRequest> =
                         vec![SyncRequest::Pages(c_id, d_type, rmd.to_vec())];
-                    let _rem = to_gnome_sender.send(ToGnome::AskData(
-                        GnomeId::any(),
-                        None,
-                        NeighborRequest::Custom(
-                            SYNC_REQUEST,
-                            CastData::new(serialize_requests(sync_requests)).unwrap(),
-                        ),
-                    ));
+                    let _rem = to_gnome_sender
+                        .send(ToGnome::AskData(
+                            GnomeId::any(),
+                            None,
+                            NeighborRequest::Custom(
+                                SYNC_REQUEST,
+                                CastData::new(serialize_requests(sync_requests)).unwrap(),
+                            ),
+                        ))
+                        .await;
                 }
                 return;
             }
@@ -7116,14 +7163,16 @@ async fn read_data_task(
         if matches!(error, AppError::ContentEmpty) {
             eprintln!("got ContentEmpty");
             let sync_requests: Vec<SyncRequest> = vec![SyncRequest::AllPages(vec![c_id])];
-            let _ = to_gnome_sender.send(ToGnome::AskData(
-                GnomeId::any(),
-                None,
-                NeighborRequest::Custom(
-                    SYNC_REQUEST,
-                    CastData::new(serialize_requests(sync_requests)).unwrap(),
-                ),
-            ));
+            let _ = to_gnome_sender
+                .send(ToGnome::AskData(
+                    GnomeId::any(),
+                    None,
+                    NeighborRequest::Custom(
+                        SYNC_REQUEST,
+                        CastData::new(serialize_requests(sync_requests)).unwrap(),
+                    ),
+                ))
+                .await;
             let mut h_miss = HashSet::with_capacity(64);
             for p_miss in 0..64 {
                 h_miss.insert(p_miss);
