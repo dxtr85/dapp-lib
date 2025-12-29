@@ -578,8 +578,16 @@ pub async fn initialize<'a>(
     let c_ex = executor.clone();
     let c_io = io_executor.clone();
     // So we are running init within current thread now...
-    let (gmgr_send, gmgr_recv, my_id) =
-        init(c_ex, c_io, config_dir, Some(neighbors), bandwidth_per_swarm).await;
+    let (gmgr_send, gmgr_recv, my_id) = init(
+        c_ex,
+        c_io,
+        config_dir,
+        Some(neighbors),
+        bandwidth_per_swarm,
+        config.listen_port,
+        config.listen_port_ipv6,
+    )
+    .await;
     // let _ = my_name_send.send(my_id).await;
 
     let (to_search_engine_send, to_search_engine_recv) = achannel::unbounded();

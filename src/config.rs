@@ -16,6 +16,8 @@ pub struct Configuration {
     pub neighbors: Option<Vec<NetworkSettings>>,
     pub max_connected_swarms: u8,
     pub upload_bandwidth: u64,
+    pub listen_port: Option<u16>,
+    pub listen_port_ipv6: Option<u16>,
     pub storage_rules: Vec<(StorageCondition, StoragePolicy)>,
 }
 
@@ -34,6 +36,8 @@ impl Configuration {
         let mut max_connected_swarms = 8;
         let mut upload_bandwidth = 8192;
         let mut store_data_on_disk = vec![(StorageCondition::Default, StoragePolicy::All)];
+        let mut listen_port = None;
+        let mut listen_port_ipv6 = None;
         if !conf_path.exists() {
             return Configuration {
                 autosave: false,
@@ -43,6 +47,8 @@ impl Configuration {
                 neighbors,
                 max_connected_swarms,
                 upload_bandwidth,
+                listen_port,
+                listen_port_ipv6,
                 storage_rules: store_data_on_disk,
             };
         }
@@ -63,6 +69,22 @@ impl Configuration {
                     "AUTOSAVE" => {
                         eprintln!("Enabling AUTOSAVE");
                         autosave = true;
+                    }
+                    "LISTEN_PORT" => {
+                        if let Some(number_str) = split.next() {
+                            if let Ok(number) = u16::from_str_radix(number_str, 10) {
+                                eprintln!("Updating LISTEN_PORT to {}", number);
+                                listen_port = Some(number);
+                            }
+                        }
+                    }
+                    "LISTEN_PORT_IPV6" => {
+                        if let Some(number_str) = split.next() {
+                            if let Ok(number) = u16::from_str_radix(number_str, 10) {
+                                eprintln!("Updating LISTEN_PORT_IPV6 to {}", number);
+                                listen_port_ipv6 = Some(number);
+                            }
+                        }
                     }
                     "MAX_CONNECTED_SWARMS" => {
                         if let Some(number_str) = split.next() {
@@ -111,6 +133,8 @@ impl Configuration {
             neighbors,
             max_connected_swarms,
             upload_bandwidth,
+            listen_port,
+            listen_port_ipv6,
             storage_rules: store_data_on_disk,
         }
     }
