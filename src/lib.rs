@@ -29,7 +29,6 @@ mod search;
 mod storage;
 mod sync_message;
 use app_type::AppType;
-use smol::channel::unbounded;
 // use async_std::fs::create_dir_all;
 use smol::fs::create_dir_all;
 // use async_std::path::PathBuf;
@@ -187,6 +186,10 @@ pub enum ToApp {
     CustomNeighborRequest(SwarmID, GnomeId, u8, CastData),
     CustomNeighborResponse(SwarmID, GnomeId, u8, CastData),
     PolicyNotMet(SwarmID, SyncMessageType, Data),
+    BCastOrigin(SwarmID, CastID, ASender<CastData>, AReceiver<CastData>),
+    MCastOrigin(SwarmID, CastID, ASender<CastData>, AReceiver<CastData>),
+    BCast(SwarmID, CastID, AReceiver<CastData>),
+    MCast(SwarmID, CastID, AReceiver<CastData>),
     Quit,
 }
 
@@ -195,20 +198,20 @@ pub enum ToAppMgr {
     CIDsForTag(SwarmID, GnomeId, u8, ContentID, Data),
     ContentLoadedFromDisk(SwarmID, ContentID, DataType, Data),
     ContentRequestedFromNeighbor(SwarmID, ContentID, DataType),
-    BroadcastSend(CastID, CastData),
-    MulticastSend(CastID, CastData),
+    BroadcastSend(SwarmID, CastID, CastData),
+    MulticastSend(SwarmID, CastID, CastData),
     ChangeDiameter(SwarmID, u8),
     StartUnicast,
     StartBroadcast,
-    EndBroadcast,
+    EndBroadcast(CastID),
     SendToBCastSource(SwarmID, CastID, CastData),
     StartMulticast,
-    EndMulticast,
+    EndMulticast(CastID),
     SendToMCastSource(SwarmID, CastID, CastData),
-    // SubscribeBroadcast,
-    SubscribeMulticast,
-    UnsubscribeBroadcast,
-    UnsubscribeMulticast,
+    SubscribeBroadcast(SwarmID, CastID),
+    SubscribeMulticast(SwarmID, CastID),
+    UnsubscribeBroadcast(SwarmID, CastID),
+    UnsubscribeMulticast(SwarmID, CastID),
     ListNeighbors,
     NeighborsListing(SwarmID, Vec<GnomeId>),
     ChangeContent(SwarmID, ContentID, DataType, Vec<Data>),
@@ -320,20 +323,20 @@ pub enum ToAppData {
     StartUnicast,
     StartMulticast,
     StartBroadcast,
-    EndBroadcast,
-    EndMulticast,
-    SubscribeBroadcast,
-    SubscribeMulticast,
-    UnsubscribeBroadcast,
-    UnsubscribeMulticast,
+    EndBroadcast(CastID),
+    EndMulticast(CastID),
+    SubscribeBroadcast(CastID),
+    SubscribeMulticast(CastID),
+    UnsubscribeBroadcast(CastID),
+    UnsubscribeMulticast(CastID),
     SendToBCastSource(CastID, CastData),
     SendToMCastSource(CastID, CastData),
     ListNeighbors,
     SwarmReady(SwarmName, bool), //bool indicates whether or not we are founder
-    BCastData(CastID, CastData),
-    BCastOrigin(CastID, ASender<CastData>),
-    MCastData(CastID, CastData),
-    MCastOrigin(CastID, ASender<CastData>),
+    BCastOrigin(SwarmID, CastID, ASender<CastData>, AReceiver<CastData>),
+    BCast(SwarmID, CastID, AReceiver<CastData>),
+    MCastOrigin(SwarmID, CastID, ASender<CastData>, AReceiver<CastData>),
+    MCast(SwarmID, CastID, AReceiver<CastData>),
     ChangeContent(ContentID, DataType, Vec<Data>),
     ChangeDiameter(u8),
     UpdateData(ContentID, u16, Data),
@@ -686,19 +689,25 @@ async fn serve_app_manager<'a>(
                         .send(ToGnomeManager::StartListeningSwarm(ns))
                         .await;
                 }
-                ToAppMgr::BroadcastSend(c_id, c_data) => {
-                    let _ = app_mgr
-                        .active_app_data
-                        .1
-                        .send(ToAppData::BroadcastSend(c_id, c_data))
-                        .await;
+                ToAppMgr::BroadcastSend(s_id, c_id, c_data) => {
+                    if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
+                        let _ = sender.send(ToAppData::BroadcastSend(c_id, c_data)).await;
+                    }
+                    // let _ = app_mgr
+                    //     .active_app_data
+                    //     .1
+                    //     .send(ToAppData::BroadcastSend(c_id, c_data))
+                    //     .await;
                 }
-                ToAppMgr::MulticastSend(c_id, c_data) => {
-                    let _ = app_mgr
-                        .active_app_data
-                        .1
-                        .send(ToAppData::MulticastSend(c_id, c_data))
-                        .await;
+                ToAppMgr::MulticastSend(s_id, c_id, c_data) => {
+                    if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
+                        let _ = sender.send(ToAppData::MulticastSend(c_id, c_data)).await;
+                    }
+                    // let _ = app_mgr
+                    //     .active_app_data
+                    //     .1
+                    //     .send(ToAppData::MulticastSend(c_id, c_data))
+                    //     .await;
                 }
                 ToAppMgr::FromApp(LibRequest::Search(phrase)) => {
                     let _ = to_search_enigne.send(SearchMsg::AddQuery(phrase)).await;
@@ -1119,21 +1128,33 @@ async fn serve_app_manager<'a>(
                         .send(ToAppData::StartBroadcast)
                         .await;
                 }
-                ToAppMgr::EndBroadcast => {
+                ToAppMgr::EndBroadcast(c_id) => {
                     eprintln!("ToAppMgr::EndBroadcast");
                     let _ = app_mgr
                         .active_app_data
                         .1
-                        .send(ToAppData::EndBroadcast)
+                        .send(ToAppData::EndBroadcast(c_id))
                         .await;
                 }
-                ToAppMgr::UnsubscribeBroadcast => {
+                ToAppMgr::SubscribeBroadcast(s_id, c_id) => {
+                    eprintln!("ToAppMgr::SubscribeBroadcast");
+                    // let _ = app_mgr
+                    //     .active_app_data
+                    //     .1
+                    if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
+                        let _ = sender.send(ToAppData::SubscribeBroadcast(c_id)).await;
+                    }
+                }
+                ToAppMgr::UnsubscribeBroadcast(s_id, c_id) => {
                     eprintln!("ToAppMgr::UnsubscribeBroadcast");
-                    let _ = app_mgr
-                        .active_app_data
-                        .1
-                        .send(ToAppData::UnsubscribeBroadcast)
-                        .await;
+                    if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
+                        let _ = sender.send(ToAppData::UnsubscribeBroadcast(c_id)).await;
+                    }
+                    // let _ = app_mgr
+                    //     .active_app_data
+                    //     .1
+                    //     .send(ToAppData::UnsubscribeBroadcast)
+                    //     .await;
                 }
                 ToAppMgr::StartMulticast => {
                     let _ = app_mgr
@@ -1142,29 +1163,31 @@ async fn serve_app_manager<'a>(
                         .send(ToAppData::StartMulticast)
                         .await;
                 }
-                ToAppMgr::EndMulticast => {
+                ToAppMgr::EndMulticast(c_id) => {
                     eprintln!("ToAppMgr::EndMulticast");
                     let _ = app_mgr
                         .active_app_data
                         .1
-                        .send(ToAppData::EndMulticast)
+                        .send(ToAppData::EndMulticast(c_id))
                         .await;
                 }
-                ToAppMgr::SubscribeMulticast => {
+                ToAppMgr::SubscribeMulticast(s_id, c_id) => {
                     eprintln!("ToAppMgr::SubscribeMulticast");
-                    let _ = app_mgr
-                        .active_app_data
-                        .1
-                        .send(ToAppData::SubscribeMulticast)
-                        .await;
+                    // let _ = app_mgr
+                    //     .active_app_data
+                    //     .1
+                    if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
+                        let _ = sender.send(ToAppData::SubscribeMulticast(c_id)).await;
+                    }
                 }
-                ToAppMgr::UnsubscribeMulticast => {
+                ToAppMgr::UnsubscribeMulticast(s_id, c_id) => {
                     eprintln!("ToAppMgr::UnsubscribeMulticast");
-                    let _ = app_mgr
-                        .active_app_data
-                        .1
-                        .send(ToAppData::UnsubscribeMulticast)
-                        .await;
+                    // let _ = app_mgr
+                    //     .active_app_data
+                    //     .1
+                    if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
+                        let _ = sender.send(ToAppData::UnsubscribeMulticast(c_id)).await;
+                    }
                 }
                 ToAppMgr::SendToBCastSource(s_id, bc_id, data) => {
                     if app_mgr.active_app_data.0 == s_id {
@@ -2024,6 +2047,7 @@ async fn serve_app_manager<'a>(
                                     to_swarm,
                                     to_app_mgr.clone(),
                                     to_search_enigne.clone(),
+                                    to_user.clone(),
                                 ))
                                 .detach();
                             let c_ex = executor.clone();
@@ -2482,6 +2506,7 @@ async fn serve_app_data<'a>(
     to_gnome_sender: ASender<ToGnome>,
     to_app_mgr_send: ASender<ToAppMgr>,
     to_search_enigne: ASender<SearchMsg>,
+    to_user: ASender<ToApp>,
 ) {
     // eprintln!("{swarm_id} serve_app_data started");
     let mut s_storage = PathBuf::new();
@@ -2541,16 +2566,16 @@ async fn serve_app_data<'a>(
     // let mut store_on_disk = false;
     let mut swarm_name = SwarmName::new(GnomeId::any(), "".to_string()).unwrap();
     // eprintln!("Storage root app data: {:?}", storage);
-    let mut b_cast_origin: Option<(CastID, ASender<CastData>)> = None;
-    let mut m_cast_origin: Option<(CastID, ASender<CastData>)> = None;
+    let mut b_cast_origin: HashMap<CastID, ASender<CastData>> = HashMap::new();
+    let mut m_cast_origin: HashMap<CastID, ASender<CastData>> = HashMap::new();
     let mut link_with_transform_info: Option<ContentID> = None;
-    let mut b_req_sent = false;
-    let mut m_req_sent = false;
+    // let mut b_req_sent = false;
+    // let mut m_req_sent = false;
     let mut i_am_founder = false;
     // let mut next_val = 0;
     let mut datastore_sync: Option<(u16, HashMap<u16, Vec<(DataType, u64)>>)> =
         Some((0, HashMap::new()));
-    let sleep_time = Duration::from_millis(32);
+    // let sleep_time = Duration::from_millis(32);
     let mut active_reads: HashMap<ContentID, ReadState> = HashMap::new();
     let mut incomplete_bottom_hashes = HashMap::new();
     while let Ok(resp) = app_data_recv.recv().await {
@@ -2639,56 +2664,50 @@ async fn serve_app_data<'a>(
                 eprintln!("UnicastReq: {:?}", res);
             }
             ToAppData::StartBroadcast => {
-                let res = to_gnome_sender.send(ToGnome::StartBroadcast).await;
-                b_req_sent = res.is_ok();
+                let _res = to_gnome_sender.send(ToGnome::StartBroadcast).await;
+                // b_req_sent = res.is_ok();
             }
             ToAppData::StartMulticast => {
                 eprintln!("ToAppData::StartMulticast");
-                let res = to_gnome_sender.send(ToGnome::StartMulticast).await;
-                m_req_sent = res.is_ok();
+                let _res = to_gnome_sender.send(ToGnome::StartMulticast).await;
+                // m_req_sent = res.is_ok();
             }
-            ToAppData::UnsubscribeBroadcast => {
-                // TODO: get this from app's logic
-                let c_id = CastID(0);
-                let res = to_gnome_sender
+            ToAppData::UnsubscribeBroadcast(c_id) => {
+                let _res = to_gnome_sender
                     .send(ToGnome::UnsubscribeBroadcast(c_id))
                     .await;
-                b_req_sent = res.is_ok();
+                // b_req_sent = res.is_ok();
             }
-            ToAppData::SubscribeMulticast => {
-                // TODO: get this from app's logic
-                let c_id = CastID(0);
-                let res = to_gnome_sender
+            ToAppData::SubscribeMulticast(c_id) => {
+                let _res = to_gnome_sender
                     .send(ToGnome::SubscribeMulticast(c_id))
                     .await;
-                m_req_sent = res.is_ok();
+                // m_req_sent = res.is_ok();
             }
-            ToAppData::UnsubscribeMulticast => {
-                // TODO: get this from app's logic
-                let c_id = CastID(0);
-                let res = to_gnome_sender
+            ToAppData::UnsubscribeMulticast(c_id) => {
+                let _res = to_gnome_sender
                     .send(ToGnome::UnsubscribeMulticast(c_id))
                     .await;
-                m_req_sent = res.is_ok();
+                // m_req_sent = res.is_ok();
             }
-            ToAppData::EndBroadcast => {
+            ToAppData::EndBroadcast(c_id) => {
                 eprintln!("ToAppData::EndBroadcast");
-                if let Some((c_id, _sender)) = b_cast_origin {
+                if let Some(_sender) = b_cast_origin.remove(&c_id) {
                     // eprintln!("Some");
-                    let res = to_gnome_sender.send(ToGnome::EndBroadcast(c_id)).await;
-                    b_req_sent = res.is_ok();
-                    b_cast_origin = None;
+                    let _res = to_gnome_sender.send(ToGnome::EndBroadcast(c_id)).await;
+                    // b_req_sent = res.is_ok();
+                    // b_cast_origin = None;
                 } else {
                     // eprintln!("None");
                 }
             }
-            ToAppData::EndMulticast => {
+            ToAppData::EndMulticast(c_id) => {
                 eprintln!("ToAppData::EndMulticast");
-                if let Some((c_id, _sender)) = m_cast_origin {
+                if let Some(_sender) = m_cast_origin.remove(&c_id) {
                     // eprintln!("Some");
                     let res = to_gnome_sender.send(ToGnome::EndMulticast(c_id)).await;
-                    m_req_sent = res.is_ok();
-                    m_cast_origin = None;
+                    // m_req_sent = res.is_ok();
+                    // m_cast_origin = None;
                 } else {
                     // eprintln!("None");
                 }
@@ -2921,174 +2940,40 @@ async fn serve_app_data<'a>(
                 let result = app_data.transform_link(c_id);
                 eprintln!("Link transformation result: {:?}", result);
             }
-            ToAppData::BroadcastSend(_id, _data) => {
-                //TODO: send to AppMgr UploadData message
-                // this logic should be moved to app mgr
-                if b_cast_origin.is_none() {
+            ToAppData::BroadcastSend(_id, c_data) => {
+                if let Some(sender) = b_cast_origin.get(&_id) {
+                    // let (_bcast_id, bcast_send) = m_cast_origin.clone().unwrap();
+                    let send_res = sender.send(c_data).await;
+                    if !send_res.is_ok() {
+                        //     eprintln!("Sent MCast data");
+                        // } else {
+                        eprintln!("FAILED to send BCast data: {}", send_res.err().unwrap());
+                    }
+                } else {
                     eprintln!("Unable to upload - no active broadcast.");
-                    if !b_req_sent {
-                        eprintln!("Requesting broadcast channel.");
-                        let res = to_gnome_sender.send(ToGnome::StartBroadcast).await;
-                        b_req_sent = res.is_ok();
-                    }
-                    continue;
-                }
-                let (broadcast_id, bcast_send) = b_cast_origin.clone().unwrap();
-                // TODO: here we need to write a procedure for data upload
-                // 1. Select data to upload
-                // 2. Split data into 64MibiByte chunks
-                //
-                let d_type = DataType::from(7);
-                let total_parts = 128;
-                let big_chunks = vec![BigChunk(0, total_parts)];
-                // Then for each big-chunk:
-                for mut big_chunk in big_chunks.into_iter() {
-                    let description = content::Description::new(String::new()).unwrap();
-                    let missing_hashes = HashSet::new();
-                    let data_hashes = vec![];
-                    let mut data_vec = Vec::with_capacity(big_chunk.1 as usize);
-                    let mut hashes = Vec::with_capacity(big_chunk.1 as usize);
-                    eprintln!("// 3. Split big-chunk into 1024byte small-chunks");
-                    while let Some(small_chunk) = big_chunk.next() {
-                        // 4. Compute hash for each small-chunk
-                        hashes.push(small_chunk.get_hash());
-                        // TODO: build proper CastData from Data
-                        data_vec.push(small_chunk);
-                    }
-                    eprintln!("// 5. Compute root hash from previous hashes.");
-                    let root_hash = get_root_hash(&hashes);
-                    eprintln!("// 6. Instantiate TransformInfo");
-                    let ti = TransformInfo {
-                        d_type,
-                        size: 0,
-                        root_hash,
-                        broadcast_id,
-                        // description,
-                        missing_hashes,
-                        data_hashes,
-                        data: HashMap::new(),
-                    };
-
-                    eprintln!(
-                        "// 7. SyncMessage::Append as many Data::Link to Datastore as necessary"
-                    );
-                    if let Some(content_id) = app_data.next_c_id() {
-                        eprintln!("ContentID: {}", content_id);
-                        let pre: Vec<(ContentID, u64)> = vec![(content_id, 0)];
-                        let link = Content::Link(
-                            AppType::Catalog,
-                            SwarmName {
-                                founder: GnomeId(u64::MAX),
-                                name: String::new(),
-                            },
-                            u16::MAX,
-                            vec![],
-                            description,
-                            // Data::empty(0),
-                            Some(ti),
-                        );
-                        let link_hash = link.hash();
-                        // eprintln!("Link hash: {}", link_hash);
-                        let data = link.to_data().unwrap();
-                        // let link_reverse = data_to_link(data.clone()).unwrap();
-                        // eprintln!("Reverse link hash: {}", link_reverse.hash());
-                        // eprintln!("Link data: {:?}", data);
-                        // eprintln!("Data hash: {}", data.get_hash());
-                        let post: Vec<(ContentID, u64)> = vec![(content_id, link_hash)];
-                        let reqs = SyncRequirements { pre, post };
-                        let msg = SyncMessage::new(
-                            SyncMessageType::AppendContent(DataType::Link),
-                            reqs,
-                            data,
-                        );
-                        let parts = msg.into_parts();
-                        for part in parts {
-                            let _ = to_gnome_sender.send(ToGnome::AddData(part)).await;
-                        }
-                        //TODO: we need to set this upon receiving Gnome's confirmation
-                        link_with_transform_info = Some(content_id);
-                        // next_val += 1;
-                        eprintln!("// 8. For each Link Send computed Hashes via broadcast");
-                        let (done_send, done_recv) = unbounded();
-                        let mut hash_bytes = vec![];
-                        let chunks = hashes.chunks(128);
-                        let total = chunks.len() - 1;
-                        for (i, chunk) in chunks.enumerate() {
-                            let mut outgoing_bytes = Vec::with_capacity(1024);
-                            for hash in chunk {
-                                for byte in u64::to_be_bytes(*hash) {
-                                    outgoing_bytes.push(byte)
-                                }
-                            }
-                            hash_bytes.push(
-                                AppMessage::new(
-                                    content_id,
-                                    true,
-                                    i as u16,
-                                    total as u16,
-                                    Data::new(outgoing_bytes).unwrap(),
-                                )
-                                .to_cast(),
-                            )
-                        }
-                        eprintln!("duplicating hashes");
-                        hash_bytes.append(&mut hash_bytes.clone());
-                        eprintln!("spawning serve_broadcast_origin");
-                        _executor
-                            .spawn(serve_broadcast_origin(
-                                broadcast_id,
-                                Duration::from_millis(512),
-                                bcast_send.clone(),
-                                hash_bytes,
-                                done_send.clone(),
-                            ))
-                            .detach();
-                        // sleep(sleep_time).await;
-                        Timer::after(sleep_time).await;
-                        let _done_res = done_recv.recv().await;
-                        eprintln!("Hashes sent: {}", _done_res.is_ok());
-                        // TODO
-                        // 9. SyncMessage::Transform a Link into Data
-
-                        //10. Send Data chunks via broadcast
-                        let mut c_data_vec = Vec::with_capacity(data_vec.len());
-                        let total_parts = total_parts - 1;
-                        for (i, data) in data_vec.into_iter().enumerate() {
-                            c_data_vec.push(
-                                AppMessage::new(content_id, false, i as u16, total_parts, data)
-                                    .to_cast(),
-                            )
-                        }
-                        _executor
-                            .spawn(serve_broadcast_origin(
-                                broadcast_id,
-                                Duration::from_millis(512),
-                                bcast_send.clone(),
-                                c_data_vec,
-                                done_send.clone(),
-                            ))
-                            .detach();
-                    }
+                    // if !m_req_sent {
+                    //     eprintln!("Requesting broadcast channel.");
+                    //     let res = to_gnome_sender.send(ToGnome::StartBroadcast).await;
+                    //     m_req_sent = res.is_ok();
+                    // }
                 }
             }
-            ToAppData::MulticastSend(_c_id, c_data) => {
-                //TODO: send to AppMgr UploadData message
-                // this logic should be moved to app mgr
-                if m_cast_origin.is_none() {
-                    eprintln!("Unable to upload - no active multicast.");
-                    if !m_req_sent {
-                        eprintln!("Requesting multicast channel.");
-                        let res = to_gnome_sender.send(ToGnome::StartMulticast).await;
-                        m_req_sent = res.is_ok();
+            ToAppData::MulticastSend(_id, c_data) => {
+                if let Some(sender) = m_cast_origin.get(&_id) {
+                    // let (_bcast_id, bcast_send) = m_cast_origin.clone().unwrap();
+                    let send_res = sender.send(c_data).await;
+                    if !send_res.is_ok() {
+                        //     eprintln!("Sent MCast data");
+                        // } else {
+                        eprintln!("FAILED to send MCast data: {}", send_res.err().unwrap());
                     }
-                    continue;
-                }
-                let (_mcast_id, mcast_send) = m_cast_origin.clone().unwrap();
-                let send_res = mcast_send.send(c_data).await;
-                if send_res.is_ok() {
-                    eprintln!("Sent MCast data");
                 } else {
-                    eprintln!("FAILED to send MCast data: {}", send_res.err().unwrap());
+                    eprintln!("Unable to upload - no active multicast.");
+                    // if !m_req_sent {
+                    //     eprintln!("Requesting multicast channel.");
+                    //     let res = to_gnome_sender.send(ToGnome::StartBroadcast).await;
+                    //     m_req_sent = res.is_ok();
+                    // }
                 }
             }
             ToAppData::Response(GnomeToApp::Neighbors(s_id, neighbors)) => {
@@ -3306,64 +3191,102 @@ async fn serve_app_data<'a>(
                     let _ = app_data_send.send(ToAppData::ReadRefresh(c_ids)).await;
                 }
             }
-            ToAppData::BCastOrigin(c_id, send) => b_cast_origin = Some((c_id, send)),
-            ToAppData::MCastOrigin(c_id, send) => m_cast_origin = Some((c_id, send)),
-            ToAppData::BCastData(_c_id, c_data) => {
-                // TODO: serve this
-                let a_msg_res = parse_cast(c_data);
-                if let Ok(a_msg) = a_msg_res {
-                    let upd_res = app_data.update_transformative_link(
-                        a_msg.is_hash,
-                        a_msg.content_id,
-                        a_msg.part_no,
-                        a_msg.total_parts,
-                        a_msg.data,
-                    );
-                    // println!("update_transformative_link result: {:?}", upd_res);
-                    if let Ok((d_type, missing_hashes, missing_data)) = upd_res {
-                        //TODO: request hashes if missing not empty
-                        if !missing_hashes.is_empty() {
-                            //TODO: there can be multiple SyncRequests
-                            eprintln!("Missing hashes: {:?}", missing_hashes);
-                            let sync_request =
-                                SyncRequest::Hashes(a_msg.content_id, missing_hashes);
-                            let _ = to_gnome_sender
-                                .send(ToGnome::AskData(
-                                    GnomeId::any(),
-                                    None,
-                                    NeighborRequest::Custom(
-                                        SYNC_REQUEST,
-                                        CastData::new(serialize_requests(vec![sync_request]))
-                                            .unwrap(),
-                                    ),
-                                ))
-                                .await;
-                        }
-                        if !missing_data.is_empty() {
-                            //TODO: there can be multiple SyncRequests
-                            eprintln!("Missing data: {:?}", missing_data);
-                            let sync_request =
-                                SyncRequest::Pages(a_msg.content_id, d_type, missing_data);
-                            let _ = to_gnome_sender
-                                .send(ToGnome::AskData(
-                                    GnomeId::any(),
-                                    None,
-                                    NeighborRequest::Custom(
-                                        SYNC_REQUEST,
-                                        CastData::new(serialize_requests(vec![sync_request]))
-                                            .unwrap(),
-                                    ),
-                                ))
-                                .await;
-                        }
-                    } else {
-                        eprintln!("Unable to update: {:?}", upd_res);
-                    }
-                } else {
-                    let data = a_msg_res.err().unwrap();
-                    eprintln!("App Data: {} ", data);
-                }
+            ToAppData::BCast(s_id, c_id, recv) => {
+                let _ = to_user.send(ToApp::BCast(s_id, c_id, recv)).await;
             }
+            ToAppData::BCastOrigin(s_id, c_id, send, recv) => {
+                if swarm_id == s_id {
+                    b_cast_origin.insert(c_id, send.clone());
+                }
+                let _ = to_user
+                    .send(ToApp::BCastOrigin(s_id, c_id, send, recv))
+                    .await;
+                // to_app_mgr_send
+                //     .send(ToAppMgr::FromDatastore(LibResponse::BroadCastOrigin(
+                //         s_id, c_id, send, recv,
+                //     )))
+                //     .await;
+            }
+            ToAppData::MCast(s_id, c_id, recv) => {
+                let _ = to_user.send(ToApp::MCast(s_id, c_id, recv)).await;
+            }
+            ToAppData::MCastOrigin(s_id, c_id, send, recv) => {
+                if swarm_id == s_id {
+                    m_cast_origin.insert(c_id, send.clone());
+                }
+                let _ = to_user
+                    .send(ToApp::MCastOrigin(s_id, c_id, send, recv))
+                    .await;
+                // to_app_mgr_send
+                //     .send(ToAppMgr::FromDatastore(LibResponse::MultiCastOrigin(
+                //         s_id, c_id, send, recv,
+                //     )))
+                //     .await;
+            }
+            // ToAppData::BCastData(c_id, c_data) => {
+            //     // TODO: serve this
+            //     if c_id == CastID(255) {
+            //         eprintln!("Got BCData on 255 channel");
+            //         let a_msg_res = parse_cast(c_data);
+            //         if let Ok(a_msg) = a_msg_res {
+            //             let upd_res = app_data.update_transformative_link(
+            //                 a_msg.is_hash,
+            //                 a_msg.content_id,
+            //                 a_msg.part_no,
+            //                 a_msg.total_parts,
+            //                 a_msg.data,
+            //             );
+            //             // println!("update_transformative_link result: {:?}", upd_res);
+            //             if let Ok((d_type, missing_hashes, missing_data)) = upd_res {
+            //                 //TODO: request hashes if missing not empty
+            //                 if !missing_hashes.is_empty() {
+            //                     //TODO: there can be multiple SyncRequests
+            //                     eprintln!("Missing hashes: {:?}", missing_hashes);
+            //                     let sync_request =
+            //                         SyncRequest::Hashes(a_msg.content_id, missing_hashes);
+            //                     let _ = to_gnome_sender
+            //                         .send(ToGnome::AskData(
+            //                             GnomeId::any(),
+            //                             None,
+            //                             NeighborRequest::Custom(
+            //                                 SYNC_REQUEST,
+            //                                 CastData::new(serialize_requests(vec![sync_request]))
+            //                                     .unwrap(),
+            //                             ),
+            //                         ))
+            //                         .await;
+            //                 }
+            //                 if !missing_data.is_empty() {
+            //                     //TODO: there can be multiple SyncRequests
+            //                     eprintln!("Missing data: {:?}", missing_data);
+            //                     let sync_request =
+            //                         SyncRequest::Pages(a_msg.content_id, d_type, missing_data);
+            //                     let _ = to_gnome_sender
+            //                         .send(ToGnome::AskData(
+            //                             GnomeId::any(),
+            //                             None,
+            //                             NeighborRequest::Custom(
+            //                                 SYNC_REQUEST,
+            //                                 CastData::new(serialize_requests(vec![sync_request]))
+            //                                     .unwrap(),
+            //                             ),
+            //                         ))
+            //                         .await;
+            //                 }
+            //             } else {
+            //                 eprintln!("Unable to update: {:?}", upd_res);
+            //             }
+            //         } else {
+            //             let c_data = a_msg_res.err().unwrap();
+            //             to_user.send(ToApp::BCastData(swarm_id, c_id, c_data)).await;
+            //         }
+            //     } else {
+            //         to_user.send(ToApp::BCastData(swarm_id, c_id, c_data)).await;
+            //     }
+            // }
+            // ToAppData::MCastData(c_id, c_data) => {
+            //     to_user.send(ToApp::MCastData(swarm_id, c_id, c_data)).await;
+            // }
             ToAppData::TimeoutSyncCheck => {
                 if datastore_sync.is_some() {
                     // spawn(sync_timeout(app_data_send.clone()));
@@ -3563,24 +3486,30 @@ async fn serve_swarm(
                         .await;
                 }
                 GnomeToApp::Broadcast(_s_id, c_id, recv_d) => {
-                    executor
-                        .spawn(serve_broadcast(
-                            c_id,
-                            Duration::from_millis(100),
-                            recv_d,
-                            to_app_data_send.clone(),
-                        ))
-                        .detach();
+                    let _ = to_app_data_send
+                        .send(ToAppData::BCast(_s_id, c_id, recv_d))
+                        .await;
+                    // executor
+                    //     .spawn(serve_broadcast(
+                    //         c_id,
+                    //         Duration::from_millis(100),
+                    //         recv_d,
+                    //         to_app_data_send.clone(),
+                    //     ))
+                    //     .detach();
                 }
                 GnomeToApp::Multicast(_s_id, c_id, recv_d) => {
-                    executor
-                        .spawn(serve_multicast(
-                            c_id,
-                            Duration::from_millis(100),
-                            recv_d,
-                            to_app_data_send.clone(),
-                        ))
-                        .detach();
+                    let _ = to_app_data_send
+                        .send(ToAppData::MCast(_s_id, c_id, recv_d))
+                        .await;
+                    // executor
+                    //     .spawn(serve_multicast(
+                    //         c_id,
+                    //         Duration::from_millis(100),
+                    //         recv_d,
+                    //         to_app_data_send.clone(),
+                    //     ))
+                    //     .detach();
                 }
                 GnomeToApp::Unicast(_s_id, c_id, recv_d) => {
                     executor
@@ -3588,29 +3517,40 @@ async fn serve_swarm(
                         .detach();
                 }
                 GnomeToApp::BroadcastOrigin(_s_id, ref c_id, cast_data_send, cast_data_recv) => {
-                    executor
-                        .spawn(serve_broadcast(
-                            *c_id,
-                            Duration::from_millis(100),
-                            cast_data_recv,
-                            to_app_data_send.clone(),
-                        ))
-                        .detach();
+                    // to_user_send.
+                    // executor
+                    //     .spawn(serve_broadcast(
+                    //         *c_id,
+                    //         Duration::from_millis(100),
+                    //         cast_data_recv,
+                    //         to_app_data_send.clone(),
+                    //     ))
+                    //     .detach();
                     let _ = to_app_data_send
-                        .send(ToAppData::BCastOrigin(*c_id, cast_data_send))
+                        .send(ToAppData::BCastOrigin(
+                            _s_id,
+                            *c_id,
+                            cast_data_send,
+                            cast_data_recv,
+                        ))
                         .await;
                 }
                 GnomeToApp::MulticastOrigin(_s_id, ref c_id, cast_data_send, cast_data_recv) => {
-                    executor
-                        .spawn(serve_multicast(
-                            *c_id,
-                            Duration::from_millis(100),
-                            cast_data_recv,
-                            to_app_data_send.clone(),
-                        ))
-                        .detach();
+                    // executor
+                    //     .spawn(serve_multicast(
+                    //         *c_id,
+                    //         Duration::from_millis(100),
+                    //         cast_data_recv,
+                    //         to_app_data_send.clone(),
+                    //     ))
+                    //     .detach();
                     let _ = to_app_data_send
-                        .send(ToAppData::MCastOrigin(*c_id, cast_data_send))
+                        .send(ToAppData::MCastOrigin(
+                            _s_id,
+                            *c_id,
+                            cast_data_send,
+                            cast_data_recv,
+                        ))
                         .await;
                 }
                 GnomeToApp::UnicastOrigin(_s_id, c_id, send_d) => {
@@ -3683,6 +3623,158 @@ async fn serve_swarm(
     }
 }
 
+// TODO: Reuse this logic somewhere:
+// async fn _test_ti_logic(){
+//                 //TODO: send to AppMgr UploadData message
+//                 // this logic should be moved to app mgr
+//                 if b_cast_origin.is_none() {
+//                     eprintln!("Unable to upload - no active broadcast.");
+//                     if !b_req_sent {
+//                         eprintln!("Requesting broadcast channel.");
+//                         let res = to_gnome_sender.send(ToGnome::StartBroadcast).await;
+//                         b_req_sent = res.is_ok();
+//                     }
+//                     continue;
+//                 }
+//                 let (broadcast_id, bcast_send) = b_cast_origin.clone().unwrap();
+//                 // TODO: here we need to write a procedure for data upload
+//                 // 1. Select data to upload
+//                 // 2. Split data into 64MibiByte chunks
+//                 //
+//                 let d_type = DataType::from(7);
+//                 let total_parts = 128;
+//                 let big_chunks = vec![BigChunk(0, total_parts)];
+//                 // Then for each big-chunk:
+//                 for mut big_chunk in big_chunks.into_iter() {
+//                     let description = content::Description::new(String::new()).unwrap();
+//                     let missing_hashes = HashSet::new();
+//                     let data_hashes = vec![];
+//                     let mut data_vec = Vec::with_capacity(big_chunk.1 as usize);
+//                     let mut hashes = Vec::with_capacity(big_chunk.1 as usize);
+//                     eprintln!("// 3. Split big-chunk into 1024byte small-chunks");
+//                     while let Some(small_chunk) = big_chunk.next() {
+//                         // 4. Compute hash for each small-chunk
+//                         hashes.push(small_chunk.get_hash());
+//                         // TODO: build proper CastData from Data
+//                         data_vec.push(small_chunk);
+//                     }
+//                     eprintln!("// 5. Compute root hash from previous hashes.");
+//                     let root_hash = get_root_hash(&hashes);
+//                     eprintln!("// 6. Instantiate TransformInfo");
+//                     let ti = TransformInfo {
+//                         d_type,
+//                         size: 0,
+//                         root_hash,
+//                         broadcast_id,
+//                         // description,
+//                         missing_hashes,
+//                         data_hashes,
+//                         data: HashMap::new(),
+//                     };
+
+//                     eprintln!(
+//                         "// 7. SyncMessage::Append as many Data::Link to Datastore as necessary"
+//                     );
+//                     if let Some(content_id) = app_data.next_c_id() {
+//                         eprintln!("ContentID: {}", content_id);
+//                         let pre: Vec<(ContentID, u64)> = vec![(content_id, 0)];
+//                         let link = Content::Link(
+//                             AppType::Catalog,
+//                             SwarmName {
+//                                 founder: GnomeId(u64::MAX),
+//                                 name: String::new(),
+//                             },
+//                             u16::MAX,
+//                             vec![],
+//                             description,
+//                             // Data::empty(0),
+//                             Some(ti),
+//                         );
+//                         let link_hash = link.hash();
+//                         // eprintln!("Link hash: {}", link_hash);
+//                         let data = link.to_data().unwrap();
+//                         // let link_reverse = data_to_link(data.clone()).unwrap();
+//                         // eprintln!("Reverse link hash: {}", link_reverse.hash());
+//                         // eprintln!("Link data: {:?}", data);
+//                         // eprintln!("Data hash: {}", data.get_hash());
+//                         let post: Vec<(ContentID, u64)> = vec![(content_id, link_hash)];
+//                         let reqs = SyncRequirements { pre, post };
+//                         let msg = SyncMessage::new(
+//                             SyncMessageType::AppendContent(DataType::Link),
+//                             reqs,
+//                             data,
+//                         );
+//                         let parts = msg.into_parts();
+//                         for part in parts {
+//                             let _ = to_gnome_sender.send(ToGnome::AddData(part)).await;
+//                         }
+//                         //TODO: we need to set this upon receiving Gnome's confirmation
+//                         link_with_transform_info = Some(content_id);
+//                         // next_val += 1;
+//                         eprintln!("// 8. For each Link Send computed Hashes via broadcast");
+//                         let (done_send, done_recv) = unbounded();
+//                         let mut hash_bytes = vec![];
+//                         let chunks = hashes.chunks(128);
+//                         let total = chunks.len() - 1;
+//                         for (i, chunk) in chunks.enumerate() {
+//                             let mut outgoing_bytes = Vec::with_capacity(1024);
+//                             for hash in chunk {
+//                                 for byte in u64::to_be_bytes(*hash) {
+//                                     outgoing_bytes.push(byte)
+//                                 }
+//                             }
+//                             hash_bytes.push(
+//                                 AppMessage::new(
+//                                     content_id,
+//                                     true,
+//                                     i as u16,
+//                                     total as u16,
+//                                     Data::new(outgoing_bytes).unwrap(),
+//                                 )
+//                                 .to_cast(),
+//                             )
+//                         }
+//                         eprintln!("duplicating hashes");
+//                         hash_bytes.append(&mut hash_bytes.clone());
+//                         eprintln!("spawning serve_broadcast_origin");
+//                         _executor
+//                             .spawn(serve_broadcast_origin(
+//                                 broadcast_id,
+//                                 Duration::from_millis(512),
+//                                 bcast_send.clone(),
+//                                 hash_bytes,
+//                                 done_send.clone(),
+//                             ))
+//                             .detach();
+//                         // sleep(sleep_time).await;
+//                         Timer::after(sleep_time).await;
+//                         let _done_res = done_recv.recv().await;
+//                         eprintln!("Hashes sent: {}", _done_res.is_ok());
+//                         // TODO
+//                         // 9. SyncMessage::Transform a Link into Data
+
+//                         //10. Send Data chunks via broadcast
+//                         let mut c_data_vec = Vec::with_capacity(data_vec.len());
+//                         let total_parts = total_parts - 1;
+//                         for (i, data) in data_vec.into_iter().enumerate() {
+//                             c_data_vec.push(
+//                                 AppMessage::new(content_id, false, i as u16, total_parts, data)
+//                                     .to_cast(),
+//                             )
+//                         }
+//                         _executor
+//                             .spawn(serve_broadcast_origin(
+//                                 broadcast_id,
+//                                 Duration::from_millis(512),
+//                                 bcast_send.clone(),
+//                                 c_data_vec,
+//                                 done_send.clone(),
+//                             ))
+//                             .detach();
+//                     }
+//                 }
+//             }
+//
 async fn request_content_from_any_neighbor(
     cid: u16,
     hashes: bool,
@@ -3757,44 +3849,44 @@ async fn serve_broadcast_origin(
     let _ = done.send(()).await;
 }
 
-async fn serve_broadcast(
-    c_id: CastID,
-    sleep_time: Duration,
-    cast_data_recv: AReceiver<CastData>,
-    to_app_data_send: ASender<ToAppData>,
-) {
-    eprintln!("Serving broadcast {:?}", c_id);
-    loop {
-        let recv_res = cast_data_recv.try_recv();
-        if let Ok(data) = recv_res {
-            eprintln!("B{:?}: {}", c_id, data);
-            let _ = to_app_data_send
-                .send(ToAppData::BCastData(c_id, data))
-                .await;
-        }
-        // sleep(sleep_time).await;
-        Timer::after(sleep_time).await;
-    }
-}
-async fn serve_multicast(
-    c_id: CastID,
-    sleep_time: Duration,
-    cast_data_recv: AReceiver<CastData>,
-    to_app_data_send: ASender<ToAppData>,
-) {
-    eprintln!("Serving multicast {:?}", c_id);
-    loop {
-        let recv_res = cast_data_recv.try_recv();
-        if let Ok(data) = recv_res {
-            eprintln!("M{:?}: {}", c_id, data);
-            let _ = to_app_data_send
-                .send(ToAppData::MCastData(c_id, data))
-                .await;
-        }
-        // sleep(sleep_time).await;
-        Timer::after(sleep_time).await;
-    }
-}
+// async fn serve_broadcast(
+//     c_id: CastID,
+//     sleep_time: Duration,
+//     cast_data_recv: AReceiver<CastData>,
+//     to_app_data_send: ASender<ToAppData>,
+// ) {
+//     eprintln!("Serving broadcast {:?}", c_id);
+//     loop {
+//         let recv_res = cast_data_recv.try_recv();
+//         if let Ok(data) = recv_res {
+//             eprintln!("B{:?}: {}", c_id, data);
+//             let _ = to_app_data_send
+//                 .send(ToAppData::BCastData(c_id, data))
+//                 .await;
+//         }
+//         // sleep(sleep_time).await;
+//         Timer::after(sleep_time).await;
+//     }
+// }
+// async fn serve_multicast(
+//     c_id: CastID,
+//     sleep_time: Duration,
+//     cast_data_recv: AReceiver<CastData>,
+//     to_app_data_send: ASender<ToAppData>,
+// ) {
+//     eprintln!("Serving multicast {:?}", c_id);
+//     loop {
+//         let recv_res = cast_data_recv.try_recv();
+//         if let Ok(data) = recv_res {
+//             eprintln!("M{:?}: {}", c_id, data);
+//             let _ = to_app_data_send
+//                 .send(ToAppData::MCastData(c_id, data))
+//                 .await;
+//         }
+//         // sleep(sleep_time).await;
+//         Timer::after(sleep_time).await;
+//     }
+// }
 
 async fn serve_unicast_origin(c_id: CastID, sleep_time: Duration, user_res: ASender<CastData>) {
     eprintln!("Originating unicast {:?}", c_id);
@@ -3873,15 +3965,19 @@ impl AppMessage {
     }
 }
 
-fn parse_cast(cast_data: CastData) -> Result<AppMessage, Data> {
+fn parse_cast(cast_data: CastData) -> Result<AppMessage, CastData> {
     // println!("Parse cast: {:?}", cast_data);
-    let mut bytes_iter = cast_data.bytes().into_iter();
-    match bytes_iter.next().unwrap() {
-        0 => {
+    let first = cast_data.first_byte();
+    match first {
+        Some(0) => {
+            let mut bytes_iter = cast_data.bytes().into_iter();
             let is_hash = match bytes_iter.next() {
                 Some(0) => false,
                 Some(255) => true,
-                _other => return Err(Data::empty(0)),
+                _other => {
+                    eprintln!("Error while parsing CastData: expected 0 or 255, got: {_other:?}");
+                    return Err(CastData::empty());
+                }
             };
             let b1 = bytes_iter.next().unwrap();
             let b2 = bytes_iter.next().unwrap();
@@ -3902,10 +3998,8 @@ fn parse_cast(cast_data: CastData) -> Result<AppMessage, Data> {
                 data,
             ))
         }
-        1 => Err(Data::new(bytes_iter.collect()).unwrap()),
-        other => {
-            panic!("TODO parse cast: {}", other);
-        }
+        Some(_other) => Err(cast_data),
+        None => Err(cast_data),
     }
 }
 // TODO: implement various fixed size heaps in order to preserve memory
