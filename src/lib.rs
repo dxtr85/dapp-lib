@@ -2,7 +2,6 @@ use crate::content::data_to_link;
 use crate::message::MAX_AVAIL_APP_MSG_ID;
 use crate::prelude::Manifest;
 use crate::prelude::SyncRequirements;
-use crate::prelude::TransformInfo;
 use crate::search::SearchMsg;
 use crate::search::SwarmLink;
 use crate::storage::load_first_pages_from_disk;
@@ -260,6 +259,7 @@ pub enum LibRequest {
     SetRunningByteSet(SwarmName, u8, ByteSet),
     CustomNeighborRequest(SwarmName, GnomeId, u8, CastData),
     CustomNeighborResponse(SwarmName, GnomeId, u8, CastData),
+    SetHeapAutoForward(SwarmID, bool),
     PeekHeap(SwarmID),
     PopHeap(SwarmID),
     NewStoragePolicy(Vec<(StorageCondition, StoragePolicy)>),
@@ -357,6 +357,7 @@ pub enum ToAppData {
     RunningCapabilitiesReq,
     RunningByteSetsReq,
     MyName(SwarmName),
+    SetHeapAutoForward(bool),
     PeekHeap,
     PopHeap,
     PolicyNotMet(SyncData),
@@ -879,6 +880,13 @@ async fn serve_app_manager<'a>(
                 ToAppMgr::FromApp(LibRequest::PeekHeap(s_id)) => {
                     if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
                         let _ = sender.send(ToAppData::PeekHeap).await;
+                    }
+                }
+                ToAppMgr::FromApp(LibRequest::SetHeapAutoForward(s_id, new_setting)) => {
+                    if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
+                        let _ = sender
+                            .send(ToAppData::SetHeapAutoForward(new_setting))
+                            .await;
                     }
                 }
                 ToAppMgr::FromApp(LibRequest::PopHeap(s_id)) => {
@@ -3396,6 +3404,18 @@ async fn serve_app_data<'a>(
             ToAppData::RunningByteSetsReq => {
                 let _ = to_gnome_sender.send(ToGnome::RunningByteSets).await;
             }
+            ToAppData::SetHeapAutoForward(new_setting) => {
+                app_data.set_heap_auto_forward(new_setting);
+                if new_setting && !app_data.heap.is_empty() {
+                    while let Some((app_msg, orig)) = app_data.heap.pop() {
+                        let _ = to_app_mgr_send
+                            .send(ToAppMgr::FromDatastore(LibResponse::HeapData(
+                                swarm_id, app_msg, orig,
+                            )))
+                            .await;
+                    }
+                }
+            }
             ToAppData::PeekHeap => {
                 if let Some((app_msg, orig)) = app_data.heap.peek() {
                     let _ = to_app_mgr_send
@@ -4986,6 +5006,7 @@ impl ApplicationData {
 
     pub fn set_heap_auto_forward(&mut self, new_setting: bool) {
         // TODO: implement a mechanism to gradually clean up heap
+        eprintln!("heap_auto_forward set to: {}", new_setting);
         self.heap_auto_forward = new_setting;
     }
 
