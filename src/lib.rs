@@ -263,6 +263,7 @@ pub enum LibRequest {
     PeekHeap(SwarmID),
     PopHeap(SwarmID),
     NewStoragePolicy(Vec<(StorageCondition, StoragePolicy)>),
+    SetPinned(SwarmID, bool),
 }
 #[derive(Debug)]
 pub enum LibResponse {
@@ -888,6 +889,10 @@ async fn serve_app_manager<'a>(
                             .send(ToAppData::SetHeapAutoForward(new_setting))
                             .await;
                     }
+                }
+                // ,
+                ToAppMgr::FromApp(LibRequest::SetPinned(s_id, pin_setting)) => {
+                    app_mgr.set_pinned(s_id, pin_setting);
                 }
                 ToAppMgr::FromApp(LibRequest::PopHeap(s_id)) => {
                     if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
@@ -3416,6 +3421,7 @@ async fn serve_app_data<'a>(
                     }
                 }
             }
+
             ToAppData::PeekHeap => {
                 if let Some((app_msg, orig)) = app_data.heap.peek() {
                     let _ = to_app_mgr_send

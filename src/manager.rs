@@ -29,6 +29,7 @@ pub struct SwarmState {
     pub s_id: SwarmID,
     pub app_type: Option<AppType>,
     pub is_synced: bool,
+    pub is_pinned: bool,
     pub is_busy: bool,
     pub is_any_content_marked_by_search_engine: bool,
 }
@@ -37,6 +38,7 @@ impl SwarmState {
         s_id: SwarmID,
         app_type: Option<AppType>,
         is_synced: bool,
+        is_pinned: bool,
         is_busy: bool,
         is_any_content_marked_by_search_engine: bool,
     ) -> Self {
@@ -44,6 +46,7 @@ impl SwarmState {
             s_id,
             app_type,
             is_synced,
+            is_pinned,
             is_busy,
             is_any_content_marked_by_search_engine,
         }
@@ -290,6 +293,14 @@ impl ApplicationManager {
     pub fn get_swarm_state(&self, s_name: &SwarmName) -> Option<SwarmState> {
         self.name_to_id.get(s_name).copied()
     }
+    pub fn set_pinned(&mut self, s_id: SwarmID, pin_setting: bool) {
+        for state in self.name_to_id.values_mut() {
+            if state.s_id == s_id {
+                state.is_pinned = pin_setting;
+                break;
+            }
+        }
+    }
     // pub fn add_pending_read(
     //     &mut self,
     //     s_id: SwarmID,
@@ -358,7 +369,7 @@ impl ApplicationManager {
             e_state.app_type = app_type;
             e_state
         } else {
-            SwarmState::new(s_id, app_type, false, true, false)
+            SwarmState::new(s_id, app_type, false, false, true, false)
         };
         self.name_to_id.insert(s_name.clone(), s_state);
         let empty = SwarmName {
@@ -455,7 +466,10 @@ impl ApplicationManager {
             if s_state.s_id == s_id {
                 eprintln!("{} is now synced", s_id);
                 s_state.is_synced = true;
-                return s_state.is_synced && !s_state.is_busy && self.active_app_data.0 != s_id;
+                return s_state.is_synced
+                    && !s_state.is_busy
+                    && !s_state.is_pinned
+                    && self.active_app_data.0 != s_id;
             }
         }
         false
@@ -464,7 +478,10 @@ impl ApplicationManager {
         for s_state in self.name_to_id.values_mut() {
             if s_state.s_id == s_id {
                 s_state.is_busy = is_busy;
-                return s_state.is_synced && !s_state.is_busy && self.active_app_data.0 != s_id;
+                return s_state.is_synced
+                    && !s_state.is_busy
+                    && !s_state.is_pinned
+                    && self.active_app_data.0 != s_id;
             }
         }
         false
@@ -800,7 +817,7 @@ impl ApplicationManager {
         for (s_name, s_state) in &self.name_to_id {
             if s_state.is_synced
                 && !s_state.is_busy
-                // && s_state.s_id.0 != keep_id.0
+                && !s_state.is_pinned
                 && self.active_app_data.0 != s_state.s_id
             {
                 return Some((s_name.clone(), s_state.s_id));
@@ -825,8 +842,10 @@ impl ApplicationManager {
         // } else {
         //     AppType::Other(0)
         // };
-        self.name_to_id
-            .insert(s_name, SwarmState::new(s_id, app_type, false, true, false));
+        self.name_to_id.insert(
+            s_name,
+            SwarmState::new(s_id, app_type, false, false, true, false),
+        );
         for val in self.name_to_id.values() {
             eprintln!("n2id {} {:?}", val.s_id, val.app_type);
         }
