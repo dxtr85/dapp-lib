@@ -1405,6 +1405,7 @@ impl ContentTree {
             Self::Empty(e_hash) => {
                 let new_hash = data.get_hash();
                 if *e_hash == 0 {
+                    eprintln!("e_hash is 0");
                     *self = if data.is_empty() {
                         ContentTree::Empty(new_hash)
                     } else {

@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 mod app_type;
+mod chopper;
 mod config;
 mod content;
 mod data;
@@ -71,6 +72,7 @@ const SYNC_RESPONSE: u8 = 243;
 
 pub mod prelude {
     pub use crate::app_type::AppType;
+    pub use crate::chopper::{Chopper, Chops};
     pub use crate::config::read_storage_rules_from_file;
     pub use crate::config::write_storage_rules_to_file;
     pub use crate::content::{
@@ -1250,8 +1252,11 @@ async fn serve_app_manager<'a>(
                 ToAppMgr::NeighborsListing(s_id, neighbors) => {
                     let _ = to_user.send(ToApp::Neighbors(s_id, neighbors)).await;
                 }
-                ToAppMgr::ChangeDiameter(_s_id, new_diameter) => {
-                    // TODO: make sure we are sending this to correct swarm!
+                ToAppMgr::ChangeDiameter(s_id, new_diameter) => {
+                    if s_id != app_mgr.active_app_data.0 {
+                        eprintln!("Currently you can only ChangeDiameter to an active swarm");
+                        continue;
+                    }
                     // but for now we just test if this functionality works
                     let _ = app_mgr
                         .active_app_data
@@ -1259,8 +1264,11 @@ async fn serve_app_manager<'a>(
                         .send(ToAppData::ChangeDiameter(new_diameter))
                         .await;
                 }
-                ToAppMgr::ChangeContent(_s_id, c_id, d_type, data_vec) => {
-                    // TODO: make sure we are sending this to correct swarm!
+                ToAppMgr::ChangeContent(s_id, c_id, d_type, data_vec) => {
+                    if s_id != app_mgr.active_app_data.0 {
+                        eprintln!("Currently you can only ChangeContent to an active swarm");
+                        continue;
+                    }
                     // eprintln!("app mgr received CC request, sending to app data");
                     // for data in &data_vec {
                     //     eprintln!("h:{}, d: {:?}", data.get_hash(), data);
@@ -1271,7 +1279,11 @@ async fn serve_app_manager<'a>(
                         .send(ToAppData::ChangeContent(c_id, d_type, data_vec))
                         .await;
                 }
-                ToAppMgr::AppendContent(_s_id, d_type, data) => {
+                ToAppMgr::AppendContent(s_id, d_type, data) => {
+                    if s_id != app_mgr.active_app_data.0 {
+                        eprintln!("Currently you can only AppendContent to an active swarm");
+                        continue;
+                    }
                     let _ = app_mgr
                         .active_app_data
                         .1
@@ -4370,7 +4382,7 @@ impl ApplicationData {
 
     pub fn next_c_id(&self) -> Option<ContentID> {
         let next_id = self.contents.len();
-        if next_id < u16::MAX {
+        if next_id <= u16::MAX {
             Some(next_id)
         } else {
             None
@@ -6054,6 +6066,78 @@ async fn response_task(
             // app_data.save_content_to_disk(c_id, None).await;
             eprintln!("SyncMessageType::ExtendData ");
         }
+        SyncMessageType::AppendMultipleContents => {
+            eprintln!("AppendMultipleContents");
+            let mut next_id = app_data.next_c_id().unwrap();
+            if !requirements.pre_validate(next_id, &app_data) {
+                eprintln!("PRE validation failed for AppendMultipleContents");
+            } else {
+                if requirements.post.len() != 1 {
+                    eprintln!(
+                        "POST validation failed for AppendMultipleContents 1 ({:?})",
+                        requirements.post
+                    );
+                    return;
+                }
+                // TODO:
+                // We need to extract (d_type, root_hash) pairs from data.
+                // Then for each pair we need to append it to Datastore.
+                // And later we have to verify post reqs.
+                let mut bts = data.bytes();
+                let no_of_cids_to_add: u16 = bts.len() as u16;
+                if no_of_cids_to_add % 9 != 0 {
+                    eprintln!("Data len mismatch for AppendMultipleContents");
+                    return;
+                }
+                if next_id + no_of_cids_to_add - 1 > u16::MAX {
+                    eprintln!(
+                        "Not enough room left in Datastore for {} new Contents",
+                        no_of_cids_to_add
+                    );
+                    return;
+                }
+                while !bts.is_empty() {
+                    let d_type = DataType::Data(bts.remove(0));
+                    let h_0 = bts.remove(0);
+                    let h_1 = bts.remove(0);
+                    let h_2 = bts.remove(0);
+                    let h_3 = bts.remove(0);
+                    let h_4 = bts.remove(0);
+                    let h_5 = bts.remove(0);
+                    let h_6 = bts.remove(0);
+                    let h_7 = bts.remove(0);
+                    let root_hash = u64::from_be_bytes([h_0, h_1, h_2, h_3, h_4, h_5, h_6, h_7]);
+                    eprintln!("Content from: {:?} {:?}", d_type, Data::empty(root_hash));
+                    let content = Content::from(d_type, Data::empty(root_hash)).unwrap();
+                    eprintln!("Content hash: {}", content.hash());
+                    // }
+                    // let (recv_id, recv_hash) = requirements.post[0];
+                    // if recv_id == next_id && recv_hash == content.hash() {
+                    // let d_type = content.data_type();
+                    let main_page = Data::empty(0);
+                    let _res = app_data.append(content);
+                    if _res.is_ok() {
+                        eprintln!("Content added: {:?}", _res);
+                        // let hash = app_data.root_hash();
+                        // eprintln!("Sending updated hash: {}", hash);
+                        // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
+                        // eprintln!("Send res: {:?}", res);
+                        if app_data.autosave {
+                            app_data.save_content_to_disk(next_id, None).await;
+                        }
+                        let _to_mgr_res = to_app_mgr_send
+                            .send(ToAppMgr::ContentAdded(swarm_id, next_id, d_type, main_page))
+                            .await;
+                        next_id = app_data.next_c_id().unwrap();
+                    } else {
+                        eprintln!("FAILED to append content: {:?}", _res.err().unwrap());
+                        eprintln!("THIS SHOULD NOT HAPPEN!");
+                        break;
+                    }
+                }
+                // TODO: figure out how/if we should do post validation
+            }
+        }
         SyncMessageType::AppDefined(m_type, c_id, d_id) => {
             //TODO: should we do req check?
             let app_msg = AppDefinedMsg::new(m_type, c_id, d_id, data).unwrap();
@@ -6068,7 +6152,7 @@ async fn response_task(
             } else {
                 app_data.push_heap(app_msg, signed_by);
             }
-            eprintln!("SyncMessageType::UserDefined({})", m_type);
+            eprintln!("SyncMessageType::AppDefined({})", m_type);
         }
     }
 }

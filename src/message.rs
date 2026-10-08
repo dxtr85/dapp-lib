@@ -174,8 +174,43 @@ impl ChangeContentOperation {
 
 #[derive(Clone, Copy, Debug)]
 pub enum SyncMessageType {
-    // SetManifest, // Should this be a separate type?
+    // We want to implement a new mechanism for quick synchronization of large amounts
+    // of data at once. It will theoretically allow for synchronization of about 7 gigabytes
+    // of data per second. It DOES NOT mean that every member will have all the data on his
+    // node within one second. After that one second he will be able to distinguish whether
+    // or not a Data block belongs to given Content or not.
+    //
+    // How this will work:
+    // - AppendMultipleContents is being sent with up to 113 new (DataType, root_hash) pairs;
+    //
+    // - Up to 512 data blocks per ContentID is being sent using a Broadcast/Multicast channel,
+    //   those blocks contain hashes of actual Data blocks belonging to given CID.
+    //   Once a Gnome is in possesion of all those Data hashes he can build a hollow ContentTree
+    //   for each CID and compare it's root hash against that in the Datastore. If they match he
+    //   replaces given CID shell with target ContentTree, without interfering in Datastore
+    //   synchronization, since both shell and ContentTree have the same root hash.
+    //
+    // - Now a Broadcast (or Multicast or Unicast) channels are being used for retrieval
+    //   of missing Data blocks, all without making any changes to synchronization state
+    //    of DataStore.
+    //
+    // Other CIDs, not involved in this procedure, may be changed while the procedure is
+    // in progress.
+    //
+    // For every CID there can be a dedicated *cast channel sending only Data blocks belonging
+    // to that CID.
+    //
+    // Some application specific message can be defined to describe what is about to be sent
+    // into those CIDs, so that user can decide upfront what CID he wants to have on his disk,
+    // and what he will skip, this way he only uses his resources to get what he is interested in.
+    //
+    // If a user is interested in more CIDs than his current hardware/bandwith limitations can
+    // handle he can simply download all the Data hashes for his CIDs of interest and store
+    // hollow ContentTrees. Then he can ask his neighbors to send him missing Data at his own pace.
+    //
+    //
     AppendContent(DataType),
+    AppendMultipleContents,
     ChangeContent(ContentID, DataType, ChangeContentOperation),
     AppendData(ContentID),
     AppendShelledDatas(ContentID),
@@ -255,7 +290,7 @@ impl SyncMessageType {
                 let d_id = u16::from_be_bytes([b1, b2]);
                 SyncMessageType::ExtendData(c_id, d_id)
             }
-
+            247 => SyncMessageType::AppendMultipleContents,
             other => {
                 let b1 = bytes.drain(0..1).next().unwrap();
                 let b2 = bytes.drain(0..1).next().unwrap();
@@ -308,6 +343,10 @@ impl SyncMessageType {
                 let [b1, b2] = c_id.to_be_bytes();
                 let [b3, b4] = d_id.to_be_bytes();
                 vec![248, b1, b2, b3, b4]
+            }
+
+            SyncMessageType::AppendMultipleContents => {
+                vec![247]
             }
 
             SyncMessageType::AppDefined(other, c_id, d_id) => {
