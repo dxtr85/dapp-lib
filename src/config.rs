@@ -34,7 +34,7 @@ impl Configuration {
         let mut search = dir.join("search");
         let mut autosave = false;
         let mut max_connected_swarms = 8;
-        let mut upload_bandwidth = 8192;
+        let mut upload_bandwidth = 8192000;
         let mut store_data_on_disk = vec![(StorageCondition::Default, StoragePolicy::All)];
         let mut listen_port = None;
         let mut listen_port_ipv6 = None;

@@ -1,7 +1,9 @@
 use crate::content::ContentTree;
 pub use crate::data::Data;
+use crate::{ToAppData, ToAppMgr};
+use gnome::prelude::{CastData, CastID, SwarmID};
 use smol::channel as achannel;
-use smol::channel::Receiver as AReceiver;
+// use smol::channel::Receiver as AReceiver;
 use smol::channel::Sender as ASender;
 use smol::fs::File;
 use smol::io::{AsyncReadExt as ReadExt, BufReader};
@@ -44,7 +46,7 @@ impl Chopper {
         }
     }
 
-    pub async fn chop_it(&self, data_sender: ASender<Data>) -> Vec<Chops> {
+    pub async fn chop_it(&self, to_app_data: ASender<ToAppData>, cast_id: CastID) -> Vec<Chops> {
         let max_contents_in_chop = 113;
         let mut chop_no = 0;
         let mut content_no: u8 = 0;
@@ -60,9 +62,6 @@ impl Chopper {
         let mut output: Vec<Chops> = vec![];
 
         let mut file = BufReader::new(File::open(self.0.clone()).await.unwrap());
-        let _ = data_sender.send(Data::empty(3)).await;
-        let _ = data_sender.send(Data::empty(2)).await;
-        let _ = data_sender.send(Data::empty(1)).await;
         let mut counter = 0;
         let mut force_hash_conversion = false;
         while !no_more_bytes_to_read {
@@ -71,12 +70,6 @@ impl Chopper {
                 // ContentTree can store only up to u16::MAX pages.
                 eprintln!("CT full: {}", c_tree.len() == u16::MAX);
                 force_hash_conversion = true;
-                let _ = data_sender.send(Data::empty(0)).await;
-                let _ = data_sender.send(Data::empty(0)).await;
-                let _ = data_sender.send(Data::empty(0)).await;
-                let _ = data_sender.send(Data::empty(3)).await;
-                let _ = data_sender.send(Data::empty(2)).await;
-                let _ = data_sender.send(Data::empty(1)).await;
             }
             if page_no > 0 && page_no % 128 == 0 || force_hash_conversion {
                 if force_hash_conversion {
@@ -161,7 +154,15 @@ impl Chopper {
                 break;
             }
             let hsh = dta.get_hash();
-            let _ = data_sender.send(dta).await;
+            let [p0, p1] = page_no.to_be_bytes();
+            let mut c_vec = vec![
+                'd' as u8, 'a' as u8, 't' as u8, 'a' as u8, content_no, p0, p1,
+            ];
+            c_vec.append(&mut dta.bytes());
+            let c_data = CastData::new(c_vec).unwrap();
+            let msg = ToAppData::BroadcastSend(cast_id, c_data);
+            let _ = to_app_data.send(msg).await;
+
             let apd_res = c_tree.append(Data::empty(hsh));
             if apd_res.is_ok() {
                 hash_container.extend(hsh.to_be_bytes());
@@ -178,9 +179,6 @@ impl Chopper {
             }
         }
 
-        let _ = data_sender.send(Data::empty(0)).await;
-        let _ = data_sender.send(Data::empty(0)).await;
-        let _ = data_sender.send(Data::empty(0)).await;
         // TODO: include remainder hashes
         if !hash_container.is_empty() {
             let hdta = Data::new(hash_container).unwrap();
@@ -207,4 +205,111 @@ impl Chopper {
 
         output
     }
+}
+pub async fn chopping_task(
+    swarm_id: SwarmID,
+    filepath: PathBuf,
+    to_app_mgr: achannel::Sender<ToAppMgr>,
+    to_app_data: achannel::Sender<ToAppData>,
+    data_cast_id: CastID,
+    hash_cast_id: CastID,
+) {
+    eprintln!("chopping_task {:?}", filepath);
+    let chopper = Chopper::new(filepath).unwrap();
+    // Chopper::new(PathBuf::new().join("/home/dxtr/Downloads/testfile")).unwrap();
+    // Chopper::new(PathBuf::new().join("/home/dxtr/Downloads/README.md")).unwrap();
+    // Chopper::new(PathBuf::new().join("/home/dxtr/Downloads/pompka.mp4")).unwrap();
+    // Chopper::new(PathBuf::new().join("/home/dxtr/Downloads/Mira-latest.AppImage")).unwrap();
+    // TODO: Test it out with a file that is at least 7.3 GB large
+    //       (after everything is moved to separate async tasks).
+    eprint!("Now we apply chop_it(ASender):");
+    // let (send, _recv) = unbounded();
+
+    // TODO: Reading from file should also be done from a separate task.
+    let mut chops = chopper.chop_it(to_app_data.clone(), data_cast_id).await;
+    // TODO: handle resulting chops: put root_hashes in SyncMultipleContents.
+    // TODO: decide what to do with leaf hashes - maybe we should send
+    //       them in a separate BCast?
+    // TODO: should leaf hashes be sent using a pair: (empty Data containing
+    //       actual Data's index, actual Data)? This way Gnomes that join
+    //       a BCast in the middle of transmission will be able to gather
+    //       at least some of the hashes.
+    //       Probably more efficient is to send a bunch of preamble
+    //       Data::empty(33), Data::empty(22), Data::empty(11),
+    //       Data::empyt(c_no),
+    //       Data::empty(3), Data::empty(2), Data::empty(1),
+    //       up to 512 Data blocks with Leaf Hashes for c_no
+    //       Data::empty(0), Data::empty(0), Data::empty(0),
+    //       And then repeat for next content, increasing c_no += 1.
+    //       This broadcast could repeat this transmission in a loop
+    //       for some time, so that everyone is eventually synced.
+    eprintln!(
+        "And we got: {}, {} ",
+        chops.len(),
+        // chops[0].root_hashes,
+        chops[0].leaf_hashes.len()
+    );
+    let mut root_hashes: Vec<Data> = vec![];
+
+    // <chop no < content no < page no >>>
+    let mut leaf_hashes: Vec<Vec<Vec<Data>>> = vec![];
+    while !chops.is_empty() {
+        let chop = chops.remove(0);
+        root_hashes.push(chop.root_hashes);
+        leaf_hashes.push(chop.leaf_hashes);
+    }
+    let _ = to_app_mgr
+        .send(ToAppMgr::FromDatastore(crate::LibResponse::ChoppingDone(
+            swarm_id,
+            data_cast_id,
+            hash_cast_id,
+            root_hashes,
+        )))
+        .await;
+    if leaf_hashes.is_empty() {
+        eprintln!("No leaf_hashes?!");
+        return;
+    }
+    let chop_count = (leaf_hashes.len() - 1) as u8;
+    for (chop_no, chop_hsh) in leaf_hashes.into_iter().enumerate() {
+        let content_count = (chop_hsh.len() - 1) as u8;
+        for (content_no, cnt_hash) in chop_hsh.into_iter().enumerate() {
+            let page_count = (cnt_hash.len() - 1) as u16;
+            for (page_no, bottom_hashes) in cnt_hash.into_iter().enumerate() {
+                let [p0, p1] = (page_no as u16).to_be_bytes();
+                let [pc0, pc1] = page_count.to_be_bytes();
+                let mut h_vec = vec![
+                    'h' as u8,
+                    'a' as u8,
+                    's' as u8,
+                    'h' as u8,
+                    chop_no as u8,
+                    chop_count,
+                    content_no as u8,
+                    content_count,
+                    p0,
+                    p1,
+                    pc0,
+                    pc1,
+                ];
+                h_vec.append(&mut bottom_hashes.bytes());
+                let h_data = CastData::new(h_vec).unwrap();
+                let msg = ToAppData::BroadcastSend(hash_cast_id, h_data);
+                let _ = to_app_data.send(msg).await;
+            }
+        }
+    }
+
+    // TODO: start a broadcasting channel and push file Data there
+    //       (preferably as a separate async task)
+    // TODO: Data will be broadcasted before CID placeholders are
+    // synced in Datastore, so we need a way to store them somewhere
+    // while let Ok(data) = _recv.try_recv() {
+    //     if data.is_empty() {
+    //         eprintln!("Empty data: {}", data.get_hash());
+    //     } else {
+    //         eprintln!("Data: {}", data.get_hash());
+    //     }
+    // }
+    // eprintln!("And we got: {:?}", chops);
 }

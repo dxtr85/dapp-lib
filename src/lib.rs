@@ -1,3 +1,4 @@
+use crate::chopper::chopping_task;
 use crate::content::data_to_link;
 use crate::message::MAX_AVAIL_APP_MSG_ID;
 use crate::prelude::Manifest;
@@ -72,7 +73,7 @@ const SYNC_RESPONSE: u8 = 243;
 
 pub mod prelude {
     pub use crate::app_type::AppType;
-    pub use crate::chopper::{Chopper, Chops};
+    pub use crate::chopper::{chopping_task, Chopper, Chops};
     pub use crate::config::read_storage_rules_from_file;
     pub use crate::config::write_storage_rules_to_file;
     pub use crate::content::{
@@ -184,6 +185,7 @@ pub enum ToApp {
     RunningByteSets(Vec<(u8, ByteSet)>),
     HeapData(SwarmID, AppDefinedMsg, GnomeId),
     HeapEmpty(SwarmID),
+    ChoppingDone(SwarmID, CastID, CastID, Vec<(u8, u8, u64)>), //TODO: build a structure for a more user friendly presentation
     CustomNeighborRequest(SwarmID, GnomeId, u8, CastData),
     CustomNeighborResponse(SwarmID, GnomeId, u8, CastData),
     PolicyNotMet(SwarmID, SyncMessageType, Data),
@@ -266,6 +268,7 @@ pub enum LibRequest {
     PopHeap(SwarmID),
     NewStoragePolicy(Vec<(StorageCondition, StoragePolicy)>),
     SetPinned(SwarmID, bool),
+    ChopFile(SwarmID, PathBuf, CastID, CastID),
 }
 #[derive(Debug)]
 pub enum LibResponse {
@@ -288,6 +291,7 @@ pub enum LibResponse {
     HeapData(SwarmID, AppDefinedMsg, GnomeId),
     HeapEmpty(SwarmID),
     PolicyNotMet(SwarmID, SyncMessageType, Data),
+    ChoppingDone(SwarmID, CastID, CastID, Vec<Data>),
     CustomNeighborRequest(SwarmID, GnomeId, u8, CastData),
     CustomNeighborResponse(SwarmID, GnomeId, u8, CastData),
 }
@@ -955,6 +959,41 @@ async fn serve_app_manager<'a>(
                 ToAppMgr::FromDatastore(LibResponse::HeapEmpty(s_id)) => {
                     eprintln!("AppMgr sending HeapEmpty to user",);
                     let _ = to_user.send(ToApp::HeapEmpty(s_id)).await;
+                }
+                ToAppMgr::FromDatastore(LibResponse::ChoppingDone(
+                    s_id,
+                    data_cst_id,
+                    hash_cst_id,
+                    mut c_no_hash_pairs,
+                )) => {
+                    let mut processed_pairs: Vec<(u8, u8, u64)> =
+                        Vec::with_capacity(c_no_hash_pairs.len());
+                    let mut chunk_no: u8 = 0;
+                    while !c_no_hash_pairs.is_empty() {
+                        let data = c_no_hash_pairs.remove(0);
+                        let mut d_bytes = data.bytes();
+                        let c_no = d_bytes.remove(0);
+                        let h0 = d_bytes.remove(0);
+                        let h1 = d_bytes.remove(0);
+                        let h2 = d_bytes.remove(0);
+                        let h3 = d_bytes.remove(0);
+                        let h4 = d_bytes.remove(0);
+                        let h5 = d_bytes.remove(0);
+                        let h6 = d_bytes.remove(0);
+                        let h7 = d_bytes.remove(0);
+                        let root_hash = u64::from_be_bytes([h0, h1, h2, h3, h4, h5, h6, h7]);
+                        processed_pairs.push((chunk_no, c_no, root_hash));
+                        chunk_no += 1;
+                    }
+                    let _ = to_user
+                        .send(ToApp::ChoppingDone(
+                            s_id,
+                            data_cst_id,
+                            hash_cst_id,
+                            processed_pairs,
+                        ))
+                        .await;
+                    //TODO
                 }
                 ToAppMgr::FromDatastore(LibResponse::CustomNeighborRequest(
                     s_id,
@@ -2483,6 +2522,20 @@ async fn serve_app_manager<'a>(
                             .update_storage_policy_for(&s_name, &config.storage_rules, cid_vec)
                             .await;
                     }
+                }
+                ToAppMgr::FromApp(LibRequest::ChopFile(s_id, p_buf, d_cast_id, h_cast_id)) => {
+                    // TODO
+                    let to_d_store = app_mgr.app_data_store.get(&s_id).unwrap();
+                    executor
+                        .spawn(chopping_task(
+                            s_id,
+                            p_buf,
+                            app_mgr.to_app_mgr.clone(),
+                            to_d_store.clone(),
+                            d_cast_id,
+                            h_cast_id,
+                        ))
+                        .detach();
                 }
                 ToAppMgr::Quit => {
                     // eprintln!("\n\n\nQUIT\n\n\n");

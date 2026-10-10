@@ -244,7 +244,7 @@ pub struct ApplicationManager {
     read_state: ReadState,
     to_gnome_mgr: Sender<ToGnomeManager>,
     to_user: Sender<ToApp>,
-    to_app_mgr: Sender<ToAppMgr>,
+    pub to_app_mgr: Sender<ToAppMgr>,
 }
 
 impl ApplicationManager {
