@@ -48,7 +48,7 @@ impl Chopper {
 
     pub async fn chop_it(&self, to_app_data: ASender<ToAppData>, cast_id: CastID) -> Vec<Chops> {
         let max_contents_in_chop = 113;
-        let mut chop_no = 0;
+        let mut chop_no: u8 = 0;
         let mut content_no: u8 = 0;
         let mut page_no = 0;
         // let mut data_no = 0;
@@ -154,9 +154,11 @@ impl Chopper {
                 break;
             }
             let hsh = dta.get_hash();
+            let len = dta.len() as u16;
+            let [l0, l1] = len.to_be_bytes();
             let [p0, p1] = page_no.to_be_bytes();
             let mut c_vec = vec![
-                'd' as u8, 'a' as u8, 't' as u8, 'a' as u8, content_no, p0, p1,
+                'd' as u8, 'a' as u8, 't' as u8, 'a' as u8, chop_no, content_no, p0, p1, l0, l1,
             ];
             c_vec.append(&mut dta.bytes());
             let c_data = CastData::new(c_vec).unwrap();
@@ -206,6 +208,118 @@ impl Chopper {
         output
     }
 }
+pub enum ChopData {
+    LeafHashes {
+        chop_nr: u8,
+        chop_count: u8,
+        content_nr: u8,
+        content_count: u8,
+        page_nr: u16,
+        page_count: u16,
+        data: Data,
+    },
+    LeafData {
+        chop_nr: u8,
+        content_nr: u8,
+        page_nr: u16,
+        data: Data,
+    },
+}
+pub fn extract_chop_data(cast_data: CastData) -> Result<ChopData, CastData> {
+    // TODO: add more assertions
+    // Do not allow empty or oversize Data
+    // eprintln!("in extract_chap_data");
+    let orig_len = cast_data.len();
+    if orig_len < 4 {
+        return Err(cast_data);
+    }
+
+    let mut bytes = cast_data.bytes();
+    let b1 = bytes.remove(0);
+    let b2 = bytes.remove(0);
+    let b3 = bytes.remove(0);
+    let b4 = bytes.remove(0);
+    // eprintln!("{} {} {} {} len: {}", b1, b2, b3, b4, orig_len);
+
+    if b1 == 'h' as u8 && b2 == 'a' as u8 && b3 == 's' as u8 && b4 == 'h' as u8 {
+        // eprintln!("hash msg");
+        if orig_len > 1038 || orig_len < 15 {
+            let mut orig_vec = vec![b1, b2, b3, b4];
+            orig_vec.append(&mut bytes);
+            return Err(CastData::new(orig_vec).unwrap());
+        }
+        let chop_nr = bytes.remove(0);
+        let chop_count = bytes.remove(0);
+        let content_nr = bytes.remove(0);
+        let content_count = bytes.remove(0);
+        let p0 = bytes.remove(0);
+        let p1 = bytes.remove(0);
+        let pc0 = bytes.remove(0);
+        let pc1 = bytes.remove(0);
+        let l0 = bytes.remove(0);
+        let l1 = bytes.remove(0);
+        let len: u16 = u16::from_be_bytes([l0, l1]);
+        if bytes.len() as u16 != len {
+            let mut orig_vec = vec![
+                b1,
+                b2,
+                b3,
+                b4,
+                chop_nr,
+                chop_count,
+                content_nr,
+                content_count,
+                p0,
+                p1,
+                pc0,
+                pc1,
+                l0,
+                l1,
+            ];
+            orig_vec.append(&mut bytes);
+            return Err(CastData::new(orig_vec).unwrap());
+        }
+        Ok(ChopData::LeafHashes {
+            chop_nr,
+            chop_count,
+            content_nr,
+            content_count,
+            page_nr: u16::from_be_bytes([p0, p1]),
+            page_count: u16::from_be_bytes([pc0, pc1]),
+            data: Data::new(bytes).unwrap(),
+        })
+    } else if b1 == 'd' as u8 && b2 == 'a' as u8 && b3 == 't' as u8 && b4 == 'a' as u8 {
+        if orig_len > 1034 || orig_len < 11 {
+            let mut orig_vec = vec![b1, b2, b3, b4];
+            orig_vec.append(&mut bytes);
+            return Err(CastData::new(orig_vec).unwrap());
+        }
+        let chop_nr = bytes.remove(0);
+        let content_nr = bytes.remove(0);
+        let p0 = bytes.remove(0);
+        let p1 = bytes.remove(0);
+        let l0 = bytes.remove(0);
+        let l1 = bytes.remove(0);
+        let len: u16 = u16::from_be_bytes([l0, l1]);
+        if bytes.len() as u16 != len {
+            // eprintln!("data {}!= {}", bytes.len(), len);
+            let mut orig_vec = vec![b1, b2, b3, b4, chop_nr, content_nr, p0, p1, l0, l1];
+            orig_vec.append(&mut bytes);
+            return Err(CastData::new(orig_vec).unwrap());
+        }
+        Ok(ChopData::LeafData {
+            chop_nr,
+            content_nr,
+            page_nr: u16::from_be_bytes([p0, p1]),
+            data: Data::new(bytes).unwrap(),
+        })
+    } else {
+        let mut orig_vec = vec![b1, b2, b3, b4];
+        orig_vec.append(&mut bytes);
+        return Err(CastData::new(orig_vec).unwrap());
+    }
+}
+
 pub async fn chopping_task(
     swarm_id: SwarmID,
     filepath: PathBuf,
@@ -278,6 +392,7 @@ pub async fn chopping_task(
             for (page_no, bottom_hashes) in cnt_hash.into_iter().enumerate() {
                 let [p0, p1] = (page_no as u16).to_be_bytes();
                 let [pc0, pc1] = page_count.to_be_bytes();
+                let [l0, l1] = (bottom_hashes.len() as u16).to_be_bytes();
                 let mut h_vec = vec![
                     'h' as u8,
                     'a' as u8,
@@ -291,6 +406,8 @@ pub async fn chopping_task(
                     p1,
                     pc0,
                     pc1,
+                    l0,
+                    l1,
                 ];
                 h_vec.append(&mut bottom_hashes.bytes());
                 let h_data = CastData::new(h_vec).unwrap();

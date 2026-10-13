@@ -73,7 +73,7 @@ const SYNC_RESPONSE: u8 = 243;
 
 pub mod prelude {
     pub use crate::app_type::AppType;
-    pub use crate::chopper::{chopping_task, Chopper, Chops};
+    pub use crate::chopper::{chopping_task, extract_chop_data, ChopData, Chopper, Chops};
     pub use crate::config::read_storage_rules_from_file;
     pub use crate::config::write_storage_rules_to_file;
     pub use crate::content::{
