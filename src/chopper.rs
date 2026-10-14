@@ -208,6 +208,8 @@ impl Chopper {
         output
     }
 }
+
+#[derive(Debug)]
 pub enum ChopData {
     LeafHashes {
         chop_nr: u8,
@@ -224,6 +226,75 @@ pub enum ChopData {
         page_nr: u16,
         data: Data,
     },
+}
+impl ChopData {
+    pub fn is_hashes(&self) -> bool {
+        matches!(self, ChopData::LeafHashes { .. })
+    }
+    pub fn unpack_hashes(self) -> Result<(u8, u8, u8, u8, u16, u16, Data), ChopData> {
+        if let ChopData::LeafHashes {
+            chop_nr,
+            chop_count,
+            content_nr,
+            content_count,
+            page_nr,
+            page_count,
+            data,
+        } = self
+        {
+            return Ok((
+                chop_nr,
+                chop_count,
+                content_nr,
+                content_count,
+                page_nr,
+                page_count,
+                data,
+            ));
+        } else {
+            return Err(self);
+        }
+    }
+    pub fn is_last_hash(&self) -> bool {
+        if let ChopData::LeafHashes {
+            page_nr,
+            page_count,
+            ..
+        } = self
+        {
+            if page_nr == page_count {
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
+
+    pub fn is_data(&self) -> bool {
+        matches!(self, ChopData::LeafData { .. })
+    }
+    pub fn unpack_data(self) -> Result<(u8, u8, u16, Data), ChopData> {
+        if let ChopData::LeafData {
+            chop_nr,
+            content_nr,
+            page_nr,
+            data,
+        } = self
+        {
+            return Ok((chop_nr, content_nr, page_nr, data));
+        } else {
+            return Err(self);
+        }
+    }
+    pub fn data_hash(&self) -> Option<u64> {
+        if let ChopData::LeafData { data, .. } = self {
+            Some(data.get_hash())
+        } else {
+            None
+        }
+    }
 }
 pub fn extract_chop_data(cast_data: CastData) -> Result<ChopData, CastData> {
     // TODO: add more assertions

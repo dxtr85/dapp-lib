@@ -1,4 +1,5 @@
 use crate::chopper::chopping_task;
+use crate::chopper::ChopData;
 use crate::content::data_to_link;
 use crate::message::MAX_AVAIL_APP_MSG_ID;
 use crate::prelude::Manifest;
@@ -269,6 +270,7 @@ pub enum LibRequest {
     NewStoragePolicy(Vec<(StorageCondition, StoragePolicy)>),
     SetPinned(SwarmID, bool),
     ChopFile(SwarmID, PathBuf, CastID, CastID),
+    StoreChopData(SwarmID, Vec<ChopData>),
 }
 #[derive(Debug)]
 pub enum LibResponse {
@@ -370,6 +372,7 @@ pub enum ToAppData {
     PolicyNotMet(SyncData),
     PolicyNotMetRcfg(u8, SyncData),
     SetStoragePolicy(PathBuf, StoragePolicy, Vec<u16>),
+    StoreChopData(Vec<ChopData>),
     Terminate,
 }
 struct PartialHashes {
@@ -948,6 +951,12 @@ async fn serve_app_manager<'a>(
                                 ))
                                 .detach();
                         }
+                    }
+                }
+                ToAppMgr::FromApp(LibRequest::StoreChopData(s_id, ch_data)) => {
+                    //TODO: find proper recipient & send
+                    if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
+                        let _ = sender.send(ToAppData::StoreChopData(ch_data)).await;
                     }
                 }
                 ToAppMgr::FromDatastore(LibResponse::HeapData(s_id, app_msg, signed_by)) => {
@@ -3532,6 +3541,46 @@ async fn serve_app_data<'a>(
             ToAppData::SetStoragePolicy(s_path, pol, c_ids) => {
                 app_data.set_new_storage_policy(s_path, pol, c_ids);
             }
+            ToAppData::StoreChopData(ch_data_vec) => {
+                //TODO
+                eprintln!("We've got some Data to store: {}", ch_data_vec.len());
+                let store_output = app_data.store_chop_data(ch_data_vec);
+                if let Some((c_id, c_tree)) = store_output {
+                    if let Ok((app_t, e_hash)) = app_data.contents.get_root_content_typed_hash(c_id)
+                    {
+                        if app_t != DataType::Link && e_hash == c_tree.hash() {
+                            let used_pages = {
+                                if let Ok(data) = c_tree.read(0) {
+                                    if data.is_empty() {
+                                        1
+                                    } else {
+                                        c_tree.len()
+                                    }
+                                } else {
+                                    0
+                                }
+                            };
+                            eprintln!(
+                                "We update Datastore, CID:{} mem:{} len:{}",
+                                c_id,
+                                used_pages,
+                                c_tree.len()
+                            );
+                            if used_pages > 1 {
+                                app_data
+                                    .save_content_to_disk(
+                                        c_id,
+                                        Some(Content::Data(app_t, used_pages, c_tree.clone())),
+                                    )
+                                    .await;
+                            }
+                            let _ = app_data
+                                .contents
+                                .update(c_id, Content::Data(app_t, used_pages, c_tree));
+                        }
+                    }
+                }
+            }
             ToAppData::Terminate => {
                 eprintln!("AppData: Terminate");
                 // TODO: determine whether or not we want to store this Swarm on disk
@@ -4255,6 +4304,256 @@ impl Heap {
         }
     }
 }
+pub struct ShelfData {
+    // A place to store ContentTrees (hollow as well as filled),
+    // those get build from ChopData that comes from BCast by default
+    // TODO: there can be multiple scenarios with LeafHashes, LeafData
+    // and AppendMultipleContents arriving in different order.
+    // We should be able to handle all of them.
+    // If a hollow CTree gets transfered to DataStore,
+    // we clone it, and add a pointer to which ContentID it was transferred.
+    // Now when LeafData arrives we fill shelved CTree. When that tree is
+    // filled we move it to Datastore.
+    // When SyncMessage::AppendMultipleContents comes, shelf stores
+    // a mapping of root_hash -> CID, so that when we have built CTree
+    // we know where to put it, filled or hollow (we might decide not to
+    // fill that content with Page data just yet).
+    // ShelfData is in memory only, so it is not preserved when application is terminated.
+    pub mapping: HashMap<u64, (Option<ContentID>, ContentTree, u16)>,
+
+    // When LeafData arrives it searches for CTree using lookup HMap.
+    // Then it asks for first Leaf/Page hash and compares it against it's Data hash,
+    // if they match, following Data blocks go into this CTree.
+    // If no CTree matches, entire Vector goes into waiting.
+    // Once lookup table is extended with a new pointer, waiting list is being
+    // scanned in search for a match.
+    pub lookup: HashMap<(u8, u8), Vec<(u64, u64)>>,
+    pub waiting: Vec<Vec<ChopData>>,
+}
+impl ShelfData {
+    pub fn new() -> Self {
+        ShelfData {
+            mapping: HashMap::new(),
+            lookup: HashMap::new(),
+            waiting: vec![],
+        }
+    }
+    pub fn empty_cid_added(&mut self, cid: u16, root_hash: u64) -> Option<ContentTree> {
+        eprintln!("Updating shelf");
+        if self.mapping.contains_key(&root_hash) {
+            // TODO: return CTree
+            let (_cid_o, c_tree, pg_missing) = self.mapping.remove(&root_hash).unwrap();
+            if pg_missing > 0 {
+                eprintln!(
+                    "Still not filled {} from BCast, keeping on shelf",
+                    pg_missing
+                );
+                let _ = self
+                    .mapping
+                    .insert(root_hash, (Some(cid), c_tree.clone(), pg_missing));
+            }
+            return Some(c_tree);
+        } else {
+            let _ = self.mapping.insert(
+                root_hash,
+                (Some(cid), ContentTree::Empty(root_hash), u16::MAX),
+            );
+            return None;
+        }
+    }
+    pub fn store(&mut self, mut data: Vec<ChopData>) -> Option<(ContentID, ContentTree)> {
+        // we assume chops come in order & belong to the same resulting CTree
+        // TODO: add support for chops that come out of order and/or are mixed types
+        if data.is_empty() {
+            return None;
+        }
+        let first = data.remove(0);
+        if first.is_hashes() {
+            //TODO
+            let (f_ch_nr, f_ch_ct, f_cnt_nr, f_cnt_ct, f_pg_nr, f_pg_ct, f_data) =
+                first.unpack_hashes().unwrap();
+            if f_pg_nr == 0 && data.len() as u16 >= f_pg_ct {
+                let mut pg_idx = 1;
+                let mut hbts = f_data.bytes();
+                let b0 = hbts.remove(0);
+                let b1 = hbts.remove(0);
+                let b2 = hbts.remove(0);
+                let b3 = hbts.remove(0);
+                let b4 = hbts.remove(0);
+                let b5 = hbts.remove(0);
+                let b6 = hbts.remove(0);
+                let b7 = hbts.remove(0);
+
+                let f_hash = u64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7]);
+                let mut c_tree = ContentTree::Filled(Data::empty(f_hash));
+
+                while !hbts.is_empty() {
+                    let b0 = hbts.remove(0);
+                    let b1 = hbts.remove(0);
+                    let b2 = hbts.remove(0);
+                    let b3 = hbts.remove(0);
+                    let b4 = hbts.remove(0);
+                    let b5 = hbts.remove(0);
+                    let b6 = hbts.remove(0);
+                    let b7 = hbts.remove(0);
+
+                    let p_hash = u64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7]);
+                    c_tree.append(Data::empty(p_hash));
+                }
+                while !data.is_empty() {
+                    let hs_data = data.remove(0);
+                    let (ch_nr, ch_ct, cnt_nr, cnt_ct, pg_nr, pg_ct, h_data) =
+                        hs_data.unpack_hashes().unwrap();
+                    if ch_nr == f_ch_nr
+                        && ch_ct == f_ch_ct
+                        && cnt_nr == f_cnt_nr
+                        && cnt_ct == f_cnt_ct
+                        && pg_ct == f_pg_ct
+                        && pg_nr == f_pg_nr + pg_idx
+                    {
+                        let mut hbts = h_data.bytes();
+                        while !hbts.is_empty() {
+                            let b0 = hbts.remove(0);
+                            let b1 = hbts.remove(0);
+                            let b2 = hbts.remove(0);
+                            let b3 = hbts.remove(0);
+                            let b4 = hbts.remove(0);
+                            let b5 = hbts.remove(0);
+                            let b6 = hbts.remove(0);
+                            let b7 = hbts.remove(0);
+
+                            let p_hash = u64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7]);
+                            c_tree.append(Data::empty(p_hash));
+                        }
+                    }
+                    if pg_nr == pg_ct && data.is_empty() {
+                        eprintln!("We are done with those chops");
+                    }
+                    pg_idx += 1;
+                }
+                let ct_hash = c_tree.hash();
+                let fst_hash = c_tree.get_data_hash(0).unwrap();
+                if let Some(d_vec) = self.lookup.get_mut(&(f_ch_nr, f_cnt_nr)) {
+                    d_vec.push((ct_hash, fst_hash));
+                } else {
+                    self.lookup
+                        .insert((f_ch_nr, f_cnt_nr), vec![(ct_hash, fst_hash)]);
+                }
+                // data in it
+                let removed = self.mapping.remove(&ct_hash);
+                let ct_len = c_tree.len();
+                if let Some((cid_opt, _ex_ct, ex_len)) = removed {
+                    // TODO: make sure we do not overwrite CTree with partial
+                    // if ex_ct.is_empty() {
+                    if ex_len > c_tree.len() {
+                        let mut return_val = None;
+                        if let Some(cid) = cid_opt {
+                            // we already have this Content in Datastore
+                            return_val = Some((cid, c_tree.clone()));
+                        }
+                        self.mapping.insert(ct_hash, (cid_opt, c_tree, ct_len));
+                        return return_val;
+                    }
+                } else {
+                    self.mapping.insert(ct_hash, (None, c_tree, ct_len));
+                }
+            } else {
+                // TODO: we need to reorder these chops somehow
+                data.insert(
+                    0,
+                    ChopData::LeafHashes {
+                        chop_nr: f_ch_nr,
+                        chop_count: f_ch_ct,
+                        content_nr: f_cnt_nr,
+                        content_count: f_cnt_ct,
+                        page_nr: f_pg_nr,
+                        page_count: f_pg_ct,
+                        data: f_data,
+                    },
+                );
+                self.waiting.push(data);
+                return None;
+            }
+        } else if first.is_data() {
+            //TODO
+            let (ch_nr, cnt_nr, pg_nr, f_data) = first.unpack_data().unwrap();
+            let mut our_hash = 0;
+            let f_hash = f_data.get_hash();
+            if let Some(p_vec) = self.lookup.get(&(ch_nr, cnt_nr)) {
+                for (ct_hash, fst_hash) in p_vec {
+                    if *fst_hash == f_hash {
+                        our_hash = *ct_hash;
+                        break;
+                    }
+                }
+            } else {
+                data.insert(
+                    0,
+                    ChopData::LeafData {
+                        chop_nr: ch_nr,
+                        content_nr: cnt_nr,
+                        page_nr: pg_nr,
+                        data: f_data,
+                    },
+                );
+                self.waiting.push(data);
+                return None;
+            }
+            if our_hash == 0 {
+                data.insert(
+                    0,
+                    ChopData::LeafData {
+                        chop_nr: ch_nr,
+                        content_nr: cnt_nr,
+                        page_nr: pg_nr,
+                        data: f_data,
+                    },
+                );
+                self.waiting.push(data);
+                return None;
+            }
+            //TODO: here we insert
+            let (cid_opt, c_tree, pg_missing) = self.mapping.get_mut(&our_hash).unwrap();
+            let f_hsh = c_tree.get_data_hash(0).unwrap();
+            if f_hsh == f_hash {
+                if let Ok(old_p) = c_tree.replace(0, f_data) {
+                    if old_p.is_empty() {
+                        *pg_missing -= 1;
+                    }
+                }
+            } else {
+                eprintln!("PG0  New hash: {} != {} old one", f_hash, f_hsh);
+            }
+            while !data.is_empty() {
+                // We can pop data, since it is indexed anyway
+                let cp_data = data.pop().unwrap();
+                let (_ch_nr, _cnt_nr, pg_nr, p_data) = cp_data.unpack_data().unwrap();
+                let e_hsh = c_tree.get_data_hash(pg_nr).unwrap(); //{
+                let new_hash = p_data.get_hash();
+                if e_hsh == new_hash {
+                    if let Ok(old_p) = c_tree.replace(pg_nr, p_data) {
+                        if old_p.is_empty() {
+                            *pg_missing -= 1;
+                        }
+                    }
+                } else {
+                    eprintln!("PG#:{}   New hash: {} != {} old one", pg_nr, f_hash, f_hsh);
+                }
+            }
+            if cid_opt.is_some() {
+                if *pg_missing == 0 {
+                    let (co, ct, _ct_len) = self.mapping.remove(&our_hash).unwrap();
+                    let c = co.unwrap();
+                    return Some((c, ct));
+                }
+            }
+        } else {
+            // TODO: new ChopData type!
+        }
+        None
+        // Some((1, ContentTree::Empty(0)))
+    }
+}
 pub struct ApplicationData {
     storage: PathBuf,
     autosave: bool,
@@ -4263,6 +4562,7 @@ pub struct ApplicationData {
     contents: Datastore,
     hash_to_temp_idx: HashMap<u64, u16>,
     partial_data: HashMap<u16, (Vec<u64>, HashMap<u64, Data>)>,
+    shelf: ShelfData,
     disk_root_hash: u64,
     heap_auto_forward: bool,
     heap: Heap,
@@ -4407,6 +4707,7 @@ impl ApplicationData {
             contents,
             hash_to_temp_idx: HashMap::new(),
             partial_data: HashMap::new(),
+            shelf: ShelfData::new(),
             disk_root_hash: 0,
             heap_auto_forward,
             heap: Heap::Small(HeapSmall::new(None)),
@@ -4427,6 +4728,7 @@ impl ApplicationData {
             contents: Datastore::empty(),
             hash_to_temp_idx: HashMap::new(),
             partial_data: HashMap::new(),
+            shelf: ShelfData::new(),
             disk_root_hash: 0,
             heap_auto_forward,
             heap: Heap::Small(HeapSmall::new(None)),
@@ -5110,6 +5412,13 @@ impl ApplicationData {
     // TODO: allow for changing heap size
     // TODO: allow for setting autoforwarding of heap contents to App
     // TODO: some more heap ops?
+
+    pub fn store_chop_data(&mut self, d_vec: Vec<ChopData>) -> Option<(ContentID, ContentTree)> {
+        // TODO: add logic here, store on shelf, not on partial_data
+        //
+        eprintln!("In store_chop_data");
+        self.shelf.store(d_vec)
+    }
 }
 
 fn get_root_hash(hashes: &Vec<u64>) -> u64 {
@@ -5810,7 +6119,7 @@ async fn response_task(
         data,
     } = process_result.unwrap();
 
-    // println!("Received m_type: {:?}", m_type);
+    println!("Received m_type: {:?} dhash: {}", m_type, data.get_hash());
     match m_type {
         // SyncMessageType::SetManifest => {
         //     let old_manifest = app_data.get_all_data(0);
@@ -5863,6 +6172,7 @@ async fn response_task(
                     return;
                 }
                 eprintln!("Content from: {:?} {:?}", d_type, data);
+                let is_data_empty = data.is_empty();
                 let content = Content::from(d_type, data).unwrap();
                 eprintln!("Content hash: {}", content.hash());
                 let (recv_id, recv_hash) = requirements.post[0];
@@ -5876,6 +6186,19 @@ async fn response_task(
                     let _res = app_data.append(content);
                     if _res.is_ok() {
                         eprintln!("Content added: {:?}", _res);
+                        if is_data_empty {
+                            if let Some(c_tree) = app_data.shelf.empty_cid_added(next_id, recv_hash)
+                            {
+                                let mem_pg = if c_tree.read(0).unwrap().is_empty() {
+                                    1
+                                } else {
+                                    c_tree.len()
+                                };
+                                let u_cnt = Content::Data(d_type, mem_pg, c_tree);
+                                let _ = app_data.contents.update(next_id, u_cnt);
+                                eprintln!("Content {} updated from BCast", next_id);
+                            }
+                        }
                         // let hash = app_data.root_hash();
                         // eprintln!("Sending updated hash: {}", hash);
                         // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));
@@ -6171,6 +6494,17 @@ async fn response_task(
                     let _res = app_data.append(content);
                     if _res.is_ok() {
                         eprintln!("Content added: {:?}", _res);
+                        // app_data.shelf.empty_cid_added(next_id, root_hash);
+                        if let Some(c_tree) = app_data.shelf.empty_cid_added(next_id, root_hash) {
+                            let mem_pg = if c_tree.read(0).unwrap().is_empty() {
+                                1
+                            } else {
+                                c_tree.len()
+                            };
+                            let u_cnt = Content::Data(d_type, mem_pg, c_tree);
+                            let _ = app_data.contents.update(next_id, u_cnt);
+                            eprintln!("Content {} updated from BCast", next_id);
+                        }
                         // let hash = app_data.root_hash();
                         // eprintln!("Sending updated hash: {}", hash);
                         // let _res = to_gnome_sender.send(ToGnome::UpdateAppRootHash(hash));

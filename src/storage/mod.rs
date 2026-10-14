@@ -799,8 +799,9 @@ pub async fn store_content_on_disk(
         let mut data_id = 1;
         // TODO: write both hdr & dat from scratch
         while let Ok(data) = content.read_data(data_id) {
+            // eprintln!("d_id: {}", data_id);
             write_data_to_disk(
-                0,
+                data_id,
                 data,
                 &mut byte_pointer,
                 &mut buff_header,
@@ -864,9 +865,9 @@ async fn write_data_to_disk(
     header_file: &mut BufWriter<File>,
     data_file: &mut BufWriter<File>,
 ) {
-    eprintln!("in write_data_to_disk id:{}, dlen:{}", data_id, data.len());
-    eprintln!("header: {:?}", header_file);
-    eprintln!("data: {:?}", data_file);
+    // eprintln!("in write_data_to_disk id:{}, dlen:{}", data_id, data.len());
+    // eprintln!("header: {:?}", header_file);
+    // eprintln!("data: {:?}", data_file);
     // TODO
     let [d0, d1] = (data_id).to_be_bytes();
     buff_header[0] = d0;
@@ -877,7 +878,7 @@ async fn write_data_to_disk(
         i += 1;
     }
     if data.is_empty() {
-        eprintln!("Data is empty, only writing header.");
+        // eprintln!("Data is empty, only writing header.");
         //Only write hdr file
         for i in 10..16 {
             buff_header[i] = 0;

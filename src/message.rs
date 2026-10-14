@@ -384,7 +384,11 @@ impl SyncMessage {
         // Every partial message will consist of
         // - 1 byte of message type
         // - 2 bytes of part_no and total_parts
-        let data_size = self.data.len();
+        let data_size = if self.data.is_empty() {
+            9
+        } else {
+            1 + self.data.len()
+        };
         let req_size = 2 + 10 * (self.requirements.pre.len() + self.requirements.post.len());
         let netto_size = data_size + req_size;
         let mut partials = vec![];
@@ -404,7 +408,16 @@ impl SyncMessage {
             bytes.push(0);
             bytes.push(0);
             bytes.append(&mut self.requirements.bytes());
-            bytes.append(&mut self.data.bytes());
+            if self.data.is_empty() {
+                eprintln!("We send Data::empty({})", self.data.get_hash());
+                bytes.push(0);
+                for bt in self.data.get_hash().to_be_bytes() {
+                    bytes.push(bt);
+                }
+            } else {
+                bytes.push(1);
+                bytes.append(&mut self.data.bytes());
+            }
             let data = SyncData::new(bytes).unwrap();
             partials.push(data);
             // partials.push(PartialMessage { m_type, part_no: 0, total_parts:0, data })
@@ -596,12 +609,28 @@ impl SyncMessage {
         //     part_hashes = Some(hashes_vec);
 
         // }
-        let bytes: Vec<u8> = bytes_iter.collect();
-        // eprintln!("m_type: {:?}", m_type);
-        // eprintln!("pre_req: {:?}", requirements.pre);
-        // eprintln!("post_req: {:?}", requirements.post);
-        // eprintln!("Bytes size: {}", bytes.len());
-        let data = Data::new(bytes).unwrap();
+        let empty_data = bytes_iter.next().unwrap();
+        let data = if empty_data == 0 {
+            let b1 = bytes_iter.next().unwrap();
+            let b2 = bytes_iter.next().unwrap();
+            let b3 = bytes_iter.next().unwrap();
+            let b4 = bytes_iter.next().unwrap();
+            let b5 = bytes_iter.next().unwrap();
+            let b6 = bytes_iter.next().unwrap();
+            let b7 = bytes_iter.next().unwrap();
+            let b8 = bytes_iter.next().unwrap();
+            let hash = u64::from_be_bytes([b1, b2, b3, b4, b5, b6, b7, b8]);
+            Data::empty(hash)
+        } else if empty_data == 1 {
+            let bytes: Vec<u8> = bytes_iter.collect();
+            // eprintln!("m_type: {:?}", m_type);
+            // eprintln!("pre_req: {:?}", requirements.pre);
+            // eprintln!("post_req: {:?}", requirements.post);
+            // eprintln!("Bytes size: {}", bytes.len());
+            Data::new(bytes).unwrap()
+        } else {
+            panic!("WRONG SYNCDATA FORMAT !!!");
+        };
         Ok(SyncMessage {
             m_type,
             requirements,
