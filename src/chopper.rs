@@ -8,6 +8,8 @@ use smol::channel::Sender as ASender;
 use smol::fs::File;
 use smol::io::{AsyncReadExt as ReadExt, BufReader};
 use std::path::PathBuf;
+use std::thread::sleep;
+use std::time::Duration;
 
 // This is where a Chopper tool will emerge.
 // It's aim is to allow user loading files of various sizes
@@ -94,10 +96,19 @@ impl Chopper {
                     c_no_hash_pair_container.push(content_no);
                     c_no_hash_pair_container.extend(root_hash);
 
+                    // eprintln!("push -1: {} {}", leaf_hashes.len(), leaf_hashes[0].len());
+                    if let Some(llh) = leaf_hashes.pop() {
+                        if !llh.is_empty() {
+                            leaf_hashes.push(llh);
+                        } else {
+                            eprintln!("Popped empty LH");
+                        }
+                    }
                     leaf_hashes.push(std::mem::replace(
                         &mut c_leaf_hashes,
                         Vec::with_capacity(512),
                     ));
+                    // eprintln!("push0: {} {}", leaf_hashes.len(), leaf_hashes[0].len());
                     c_tree = ContentTree::Empty(0);
                     page_no = 0;
                     if content_no > 0 && content_no % max_contents_in_chop == 0 {
@@ -111,8 +122,13 @@ impl Chopper {
                         .unwrap();
                         let chops = Chops {
                             root_hashes,
-                            leaf_hashes: std::mem::replace(&mut leaf_hashes, vec![vec![]]),
+                            leaf_hashes: std::mem::replace(&mut leaf_hashes, vec![]),
                         };
+                        // eprintln!(
+                        //     "push1: {} {}",
+                        //     chops.leaf_hashes.len(),
+                        //     chops.leaf_hashes[0].len()
+                        // );
                         output.push(chops);
                     }
                     content_no += 1;
@@ -163,7 +179,11 @@ impl Chopper {
             c_vec.append(&mut dta.bytes());
             let c_data = CastData::new(c_vec).unwrap();
             let msg = ToAppData::BroadcastSend(cast_id, c_data);
-            let _ = to_app_data.send(msg).await;
+            let _res = to_app_data.send(msg).await;
+            sleep(Duration::from_micros(100));
+            if _res.is_err() {
+                eprintln!("BCSR: {:?}", _res.err().unwrap());
+            }
 
             let apd_res = c_tree.append(Data::empty(hsh));
             if apd_res.is_ok() {
@@ -183,13 +203,21 @@ impl Chopper {
 
         // TODO: include remainder hashes
         if !hash_container.is_empty() {
+            eprintln!(
+                "not empty remainder,content nr: {} output size: {}",
+                content_no,
+                output.len()
+            );
+
             let hdta = Data::new(hash_container).unwrap();
             c_leaf_hashes.push(hdta);
             let mut last_lh = leaf_hashes.pop().unwrap();
+            eprintln!("last_lh: {}", last_lh.len());
             if last_lh.len() < 512 {
                 last_lh.append(&mut c_leaf_hashes);
                 leaf_hashes.push(last_lh);
             } else {
+                leaf_hashes.push(last_lh);
                 leaf_hashes.push(c_leaf_hashes);
             }
 
@@ -198,11 +226,19 @@ impl Chopper {
             c_no_hash_pair_container.extend(root_hash);
 
             // TODO: here we need to construct a Chop result and add remainder
+            eprintln!("root hashes data len: {}", c_no_hash_pair_container.len());
             let chops = Chops {
                 root_hashes: Data::new(c_no_hash_pair_container).unwrap(),
                 leaf_hashes,
             };
+            // eprintln!(
+            //     "push2: {} {}",
+            //     chops.leaf_hashes.len(),
+            //     chops.leaf_hashes[0].len()
+            // );
             output.push(chops);
+        } else {
+            eprintln!("remainder empty");
         }
 
         output
@@ -429,10 +465,11 @@ pub async fn chopping_task(
     //       This broadcast could repeat this transmission in a loop
     //       for some time, so that everyone is eventually synced.
     eprintln!(
-        "And we got: {}, {} ",
+        "And we got: {}, {} last: {}",
         chops.len(),
         // chops[0].root_hashes,
-        chops[0].leaf_hashes.len()
+        chops[0].leaf_hashes.len(),
+        chops[chops.len() - 1].leaf_hashes.len()
     );
     let mut root_hashes: Vec<Data> = vec![];
 
@@ -440,9 +477,11 @@ pub async fn chopping_task(
     let mut leaf_hashes: Vec<Vec<Vec<Data>>> = vec![];
     while !chops.is_empty() {
         let chop = chops.remove(0);
+        eprintln!(" push it real good {}", chop.root_hashes.len());
         root_hashes.push(chop.root_hashes);
         leaf_hashes.push(chop.leaf_hashes);
     }
+
     let _ = to_app_mgr
         .send(ToAppMgr::FromDatastore(crate::LibResponse::ChoppingDone(
             swarm_id,
@@ -454,6 +493,15 @@ pub async fn chopping_task(
     if leaf_hashes.is_empty() {
         eprintln!("No leaf_hashes?!");
         return;
+        // } else {
+        //     for lh in &leaf_hashes {
+        //         for lh2 in lh {
+        //             eprintln!("L LH len: {}", lh2.len());
+        //             for lh3 in lh2 {
+        //                 eprintln!("L LH LH3 len: {}", lh3.len());
+        //             }
+        //         }
+        //     }
     }
     let chop_count = (leaf_hashes.len() - 1) as u8;
     for (chop_no, chop_hsh) in leaf_hashes.into_iter().enumerate() {
@@ -461,6 +509,7 @@ pub async fn chopping_task(
         for (content_no, cnt_hash) in chop_hsh.into_iter().enumerate() {
             let page_count = (cnt_hash.len() - 1) as u16;
             for (page_no, bottom_hashes) in cnt_hash.into_iter().enumerate() {
+                eprint!("CH{} C{} P{}    ", chop_no, content_no, page_no);
                 let [p0, p1] = (page_no as u16).to_be_bytes();
                 let [pc0, pc1] = page_count.to_be_bytes();
                 let [l0, l1] = (bottom_hashes.len() as u16).to_be_bytes();
@@ -483,11 +532,12 @@ pub async fn chopping_task(
                 h_vec.append(&mut bottom_hashes.bytes());
                 let h_data = CastData::new(h_vec).unwrap();
                 let msg = ToAppData::BroadcastSend(hash_cast_id, h_data);
-                let _ = to_app_data.send(msg).await;
+                let _res = to_app_data.send(msg).await;
+                eprintln!("Bottom hashes sent?: {}", _res.is_ok())
             }
         }
     }
-
+    eprintln!("out of nest");
     // TODO: start a broadcasting channel and push file Data there
     //       (preferably as a separate async task)
     // TODO: Data will be broadcasted before CID placeholders are

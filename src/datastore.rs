@@ -132,10 +132,12 @@ impl Datastore {
                 // TODO: calculate how many memory slots are used as a sum of left & right
                 // contents + space taken by their bottom hashes.
 
-                let used_memory_slots = prev_content.used_memory_pages()
-                    + content.used_memory_pages()
-                    + 1
-                    + ((prev_content.len() + content.len()) as usize >> 7);
+                // TODO: fix this
+                // attempt to add with overflow on maxed out Content files
+                let used_memory_slots = prev_content
+                    .used_memory_pages()
+                    .saturating_add(1 + content.used_memory_pages())
+                    .saturating_add((prev_content.len() as usize + content.len() as usize) >> 7);
                 let substore = Substore {
                     content_count: 2,
                     used_memory_slots,

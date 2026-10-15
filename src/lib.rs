@@ -220,6 +220,7 @@ pub enum ToAppMgr {
     NeighborsListing(SwarmID, Vec<GnomeId>),
     ChangeContent(SwarmID, ContentID, DataType, Vec<Data>),
     AppendContent(SwarmID, DataType, Data),
+    AppendMultipleContents(SwarmID, Vec<(DataType, u64)>),
     AppendData(SwarmID, ContentID, Data),
     RemoveData(SwarmID, ContentID, u16),
     UpdateData(SwarmID, ContentID, u16, Data),
@@ -351,6 +352,7 @@ pub enum ToAppData {
     UpdateData(ContentID, u16, Data),
     AppDefined(AppDefinedMsg),
     AppendContent(DataType, Data),
+    AppendMultipleContents(Vec<(DataType, u64)>),
     AppendData(ContentID, Data),
     RemoveData(ContentID, u16),
     AppendShelledDatas(ContentID, Data, Vec<Data>),
@@ -981,17 +983,20 @@ async fn serve_app_manager<'a>(
                     while !c_no_hash_pairs.is_empty() {
                         let data = c_no_hash_pairs.remove(0);
                         let mut d_bytes = data.bytes();
-                        let c_no = d_bytes.remove(0);
-                        let h0 = d_bytes.remove(0);
-                        let h1 = d_bytes.remove(0);
-                        let h2 = d_bytes.remove(0);
-                        let h3 = d_bytes.remove(0);
-                        let h4 = d_bytes.remove(0);
-                        let h5 = d_bytes.remove(0);
-                        let h6 = d_bytes.remove(0);
-                        let h7 = d_bytes.remove(0);
-                        let root_hash = u64::from_be_bytes([h0, h1, h2, h3, h4, h5, h6, h7]);
-                        processed_pairs.push((chunk_no, c_no, root_hash));
+                        while !d_bytes.is_empty() {
+                            let c_no = d_bytes.remove(0);
+                            let h0 = d_bytes.remove(0);
+                            let h1 = d_bytes.remove(0);
+                            let h2 = d_bytes.remove(0);
+                            let h3 = d_bytes.remove(0);
+                            let h4 = d_bytes.remove(0);
+                            let h5 = d_bytes.remove(0);
+                            let h6 = d_bytes.remove(0);
+                            let h7 = d_bytes.remove(0);
+                            let root_hash = u64::from_be_bytes([h0, h1, h2, h3, h4, h5, h6, h7]);
+                            eprintln!("pushing: {} {}", c_no, root_hash);
+                            processed_pairs.push((chunk_no, c_no, root_hash));
+                        }
                         chunk_no += 1;
                     }
                     let _ = to_user
@@ -1328,6 +1333,7 @@ async fn serve_app_manager<'a>(
                         .await;
                 }
                 ToAppMgr::AppendContent(s_id, d_type, data) => {
+                    //TODO: not sure if this is necessary
                     if s_id != app_mgr.active_app_data.0 {
                         eprintln!("Currently you can only AppendContent to an active swarm");
                         continue;
@@ -1337,6 +1343,17 @@ async fn serve_app_manager<'a>(
                         .1
                         .send(ToAppData::AppendContent(d_type, data))
                         .await;
+                }
+                ToAppMgr::AppendMultipleContents(s_id, tch_pairs) => {
+                    // if s_id != app_mgr.active_app_data.0 {
+                    //     eprintln!("Currently you can only AppendContent to an active swarm");
+                    //     continue;
+                    // }
+                    if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
+                        let _ = sender
+                            .send(ToAppData::AppendMultipleContents(tch_pairs))
+                            .await;
+                    }
                 }
                 ToAppMgr::AppendData(s_id, c_id, data) => {
                     if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
@@ -2891,6 +2908,52 @@ async fn serve_app_data<'a>(
                     // next_val += 1;
                 }
             }
+            ToAppData::AppendMultipleContents(tch_pairs) => {
+                eprintln!("AppData got AppendMultipleContents {}", tch_pairs.len());
+                let tch_iter = tch_pairs.chunks_exact(113);
+                let mut chunks = vec![];
+                let rem = tch_iter.remainder();
+                for p_chunk in tch_iter {
+                    chunks.push(p_chunk);
+                }
+                if !rem.is_empty() {
+                    chunks.push(rem);
+                }
+                if let Some(next_id) = app_data.next_c_id() {
+                    // TODO: be more precise
+                    let c_len = chunks.len();
+                    if next_id as usize + chunks.len() * 113 <= u16::MAX as usize {
+                        for chunk in chunks {
+                            eprintln!("AppendMultipleContents x{}", c_len);
+
+                            let pre: Vec<(ContentID, u64)> = vec![(next_id, 0)];
+                            let post: Vec<(ContentID, u64)> = vec![];
+                            let mut bytes = Vec::with_capacity(1024);
+                            for (d_type, d_hash) in chunk {
+                                bytes.push(d_type.byte());
+                                for bt in d_hash.to_be_bytes() {
+                                    bytes.push(bt);
+                                }
+                            }
+                            let reqs = SyncRequirements { pre, post };
+                            let data = Data::new(bytes).unwrap();
+                            let msg = SyncMessage::new(
+                                SyncMessageType::AppendMultipleContents,
+                                reqs,
+                                data,
+                            );
+                            let parts = msg.into_parts();
+                            eprintln!(
+                                "AppData sending SyncMsg::AppMC to gnome in parts: {}",
+                                parts.len()
+                            );
+                            for part in parts {
+                                let _ = to_gnome_sender.send(ToGnome::AddData(part)).await;
+                            }
+                        }
+                    }
+                }
+            }
             ToAppData::AppendData(c_id, data) => {
                 let pre_hash = app_data.content_root_hash(c_id).unwrap();
                 // eprintln!("Initial AppendData PRE hash: {}", pre_hash.1);
@@ -3044,6 +3107,7 @@ async fn serve_app_data<'a>(
                     //     m_req_sent = res.is_ok();
                     // }
                 }
+                // eprint!("AppData BCast sent");
             }
             ToAppData::MulticastSend(_id, c_data) => {
                 if let Some(sender) = m_cast_origin.get(&_id) {
@@ -3545,6 +3609,7 @@ async fn serve_app_data<'a>(
                 //TODO
                 eprintln!("We've got some Data to store: {}", ch_data_vec.len());
                 let store_output = app_data.store_chop_data(ch_data_vec);
+                eprintln!("Storing complete {}", store_output.is_some());
                 if let Some((c_id, c_tree)) = store_output {
                     if let Ok((app_t, e_hash)) = app_data.contents.get_root_content_typed_hash(c_id)
                     {
@@ -4339,36 +4404,62 @@ impl ShelfData {
         }
     }
     pub fn empty_cid_added(&mut self, cid: u16, root_hash: u64) -> Option<ContentTree> {
-        eprintln!("Updating shelf");
+        eprintln!("Updating shelf {} - {}", cid, root_hash);
+        for (key, (co, c_tree, pg_missing)) in self.mapping.iter() {
+            eprintln!(
+                "on shelf: {} - {:?} {} missing {}",
+                key,
+                co,
+                c_tree.len(),
+                pg_missing
+            );
+        }
+        // self.waiting
         if self.mapping.contains_key(&root_hash) {
             // TODO: return CTree
             let (_cid_o, c_tree, pg_missing) = self.mapping.remove(&root_hash).unwrap();
-            if pg_missing > 0 {
-                eprintln!(
-                    "Still not filled {} from BCast, keeping on shelf",
-                    pg_missing
-                );
-                let _ = self
-                    .mapping
-                    .insert(root_hash, (Some(cid), c_tree.clone(), pg_missing));
-            }
-            return Some(c_tree);
+            // if pg_missing > 0 {
+            //     eprintln!(
+            //         "Still not filled {} from BCast, keeping on shelf",
+            //         pg_missing
+            //     );
+            let _ = self
+                .mapping
+                .insert(root_hash, (Some(cid), c_tree, pg_missing));
+            // }
+            // return Some(c_tree);
         } else {
             let _ = self.mapping.insert(
                 root_hash,
                 (Some(cid), ContentTree::Empty(root_hash), u16::MAX),
             );
-            return None;
+            // return None;
         }
+        for _i in 0..self.waiting.len() {
+            let chops = self.waiting.remove(0);
+            let res = self.store(chops);
+            if let Some((r_cid, r_ctree)) = res {
+                if r_cid == cid {
+                    eprintln!("Pulled from waiting!");
+                    return Some(r_ctree);
+                } else {
+                    eprintln!("add logic here");
+                    //TODO: insert back given tree
+                }
+            }
+        }
+        None
     }
     pub fn store(&mut self, mut data: Vec<ChopData>) -> Option<(ContentID, ContentTree)> {
         // we assume chops come in order & belong to the same resulting CTree
         // TODO: add support for chops that come out of order and/or are mixed types
         if data.is_empty() {
+            eprintln!("in store, but empty data");
             return None;
         }
         let first = data.remove(0);
         if first.is_hashes() {
+            eprintln!("in store, hashes");
             //TODO
             let (f_ch_nr, f_ch_ct, f_cnt_nr, f_cnt_ct, f_pg_nr, f_pg_ct, f_data) =
                 first.unpack_hashes().unwrap();
@@ -4475,11 +4566,17 @@ impl ShelfData {
                 return None;
             }
         } else if first.is_data() {
+            eprintln!("in store, data {}", data.len() + 1);
             //TODO
             let (ch_nr, cnt_nr, pg_nr, f_data) = first.unpack_data().unwrap();
             let mut our_hash = 0;
             let f_hash = f_data.get_hash();
+            eprintln!("searching for: ({},{}) {}", ch_nr, cnt_nr, f_hash);
+            for (k, v) in self.lookup.iter() {
+                eprintln!("Lookup {:?}: {:?}", k, v);
+            }
             if let Some(p_vec) = self.lookup.get(&(ch_nr, cnt_nr)) {
+                eprintln!("found it!");
                 for (ct_hash, fst_hash) in p_vec {
                     if *fst_hash == f_hash {
                         our_hash = *ct_hash;
@@ -4487,6 +4584,7 @@ impl ShelfData {
                     }
                 }
             } else {
+                eprintln!("unable to find!");
                 data.insert(
                     0,
                     ChopData::LeafData {
@@ -4500,6 +4598,7 @@ impl ShelfData {
                 return None;
             }
             if our_hash == 0 {
+                eprintln!("hash 0");
                 data.insert(
                     0,
                     ChopData::LeafData {
@@ -4534,6 +4633,9 @@ impl ShelfData {
                     if let Ok(old_p) = c_tree.replace(pg_nr, p_data) {
                         if old_p.is_empty() {
                             *pg_missing -= 1;
+                            if *pg_missing % 1024 == 0 {
+                                eprintln!("still missing: {}", pg_missing);
+                            }
                         }
                     }
                 } else {
@@ -4550,6 +4652,7 @@ impl ShelfData {
         } else {
             // TODO: new ChopData type!
         }
+        eprintln!("ShelfData store is done.");
         None
         // Some((1, ContentTree::Empty(0)))
     }
@@ -6448,13 +6551,13 @@ async fn response_task(
             if !requirements.pre_validate(next_id, &app_data) {
                 eprintln!("PRE validation failed for AppendMultipleContents");
             } else {
-                if requirements.post.len() != 1 {
-                    eprintln!(
-                        "POST validation failed for AppendMultipleContents 1 ({:?})",
-                        requirements.post
-                    );
-                    return;
-                }
+                // if requirements.post.len() != 1 {
+                //     eprintln!(
+                //         "POST validation failed for AppendMultipleContents 1 ({:?})",
+                //         requirements.post
+                //     );
+                //     return;
+                // }
                 // TODO:
                 // We need to extract (d_type, root_hash) pairs from data.
                 // Then for each pair we need to append it to Datastore.
@@ -6472,6 +6575,7 @@ async fn response_task(
                     );
                     return;
                 }
+                eprintln!("Contents to add:{} {}", bts.len(), bts.len() / 9);
                 while !bts.is_empty() {
                     let d_type = DataType::Data(bts.remove(0));
                     let h_0 = bts.remove(0);
