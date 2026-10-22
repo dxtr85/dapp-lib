@@ -292,19 +292,6 @@ pub async fn read_datastore_from_disk(
         if let Some((dtype, hash)) = temp_store.remove(&i) {
             eprintln!("Disk read CID-{} with hash: {}", i, hash);
             let content =
-            // = if dtype == DataType::Link {
-            //     Content::Link(
-            //         SwarmName {
-            //             founder: GnomeId::any(),
-            //             name: String::new(),
-            //         },
-            //         0,
-            //         Description::new(String::new()).unwrap(),
-            //         Data::empty(hash),
-            //         None,
-            //     )
-            // } else {
-            // 
             // We do not distinguish between Link and Data at this point
                 // let ctree = ContentTree::empty(hash);
                 Content::Data(dtype, 0, ContentTree::empty(hash));
@@ -885,7 +872,7 @@ async fn write_data_to_disk(
         }
         let _ = header_file.write(buff_header).await;
     } else {
-        eprintln!("Data with bytes");
+        // eprintln!("Data with bytes");
         let mut i = 10;
         for byte in byte_pointer.to_be_bytes() {
             buff_header[i] = byte;
@@ -897,9 +884,9 @@ async fn write_data_to_disk(
             i += 1;
         }
         let _res1 = header_file.write(buff_header).await;
-        eprintln!("header write: {:?}", _res1);
+        // eprintln!("header write: {:?}", _res1);
         let _res2 = data_file.write(&data.bytes()).await;
-        eprintln!("data write: {:?}", _res2);
+        // eprintln!("data write: {:?}", _res2);
         *byte_pointer += data_len;
     }
 }
@@ -1075,6 +1062,8 @@ pub async fn load_content_from_disk(
     cid: u16,
     dtype: DataType,
     hash: u64,
+    read_header_only: bool,
+    page_range: (u16, u16),
     first_pages: &HashMap<ContentID, Data>,
 ) -> Option<Content> {
     if dtype.is_link() {
@@ -1091,17 +1080,38 @@ pub async fn load_content_from_disk(
     }
     let header_file = s_storage.join(format!("{}.hdr", cid));
     let data_file = s_storage.join(format!("{}.dat", cid));
-    // eprintln!("Load content from disk: {:?} {}", s_storage, cid);
+    eprintln!(
+        "Load content from disk: {:?} {}, range: {}-{}",
+        s_storage, cid, page_range.0, page_range.1
+    );
     let mut temp_storage = HashMap::new();
     let mut byte_pointer: u32 = 0;
-    if let Some(content_on_disk) = load_content_from_header_file(
+    let load_header_result = load_content_from_header_file(
         header_file.clone(),
         dtype,
         &mut temp_storage,
         &mut byte_pointer,
     )
-    .await
-    {
+    .await;
+    if read_header_only {
+        // We replace first page, if found & matching
+        if let Some(f_page) = first_pages.get(&cid) {
+            if let Some(mut content) = load_header_result {
+                if let Ok(e_fp) = content.read_data(0) {
+                    if e_fp.get_hash() == f_page.get_hash() {
+                        let _ = content.update_data(0, f_page.clone());
+                        return Some(content);
+                    } else {
+                        return Some(content);
+                    }
+                } else {
+                    return Some(content);
+                }
+            }
+        }
+        return load_header_result;
+    }
+    if let Some(content_on_disk) = load_header_result {
         // eprintln!(
         //     "Loaded CID-{} from hdr, {:?}",
         //     cid,
@@ -1109,14 +1119,26 @@ pub async fn load_content_from_disk(
         // );
         //TODO: all matches
         //TODO: read each Page from data_file
+        // TODO: maybe read entire file into a 64MB Vec<u8> and parse it from memory?
         let dhash = content_on_disk.hash();
         if dhash == hash {
             let mut c_tree = ContentTree::empty(0);
+            for i in 0..=u16::MAX {
+                if let Some((hsh, _off, _siz)) = temp_storage.get(&i) {
+                    let _ = c_tree.append(Data::empty(*hsh));
+                } else {
+                    break;
+                }
+            }
+            if c_tree.hash() != hash {
+                eprintln!("c_tree hash mismatch!");
+                return None;
+            }
             let mut mem_size = 0;
             let mut buffer: [u8; 1024] = [0; 1024];
             // eprintln!("2Reading: {data_file:?}");
             let mut file = BufReader::new(File::open(data_file).await.unwrap());
-            for i in 0..=u16::MAX {
+            for i in page_range.0..=page_range.1 {
                 if let Some((hash, pointer, size)) = temp_storage.remove(&i) {
                     if size == 0 {
                         // eprintln!("Size is zero for {i}");
@@ -1125,23 +1147,26 @@ pub async fn load_content_from_disk(
                             if let Some(first_page) = first_pages.get(&cid) {
                                 // eprintln!("and we have it!");
                                 if hash == first_page.get_hash() {
-                                    let _res = c_tree.append(first_page.clone());
+                                    // let _res = c_tree.append(first_page.clone());
+                                    let _res = c_tree.replace(i, first_page.clone());
                                     continue;
                                 } else {
                                     // eprintln!(
                                     //     "but hash mismatch exp: {hash}, but: {}",
                                     //     first_page.get_hash()
                                     // );
-                                    let _res = c_tree.append(Data::empty(hash));
-                                    eprintln!("Append 0 for DID: {},res: {:?}", i, _res);
+                                    // let _res = c_tree.append(Data::empty(hash));
+                                    let _res = c_tree.replace(i, Data::empty(hash));
+                                    eprintln!("Replace 0 for DID: {},res: {:?}", i, _res);
                                     continue;
                                 }
                             } else {
                                 eprintln!("But no first pages");
                             }
                         } else {
-                            let _res = c_tree.append(Data::empty(hash));
-                            eprintln!("Append 0 for DID: {},res: {:?}", i, _res);
+                            // let _res = c_tree.append(Data::empty(hash));
+                            let _res = c_tree.replace(i, Data::empty(hash));
+                            eprintln!("Replace 0 for DID: {},res: {:?}", i, _res);
                             continue;
                         }
                     }
@@ -1159,8 +1184,9 @@ pub async fn load_content_from_disk(
                             let data = Data::new(v).unwrap();
                             let d_hash = data.get_hash();
                             if d_hash == hash {
-                                let _ar = c_tree.append(data);
-                                eprintln!("Append non-zero for DID: {},res: {:?}", i, _ar);
+                                // let _ar = c_tree.append(data);
+                                let _ar = c_tree.replace(i, data);
+                                // eprintln!("Replace non-zero for DID: {},res: {:?}", i, _ar);
                                 mem_size += 1;
                                 // eprintln!("Append result: {:?}", _ar);
                             } else {
@@ -1233,15 +1259,15 @@ async fn load_content_from_header_file(
         if new_pointer > *byte_pointer {
             *byte_pointer = new_pointer;
         }
-        eprintln!(
-            "Insert {} - {}, off: {}, size: {}",
-            page_id, page_hash, offset, page_size
-        );
+        // eprintln!(
+        //     "Insert {} - {}, off: {}, size: {}",
+        //     page_id, page_hash, offset, page_size
+        // );
         temp_storage.insert(page_id, (page_hash, offset, page_size));
     }
     // eprintln!("Read {} entries", temp_storage.len());
     if let Some((hash, _offset, _size)) = temp_storage.get(&0) {
-        eprintln!("Has root entry!");
+        // eprintln!("Has root entry!");
         // let mut content = Content::from(dtype, Data::empty(*hash)).unwrap();
         let mut content = Content::Data(dtype, 0, ContentTree::Empty(*hash));
         let mut page_id = 1;

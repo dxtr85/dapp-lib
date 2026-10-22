@@ -125,7 +125,7 @@ pub fn read_tags_and_header(d_type: DataType, data: Data) -> (Vec<u8>, String) {
     };
     let mut bytes = data.bytes();
     let how_many_tags = bytes.remove(0);
-    eprintln!("We have {} tags", how_many_tags);
+    eprintln!("We have {} tags (dlen: {})", how_many_tags, bytes.len());
     let mut tag_ids = Vec::with_capacity(how_many_tags as usize);
     for _i in 0..how_many_tags {
         if !bytes.is_empty() {

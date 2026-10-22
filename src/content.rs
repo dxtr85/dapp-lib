@@ -1305,7 +1305,7 @@ impl ContentTree {
         }
     }
 
-    pub fn replace(&mut self, idx: u16, mut new_data: Data) -> Result<Data, AppError> {
+    pub fn replace(&mut self, idx: u16, new_data: Data) -> Result<Data, AppError> {
         // eprintln!("replace {}", idx);
         match self {
             Self::Filled(data) => {
@@ -1321,14 +1321,19 @@ impl ContentTree {
             Self::Empty(hash) => {
                 // eprintln!("Existing hash: {}", hash);
                 // eprintln!("New data hash: {} {}", new_data.get_hash(), new_data.hash());
-                let new_hash = new_data.hash();
-                if idx == 0 && *hash == new_hash {
+                // let new_hash = new_data.hash();
+                if idx == 0 {
+                    let old = Data::empty(*hash);
+                    // Here we can replace empty CTree, since it only contains one Page,
+                    // hence it's root_hash = first_page hash
                     *self = Self::Filled(new_data);
-                    Ok(Data::empty(0))
+                    Ok(old)
                 } else if idx != 0 {
                     Err(AppError::IndexingError)
                 } else {
-                    Err(AppError::HashMismatch)
+                    // TODO: we can not replace Data, when CTree is empty
+                    // since we only know it's root hash and not a single one leaf hash
+                    Err(AppError::ContentEmpty)
                 }
             }
         }

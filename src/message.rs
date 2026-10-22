@@ -473,8 +473,15 @@ impl SyncMessage {
             let mut req_and_data_bytes = self.requirements.bytes();
             // eprintln!("req_bytes: {}", req_and_data_bytes.len());
             // And at the end we put data_bytes
-            let mut data_bytes = self.data.bytes();
-            req_and_data_bytes.append(&mut data_bytes);
+            // let mut data_bytes = self.data.bytes();
+            // req_and_data_bytes.append(&mut data_bytes);
+            if self.data.is_empty() {
+                req_and_data_bytes.push(0);
+                req_and_data_bytes.extend(self.data.get_hash().to_be_bytes());
+            } else {
+                req_and_data_bytes.push(1);
+                req_and_data_bytes.extend(self.data.bytes());
+            }
             // eprintln!("req_and_data_bytes: {}", req_and_data_bytes.len());
             let mut first_chunk_bytes: Vec<u8> =
                 req_and_data_bytes.drain(0..first_chunk_size).collect();

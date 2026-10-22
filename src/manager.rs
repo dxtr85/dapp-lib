@@ -525,6 +525,11 @@ impl ApplicationManager {
                     }
                 }
             }
+        } else {
+            eprintln!(
+                "Active_founder: {:?}",
+                self.get_name(self.active_app_data.0)
+            );
         }
         // self.update_swap_state(s_id, can_be_swapped).await;
         // if self.swap_state.is_overloaded() {

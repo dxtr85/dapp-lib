@@ -949,7 +949,7 @@ async fn serve_app_manager<'a>(
                                 .spawn(start_a_timer(
                                     to_app_mgr.clone(),
                                     TimeoutType::AuditMemoryForSwarm(s_id, s_name),
-                                    Duration::from_secs(60 * time_until_next_audit as u64),
+                                    Duration::from_secs(60 * (time_until_next_audit as u64)),
                                 ))
                                 .detach();
                         }
@@ -1168,14 +1168,18 @@ async fn serve_app_manager<'a>(
                         let _ = to_user.send(ToApp::ActiveSwarm(swarm_name, s_id)).await;
                     } else {
                         let curr_id = app_mgr.active_app_data.0;
-                        let curr_swarm = app_mgr.get_name(curr_id).unwrap();
-                        let _ = to_user.send(ToApp::ActiveSwarm(curr_swarm, curr_id)).await;
-                        eprintln!("Trying to join {}…", swarm_name);
-                        //TODO: we should try to join requested swarm
-                        // by searching for it in neighboring_swarms
-                        let _ = to_gnome_mgr
-                            .send(ToGnomeManager::JoinSwarm(swarm_name, None))
-                            .await;
+                        eprintln!("SetActiveApp {}", curr_id);
+                        if let Some(curr_swarm) = app_mgr.get_name(curr_id) {
+                            let _ = to_user.send(ToApp::ActiveSwarm(curr_swarm, curr_id)).await;
+                            eprintln!("Trying to join {}…", swarm_name);
+                            //TODO: we should try to join requested swarm
+                            // by searching for it in neighboring_swarms
+                            let _ = to_gnome_mgr
+                                .send(ToGnomeManager::JoinSwarm(swarm_name, None))
+                                .await;
+                        } else {
+                            eprintln!("Problem: could not get name for {}", curr_id);
+                        }
                     }
                 }
                 ToAppMgr::FromApp(LibRequest::NewStoragePolicy(sp_v)) => {
@@ -2741,7 +2745,7 @@ async fn serve_app_data<'a>(
                 // so maximum difference.
 
                 let sync_requests: Vec<SyncRequest> = vec![
-                    SyncRequest::Datastore,
+                    SyncRequest::RootHash,
                     // SyncRequest::AllFirstPages(Some(vec![0])),
                     // SyncRequest::Hashes(0, vec![]),
                     // SyncRequest::Hashes(1, vec![]),
@@ -2910,7 +2914,8 @@ async fn serve_app_data<'a>(
             }
             ToAppData::AppendMultipleContents(tch_pairs) => {
                 eprintln!("AppData got AppendMultipleContents {}", tch_pairs.len());
-                let tch_iter = tch_pairs.chunks_exact(113);
+                let c_pairs_per_msg = 113;
+                let tch_iter = tch_pairs.chunks_exact(c_pairs_per_msg);
                 let mut chunks = vec![];
                 let rem = tch_iter.remainder();
                 for p_chunk in tch_iter {
@@ -2919,14 +2924,15 @@ async fn serve_app_data<'a>(
                 if !rem.is_empty() {
                     chunks.push(rem);
                 }
-                if let Some(next_id) = app_data.next_c_id() {
+                if let Some(mut next_id) = app_data.next_c_id() {
                     // TODO: be more precise
                     let c_len = chunks.len();
-                    if next_id as usize + chunks.len() * 113 <= u16::MAX as usize {
+                    if next_id as usize + chunks.len() * c_pairs_per_msg <= u16::MAX as usize {
                         for chunk in chunks {
                             eprintln!("AppendMultipleContents x{}", c_len);
 
                             let pre: Vec<(ContentID, u64)> = vec![(next_id, 0)];
+                            next_id = next_id + (chunk.len() as u16);
                             let post: Vec<(ContentID, u64)> = vec![];
                             let mut bytes = Vec::with_capacity(1024);
                             for (d_type, d_hash) in chunk {
@@ -2936,6 +2942,7 @@ async fn serve_app_data<'a>(
                                 }
                             }
                             let reqs = SyncRequirements { pre, post };
+                            eprintln!("AppendMC Data len:{}", bytes.len());
                             let data = Data::new(bytes).unwrap();
                             let msg = SyncMessage::new(
                                 SyncMessageType::AppendMultipleContents,
@@ -2948,6 +2955,7 @@ async fn serve_app_data<'a>(
                                 parts.len()
                             );
                             for part in parts {
+                                eprintln!("Sending part len: {}", part.len());
                                 let _ = to_gnome_sender.send(ToGnome::AddData(part)).await;
                             }
                         }
@@ -2986,20 +2994,28 @@ async fn serve_app_data<'a>(
             ToAppData::UpdateData(c_id, d_id, data) => {
                 //TODO:serve this
                 eprintln!(
-                    "Got ToAppData::UpdateData({}, {}, Dlen: {})",
+                    "Got ToAppData::UpdateData({}, {}, Dlen: {}, DHash: {})",
                     c_id,
                     d_id,
-                    data.len()
+                    data.len(),
+                    data.get_hash()
                 );
                 let pre_hash = app_data.content_root_hash(c_id).unwrap();
                 let pre: Vec<(ContentID, u64)> = vec![(c_id, pre_hash.1)];
-                let prev_data = app_data
-                    // .update_data(c_id, d_id, Data::empty(data.get_hash()))
-                    .update_data(c_id, d_id, data.clone())
-                    .unwrap();
-                let post_hash = app_data.content_root_hash(c_id).unwrap();
-                let post: Vec<(ContentID, u64)> = vec![(c_id, post_hash.1)];
-                let _res = app_data.update_data(c_id, d_id, prev_data);
+                let mut hollow_c = app_data.shell(c_id).unwrap();
+                let update_result = hollow_c.update_data(d_id, Data::empty(data.get_hash()));
+                // let update_result = app_data
+                //     // .update_data(c_id, d_id, )
+                //     .update_data(c_id, d_id, data.clone());
+                if update_result.is_err() {
+                    let err = update_result.err().unwrap();
+                    eprintln!("Failed to update: {}", err);
+                    return;
+                }
+                // let prev_data = update_result.unwrap();
+                let post_hash = hollow_c.hash();
+                let post: Vec<(ContentID, u64)> = vec![(c_id, post_hash)];
+                // let _res = app_data.update_data(c_id, d_id, prev_data);
                 let reqs = SyncRequirements { pre, post };
                 let msg = SyncMessage::new(SyncMessageType::UpdateData(c_id, d_id), reqs, data);
                 let parts = msg.into_parts();
@@ -3442,7 +3458,7 @@ async fn serve_app_data<'a>(
                 if datastore_sync.is_some() {
                     // spawn(sync_timeout(app_data_send.clone()));
                     eprintln!("{} Sending SyncRequest::Datastore again", swarm_id);
-                    let sync_requests: Vec<SyncRequest> = vec![SyncRequest::Datastore];
+                    let sync_requests: Vec<SyncRequest> = vec![SyncRequest::RootHash];
                     let _ = to_gnome_sender
                         .send(ToGnome::AskData(
                             GnomeId::any(),
@@ -4393,14 +4409,14 @@ pub struct ShelfData {
     // Once lookup table is extended with a new pointer, waiting list is being
     // scanned in search for a match.
     pub lookup: HashMap<(u8, u8), Vec<(u64, u64)>>,
-    pub waiting: Vec<Vec<ChopData>>,
+    pub waiting: HashMap<u64, Vec<ChopData>>,
 }
 impl ShelfData {
     pub fn new() -> Self {
         ShelfData {
             mapping: HashMap::new(),
             lookup: HashMap::new(),
-            waiting: vec![],
+            waiting: HashMap::new(),
         }
     }
     pub fn empty_cid_added(&mut self, cid: u16, root_hash: u64) -> Option<ContentTree> {
@@ -4435,19 +4451,7 @@ impl ShelfData {
             );
             // return None;
         }
-        for _i in 0..self.waiting.len() {
-            let chops = self.waiting.remove(0);
-            let res = self.store(chops);
-            if let Some((r_cid, r_ctree)) = res {
-                if r_cid == cid {
-                    eprintln!("Pulled from waiting!");
-                    return Some(r_ctree);
-                } else {
-                    eprintln!("add logic here");
-                    //TODO: insert back given tree
-                }
-            }
-        }
+
         None
     }
     pub fn store(&mut self, mut data: Vec<ChopData>) -> Option<(ContentID, ContentTree)> {
@@ -4459,23 +4463,24 @@ impl ShelfData {
         }
         let first = data.remove(0);
         if first.is_hashes() {
+            let mut return_val = None;
             eprintln!("in store, hashes");
             //TODO
             let (f_ch_nr, f_ch_ct, f_cnt_nr, f_cnt_ct, f_pg_nr, f_pg_ct, f_data) =
                 first.unpack_hashes().unwrap();
+            let mut hbts = f_data.bytes();
+            let b0 = hbts.remove(0);
+            let b1 = hbts.remove(0);
+            let b2 = hbts.remove(0);
+            let b3 = hbts.remove(0);
+            let b4 = hbts.remove(0);
+            let b5 = hbts.remove(0);
+            let b6 = hbts.remove(0);
+            let b7 = hbts.remove(0);
+
+            let f_hash = u64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7]);
             if f_pg_nr == 0 && data.len() as u16 >= f_pg_ct {
                 let mut pg_idx = 1;
-                let mut hbts = f_data.bytes();
-                let b0 = hbts.remove(0);
-                let b1 = hbts.remove(0);
-                let b2 = hbts.remove(0);
-                let b3 = hbts.remove(0);
-                let b4 = hbts.remove(0);
-                let b5 = hbts.remove(0);
-                let b6 = hbts.remove(0);
-                let b7 = hbts.remove(0);
-
-                let f_hash = u64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7]);
                 let mut c_tree = ContentTree::Filled(Data::empty(f_hash));
 
                 while !hbts.is_empty() {
@@ -4489,7 +4494,7 @@ impl ShelfData {
                     let b7 = hbts.remove(0);
 
                     let p_hash = u64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7]);
-                    c_tree.append(Data::empty(p_hash));
+                    let _ = c_tree.append(Data::empty(p_hash));
                 }
                 while !data.is_empty() {
                     let hs_data = data.remove(0);
@@ -4514,7 +4519,7 @@ impl ShelfData {
                             let b7 = hbts.remove(0);
 
                             let p_hash = u64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7]);
-                            c_tree.append(Data::empty(p_hash));
+                            let _ = c_tree.append(Data::empty(p_hash));
                         }
                     }
                     if pg_nr == pg_ct && data.is_empty() {
@@ -4533,23 +4538,52 @@ impl ShelfData {
                 // data in it
                 let removed = self.mapping.remove(&ct_hash);
                 let ct_len = c_tree.len();
-                if let Some((cid_opt, _ex_ct, ex_len)) = removed {
+                if let Some((cid_opt, _ex_ct, pg_missing)) = removed {
                     // TODO: make sure we do not overwrite CTree with partial
                     // if ex_ct.is_empty() {
-                    if ex_len > c_tree.len() {
-                        let mut return_val = None;
-                        if let Some(cid) = cid_opt {
+                    if let Some(cid) = cid_opt {
+                        if pg_missing >= c_tree.len() {
                             // we already have this Content in Datastore
                             return_val = Some((cid, c_tree.clone()));
+                        } else {
+                            return_val = Some((cid, _ex_ct.clone()));
                         }
-                        self.mapping.insert(ct_hash, (cid_opt, c_tree, ct_len));
-                        return return_val;
+                        // } else {
+                        //     kk
                     }
+                    self.mapping.insert(ct_hash, (cid_opt, c_tree, ct_len));
+                    // return return_val;
                 } else {
                     self.mapping.insert(ct_hash, (None, c_tree, ct_len));
                 }
+                if let Some(chop_data) = self.waiting.remove(&fst_hash) {
+                    return self.store(chop_data);
+                }
+                //TODO
+                // for _i in 0..self.waiting.len() {
+                //     let chops = self.waiting.remove(0);
+                //     let res = self.store(chops);
+                //     if let Some((r_cid, r_ctree)) = res {
+                //         if r_cid == cid {
+                //             eprintln!("Pulled from waiting!");
+                //             return Some(r_ctree);
+                //         } else {
+                //             eprintln!("add logic here");
+                //             //TODO: insert back given tree
+                //         }
+                //     }
+                // }
             } else {
                 // TODO: we need to reorder these chops somehow
+                hbts.insert(0, b7);
+                hbts.insert(0, b6);
+                hbts.insert(0, b5);
+                hbts.insert(0, b4);
+                hbts.insert(0, b3);
+                hbts.insert(0, b2);
+                hbts.insert(0, b1);
+                hbts.insert(0, b0);
+                eprintln!("TODO: Inserting out of order/incomplete LeafHashes");
                 data.insert(
                     0,
                     ChopData::LeafHashes {
@@ -4559,11 +4593,11 @@ impl ShelfData {
                         content_count: f_cnt_ct,
                         page_nr: f_pg_nr,
                         page_count: f_pg_ct,
-                        data: f_data,
+                        data: Data::new(hbts).unwrap(),
                     },
                 );
-                self.waiting.push(data);
-                return None;
+                // self.waiting.insert(f_hash, data);
+                // return None;
             }
         } else if first.is_data() {
             eprintln!("in store, data {}", data.len() + 1);
@@ -4594,7 +4628,7 @@ impl ShelfData {
                         data: f_data,
                     },
                 );
-                self.waiting.push(data);
+                self.waiting.insert(f_hash, data);
                 return None;
             }
             if our_hash == 0 {
@@ -4608,7 +4642,7 @@ impl ShelfData {
                         data: f_data,
                     },
                 );
-                self.waiting.push(data);
+                self.waiting.insert(f_hash, data);
                 return None;
             }
             //TODO: here we insert
@@ -6222,7 +6256,7 @@ async fn response_task(
         data,
     } = process_result.unwrap();
 
-    println!("Received m_type: {:?} dhash: {}", m_type, data.get_hash());
+    eprintln!("Received m_type: {:?} dhash: {}", m_type, data.get_hash());
     match m_type {
         // SyncMessageType::SetManifest => {
         //     let old_manifest = app_data.get_all_data(0);
@@ -6546,7 +6580,7 @@ async fn response_task(
             eprintln!("SyncMessageType::ExtendData ");
         }
         SyncMessageType::AppendMultipleContents => {
-            eprintln!("AppendMultipleContents");
+            eprintln!("AppendMultipleContents Data len:{}", data.len());
             let mut next_id = app_data.next_c_id().unwrap();
             if !requirements.pre_validate(next_id, &app_data) {
                 eprintln!("PRE validation failed for AppendMultipleContents");
@@ -6565,7 +6599,10 @@ async fn response_task(
                 let mut bts = data.bytes();
                 let no_of_cids_to_add: u16 = bts.len() as u16;
                 if no_of_cids_to_add % 9 != 0 {
-                    eprintln!("Data len mismatch for AppendMultipleContents");
+                    eprintln!(
+                        "Data len mismatch for AppendMultipleContents {}",
+                        no_of_cids_to_add
+                    );
                     return;
                 }
                 if next_id + no_of_cids_to_add - 1 > u16::MAX {
@@ -6720,16 +6757,30 @@ async fn custom_request_task(
     let mut sync_req_iter = sync_requests.into_iter();
     while let Some(req) = sync_req_iter.next() {
         match req {
+            SyncRequest::RootHash => {
+                let root_hash = app_data.root_hash();
+                let sync_response = SyncResponse::RootHash(root_hash);
+                let _ = to_gnome_sender
+                    .send(ToGnome::SendData(
+                        neighbor_id,
+                        NeighborResponse::Custom(
+                            SYNC_RESPONSE,
+                            CastData::new(sync_response.serialize()).unwrap(),
+                        ),
+                    ))
+                    .await;
+            }
             SyncRequest::Datastore => {
                 eprintln!("{} Got SyncRequest::Datastore", swarm_id);
                 // TODO: here we should trigger a separate task for sending
                 // all root hashes to specified Neighbor
                 // let sync_type = 0;
+                let root_hash = app_data.root_hash();
                 let hashes = app_data.all_content_typed_root_hashes();
                 let hashes_len = hashes.len() as u16;
                 for (part_no, group) in hashes.into_iter().enumerate() {
                     let sync_response =
-                        SyncResponse::Datastore(part_no as u16, hashes_len - 1, group);
+                        SyncResponse::Datastore(part_no as u16, hashes_len - 1, root_hash, group);
                     let _ = to_gnome_sender
                         .send(ToGnome::SendData(
                             neighbor_id,
@@ -7049,8 +7100,38 @@ async fn custom_response_task(
             SyncResponse::Partial(is_hash_data, data) => {
                 app_data.update_partial(is_hash_data, data);
             }
-            SyncResponse::Datastore(part_no, total, mut hashes) => {
-                // eprintln!("{} Got SyncResponse::Datastore", swarm_id);
+            SyncResponse::RootHash(root_hash) => {
+                eprintln!(
+                    "RootHash response {} =? {}",
+                    root_hash,
+                    app_data.root_hash()
+                );
+                if app_data.root_hash() == root_hash {
+                    let _prev_dstore_sync = std::mem::replace(datastore_sync, None);
+                    let _ = to_app_mgr_send
+                        .send(ToAppMgr::FromDatastore(
+                            // Requestor::App,
+                            LibResponse::SwarmSynced(swarm_id),
+                        ))
+                        .await;
+                    // return;
+                } else {
+                    // We request Datastore
+                    let _ = to_gnome_sender
+                        .send(ToGnome::AskData(
+                            GnomeId::any(),
+                            None,
+                            NeighborRequest::Custom(
+                                SYNC_REQUEST,
+                                CastData::new(serialize_requests(vec![SyncRequest::Datastore]))
+                                    .unwrap(),
+                            ),
+                        ))
+                        .await;
+                }
+            }
+            SyncResponse::Datastore(part_no, total, root_hash, mut hashes) => {
+                eprintln!("{} Got SyncResponse::Datastore({})", swarm_id, root_hash);
                 let prev_dstore_sync = std::mem::replace(datastore_sync, None);
                 // eprintln!(
                 //     "{} PrevDSync: {:?}",
@@ -7126,6 +7207,8 @@ async fn custom_response_task(
                                         curr_cid,
                                         local_dtype,
                                         local_hash,
+                                        true,
+                                        (0, 64),
                                         &first_pages,
                                     )
                                     .await
@@ -7157,10 +7240,11 @@ async fn custom_response_task(
                                             "Load {:?} CID-{} from disk failed",
                                             swarm_id, curr_cid,
                                         );
+                                        let all_pages = if curr_cid == 0 { true } else { false };
                                         request_content_from_any_neighbor(
                                             curr_cid,
                                             true,
-                                            true,
+                                            all_pages,
                                             None,
                                             to_gnome_sender.clone(),
                                         )
@@ -7206,10 +7290,11 @@ async fn custom_response_task(
                                             curr_cid, _res
                                         );
                                     }
+                                    let all_pages = if curr_cid == 0 { true } else { false };
                                     request_content_from_any_neighbor(
                                         curr_cid,
                                         true,
-                                        true,
+                                        all_pages,
                                         Some(neighbor_id),
                                         to_gnome_sender.clone(),
                                     )
@@ -7234,10 +7319,11 @@ async fn custom_response_task(
                                     curr_cid,
                                     Content::Data(swarm_dtype, 0, ContentTree::Empty(swarm_hash)),
                                 );
+                                let all_pages = if curr_cid == 0 { true } else { false };
                                 request_content_from_any_neighbor(
                                     curr_cid,
                                     true,
-                                    true,
+                                    all_pages,
                                     None,
                                     to_gnome_sender.clone(),
                                 )
@@ -7259,10 +7345,11 @@ async fn custom_response_task(
                                 ContentTree::Empty(swarm_hash),
                             ));
                             //TODO: we do not have this on disk
+                            let all_pages = if curr_cid == 0 { true } else { false };
                             request_content_from_any_neighbor(
                                 curr_cid,
                                 true,
-                                true,
+                                all_pages,
                                 None,
                                 to_gnome_sender.clone(),
                             )
@@ -7650,7 +7737,7 @@ async fn read_data_task(
     //      if not request to sync from any Neighbor
     // send back data in chunks of 64
     if datastore_sync.is_some() {
-        eprintln!("Not synced");
+        eprintln!("{:?} Not synced", swarm_id);
         let _ = to_app_mgr_send
             .send(ToAppMgr::FromDatastore(
                 // requestor,
@@ -7683,10 +7770,10 @@ async fn read_data_task(
     let (d_type, len) = type_and_len_result.unwrap();
     let (t, root_hash) = app_data.content_root_hash(c_id).unwrap();
     eprintln!("Start page: {starting_page},last: {:?}", last_page);
-    let mut read_to_page_incl = if len < starting_page + 64 {
+    let mut read_to_page_incl = if len < starting_page.saturating_add(64) {
         len.saturating_sub(1)
     } else {
-        starting_page + 64
+        starting_page.saturating_add(64)
     };
     if let Some(l_p) = last_page {
         // This is how we ask for last page (maybe in future can be extended to last but Nth page…)
@@ -7702,15 +7789,17 @@ async fn read_data_task(
 
     let get_data_result = if len <= 64 {
         if starting_page == 0 && read_to_page_incl >= len {
-            // eprintln!("get_all_data");
+            eprintln!("get_all_data");
             app_data.get_all_data(c_id)
         } else {
-            // eprintln!("get_data_range {starting_page}-{read_to_page_incl}");
+            eprintln!("get_data_range {starting_page}-{read_to_page_incl}");
             app_data.get_data_range(c_id, starting_page, read_to_page_incl)
         }
     } else {
+        eprintln!("2get_data_range {starting_page}-{read_to_page_incl}");
         app_data.get_data_range(c_id, starting_page, read_to_page_incl)
     };
+    eprintln!("gte_data_result: {:?}", get_data_result);
     if let Ok(mut data_vec) = get_data_result {
         //
         //  we scan data_vec for empty data…
@@ -7723,12 +7812,28 @@ async fn read_data_task(
             }
         }
         if !data_missing.is_empty() {
+            if data_missing.len() == 1 && data_missing[0] == 0 {
+                eprintln!("We should only read first page!");
+            }
             // …and then try to load missing Data either from
             // local storage…
             let disk_path = storage.join(swarm_name.to_path());
-            eprintln!("lcfd 22");
-            if let Some(c_from_store) =
-                load_content_from_disk(disk_path, c_id, d_type, root_hash, &HashMap::new()).await
+            let first_pages = if starting_page == 0 {
+                load_first_pages_from_disk(&disk_path).await
+            } else {
+                HashMap::new()
+            };
+            eprintln!("lcfd 22 TODO: spawn a dedicated async task for it!");
+            if let Some(c_from_store) = load_content_from_disk(
+                disk_path,
+                c_id,
+                d_type,
+                root_hash,
+                false,
+                (data_missing[0], data_missing[data_missing.len() - 1]),
+                &first_pages,
+            )
+            .await
             {
                 let mut data_filled_from_storage = vec![];
                 for d_id in &data_missing {
@@ -8158,13 +8263,82 @@ fn determine_storage_policy(
 // and editable in another.
 
 // yeah, tests... ... ...
+
 #[cfg(test)]
 mod tests {
-    // use super::*;
+    use std::path::PathBuf;
+
+    use crate::storage::StoragePolicy;
+    use crate::ApplicationData;
+
+    use super::ContentID;
+    use super::Data;
+    use super::SyncData;
+    use super::SyncMessage;
+    use super::SyncMessageType;
+    use super::SyncRequirements;
 
     #[test]
-    fn it_works() {
-        // let result = add(2, 2);
-        // assert_eq!(result, 4);
+    fn test_split_merge() {
+        let mut bytes: Vec<u8> = Vec::with_capacity(1024);
+        for i in 0 as u8..=112 {
+            bytes.push(i);
+            bytes.push(8);
+            bytes.push(7);
+            bytes.push(6);
+            bytes.push(5);
+            bytes.push(4);
+            bytes.push(3);
+            bytes.push(2);
+            bytes.push(1);
+        }
+        eprintln!(
+            "Orig len: {}  [{}, {}, {}]",
+            bytes.len(),
+            bytes[0],
+            bytes[1],
+            bytes[2]
+        );
+        let data = Data::new(bytes).unwrap();
+        let orig_len = data.len();
+        let pre: Vec<(ContentID, u64)> = vec![(0, 0)];
+        let post: Vec<(ContentID, u64)> = vec![];
+        let requirements = SyncRequirements { pre, post };
+        let m = SyncMessage {
+            m_type: SyncMessageType::AppendMultipleContents,
+            requirements,
+            data,
+        };
+        let parts = m.into_parts();
+        // let mut idx:Vec<u64>=vec![];
+        // let mut hm:HashMap<u64,Data>=HashMap::new();
+
+        let mut app_data = ApplicationData::new(
+            Some(crate::app_type::AppType::Catalog),
+            PathBuf::new(),
+            false,
+            (StoragePolicy::All, vec![]),
+            false, // heap auto forward
+        );
+
+        let mut m_back: Option<SyncMessage> = None;
+        for p in parts {
+            if let Some(r) = app_data.process(p) {
+                m_back = Some(r);
+                break;
+            }
+        }
+        assert!(m_back.is_some());
+        let m_back = m_back.unwrap();
+        let data_back = m_back.data.bytes();
+        let back_len = data_back.len();
+        eprintln!(
+            "Back len: {}  [{}, {}, {}]",
+            data_back.len(),
+            data_back[0],
+            data_back[1],
+            data_back[2]
+        );
+        assert_eq!(orig_len, back_len);
     }
 }

@@ -7,8 +7,8 @@ use smol::channel as achannel;
 use smol::channel::Sender as ASender;
 use smol::fs::File;
 use smol::io::{AsyncReadExt as ReadExt, BufReader};
+use smol::Timer;
 use std::path::PathBuf;
-use std::thread::sleep;
 use std::time::Duration;
 
 // This is where a Chopper tool will emerge.
@@ -49,7 +49,7 @@ impl Chopper {
     }
 
     pub async fn chop_it(&self, to_app_data: ASender<ToAppData>, cast_id: CastID) -> Vec<Chops> {
-        let max_contents_in_chop = 113;
+        let max_contents_in_chop = 112;
         let mut chop_no: u8 = 0;
         let mut content_no: u8 = 0;
         let mut page_no = 0;
@@ -66,19 +66,35 @@ impl Chopper {
         let mut file = BufReader::new(File::open(self.0.clone()).await.unwrap());
         let mut counter = 0;
         let mut force_hash_conversion = false;
+        let mut optional_msg: Option<Data> = None;
         while !no_more_bytes_to_read {
             if page_no == u16::MAX {
                 // TODO: since we are indexing Data/Pages with u16
                 // ContentTree can store only up to u16::MAX pages.
                 eprintln!("CT full: {}", c_tree.len() == u16::MAX);
                 force_hash_conversion = true;
+
+                // TODO: send SegmentComplete if appropriate
+                let c_vec = vec![
+                    'c' as u8, 'p' as u8, 'l' as u8, 't' as u8, chop_no, content_no,
+                ];
+                let c_data = CastData::new(c_vec).unwrap();
+                let msg = ToAppData::BroadcastSend(cast_id, c_data);
+                let _res = to_app_data.send(msg).await;
             }
             if page_no > 0 && page_no % 128 == 0 || force_hash_conversion {
                 if force_hash_conversion {
                     force_hash_conversion = false;
                     page_no = 0;
                 }
-                eprintln!("c{} page {} % 128 tree: {}", counter, page_no, c_tree.len());
+                eprintln!(
+                    "C-C: {}-{}, #: {}, page: {}, tree: {}",
+                    chop_no,
+                    content_no,
+                    counter,
+                    page_no,
+                    c_tree.len()
+                );
                 counter += 1;
                 // We have 1024 bytes in hash_container,
                 // let's build a Data block of it.
@@ -88,13 +104,16 @@ impl Chopper {
                 ))
                 .unwrap();
                 c_leaf_hashes.push(hdta);
-                eprintln!("c_leaf_hashes size: {}", c_leaf_hashes.len());
+                // eprintln!("c_leaf_hashes size: {}", c_leaf_hashes.len());
                 if c_leaf_hashes.len() == 512 {
-                    eprintln!("CID is full");
                     // TODO: CID is full
                     let root_hash = c_tree.hash().to_be_bytes();
                     c_no_hash_pair_container.push(content_no);
                     c_no_hash_pair_container.extend(root_hash);
+                    eprintln!(
+                        "CID is full (building data from {} bytes)",
+                        c_no_hash_pair_container.len()
+                    );
 
                     // eprintln!("push -1: {} {}", leaf_hashes.len(), leaf_hashes[0].len());
                     if let Some(llh) = leaf_hashes.pop() {
@@ -112,14 +131,22 @@ impl Chopper {
                     c_tree = ContentTree::Empty(0);
                     page_no = 0;
                     if content_no > 0 && content_no % max_contents_in_chop == 0 {
+                        content_no = 0;
                         chop_no += 1;
                         // TODO: here we need to construct a Chop result and add
                         // it to output.
-                        let root_hashes = Data::new(std::mem::replace(
+                        eprintln!(
+                            "c_no_hash_pair_container size: {}",
+                            c_no_hash_pair_container.len()
+                        );
+                        let root_hashes_res = Data::new(std::mem::replace(
                             &mut c_no_hash_pair_container,
                             Vec::with_capacity(1024),
-                        ))
-                        .unwrap();
+                        ));
+                        if root_hashes_res.is_err() {
+                            panic!("Something went wrong: {:?}", root_hashes_res.err().unwrap());
+                        }
+                        let root_hashes = root_hashes_res.unwrap();
                         let chops = Chops {
                             root_hashes,
                             leaf_hashes: std::mem::replace(&mut leaf_hashes, vec![]),
@@ -130,12 +157,13 @@ impl Chopper {
                         //     chops.leaf_hashes[0].len()
                         // );
                         output.push(chops);
+                    } else {
+                        content_no += 1;
                     }
-                    content_no += 1;
                 }
             }
             let dta = if page_no == 0 {
-                eprintln!("crtee : {}", c_tree.len());
+                // eprintln!("crtee : {}", c_tree.len());
                 // we are starting a new CID, so first we have to place
                 // a text-based manifest page into it, so that we always know
                 // what we are dealing with.
@@ -143,10 +171,15 @@ impl Chopper {
                 // index_discount += 1;
 
                 let mut bts = format!("{:?} {}-{}", self.0, chop_no, content_no).into_bytes();
-                for _i in 0..bts.len().saturating_sub(1024) {
+                // TODO: check how many bytes can this header have
+                for _i in 0..bts.len().saturating_sub(255) {
                     eprintln!("drop a byte");
                     bts.remove(0);
                 }
+                let [l0, l1] = (bts.len() as u16).to_be_bytes();
+                bts.insert(0, l1);
+                bts.insert(0, l0);
+                bts.insert(0, 0);
                 Data::new(bts).unwrap()
             } else {
                 let mut buffer: [u8; 1024] = [0; 1024];
@@ -180,7 +213,8 @@ impl Chopper {
             let c_data = CastData::new(c_vec).unwrap();
             let msg = ToAppData::BroadcastSend(cast_id, c_data);
             let _res = to_app_data.send(msg).await;
-            sleep(Duration::from_micros(100));
+            Timer::after(Duration::from_micros(200)).await;
+            // sleep(Duration::from_micros(200));
             if _res.is_err() {
                 eprintln!("BCSR: {:?}", _res.err().unwrap());
             }
@@ -200,6 +234,13 @@ impl Chopper {
                 break;
             }
         }
+        // Send a notification via BCast, that given segment is complete
+        let c_vec = vec![
+            'c' as u8, 'p' as u8, 'l' as u8, 't' as u8, chop_no, content_no,
+        ];
+        let c_data = CastData::new(c_vec).unwrap();
+        let msg = ToAppData::BroadcastSend(cast_id, c_data);
+        let _res = to_app_data.send(msg).await;
 
         // TODO: include remainder hashes
         if !hash_container.is_empty() {
@@ -261,6 +302,10 @@ pub enum ChopData {
         content_nr: u8,
         page_nr: u16,
         data: Data,
+    },
+    SegmentComplete {
+        chop_nr: u8,
+        content_nr: u8,
     },
 }
 impl ChopData {
@@ -329,6 +374,20 @@ impl ChopData {
             Some(data.get_hash())
         } else {
             None
+        }
+    }
+    pub fn is_seg_complete(&self) -> bool {
+        matches!(self, ChopData::SegmentComplete { .. })
+    }
+    pub fn unpack_seg_complete(self) -> Result<(u8, u8), ChopData> {
+        if let ChopData::SegmentComplete {
+            chop_nr,
+            content_nr,
+        } = self
+        {
+            return Ok((chop_nr, content_nr));
+        } else {
+            return Err(self);
         }
     }
 }
@@ -420,6 +479,14 @@ pub fn extract_chop_data(cast_data: CastData) -> Result<ChopData, CastData> {
             page_nr: u16::from_be_bytes([p0, p1]),
             data: Data::new(bytes).unwrap(),
         })
+    } else if b1 == 'c' as u8 && b2 == 'p' as u8 && b3 == 'l' as u8 && b4 == 't' as u8 {
+        // TODO
+        let chop_nr = bytes.remove(0);
+        let content_nr = bytes.remove(0);
+        Ok(ChopData::SegmentComplete {
+            chop_nr,
+            content_nr,
+        })
     } else {
         let mut orig_vec = vec![b1, b2, b3, b4];
         orig_vec.append(&mut bytes);
@@ -437,11 +504,7 @@ pub async fn chopping_task(
 ) {
     eprintln!("chopping_task {:?}", filepath);
     let chopper = Chopper::new(filepath).unwrap();
-    // Chopper::new(PathBuf::new().join("/home/dxtr/Downloads/testfile")).unwrap();
-    // Chopper::new(PathBuf::new().join("/home/dxtr/Downloads/README.md")).unwrap();
-    // Chopper::new(PathBuf::new().join("/home/dxtr/Downloads/pompka.mp4")).unwrap();
-    // Chopper::new(PathBuf::new().join("/home/dxtr/Downloads/Mira-latest.AppImage")).unwrap();
-    // TODO: Test it out with a file that is at least 7.3 GB large
+    // TODO: Test it out with a file that is at least 6.5 GB large
     //       (after everything is moved to separate async tasks).
     eprint!("Now we apply chop_it(ASender):");
     // let (send, _recv) = unbounded();
@@ -477,7 +540,7 @@ pub async fn chopping_task(
     let mut leaf_hashes: Vec<Vec<Vec<Data>>> = vec![];
     while !chops.is_empty() {
         let chop = chops.remove(0);
-        eprintln!(" push it real good {}", chop.root_hashes.len());
+        // eprintln!(" push it real good {}", chop.root_hashes.len());
         root_hashes.push(chop.root_hashes);
         leaf_hashes.push(chop.leaf_hashes);
     }
@@ -509,7 +572,7 @@ pub async fn chopping_task(
         for (content_no, cnt_hash) in chop_hsh.into_iter().enumerate() {
             let page_count = (cnt_hash.len() - 1) as u16;
             for (page_no, bottom_hashes) in cnt_hash.into_iter().enumerate() {
-                eprint!("CH{} C{} P{}    ", chop_no, content_no, page_no);
+                // eprint!("CH{} C{} P{}    ", chop_no, content_no, page_no);
                 let [p0, p1] = (page_no as u16).to_be_bytes();
                 let [pc0, pc1] = page_count.to_be_bytes();
                 let [l0, l1] = (bottom_hashes.len() as u16).to_be_bytes();
@@ -533,7 +596,11 @@ pub async fn chopping_task(
                 let h_data = CastData::new(h_vec).unwrap();
                 let msg = ToAppData::BroadcastSend(hash_cast_id, h_data);
                 let _res = to_app_data.send(msg).await;
-                eprintln!("Bottom hashes sent?: {}", _res.is_ok())
+                Timer::after(Duration::from_millis(80)).await;
+                // sleep(Duration::from_micros(200));
+                if !_res.is_ok() {
+                    eprintln!("Failed sending bottom hashes: {:?}", _res.err().unwrap());
+                }
             }
         }
     }
