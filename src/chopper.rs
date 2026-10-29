@@ -48,7 +48,7 @@ impl Chopper {
         }
     }
 
-    pub async fn chop_it(&self, to_app_data: ASender<ToAppData>, cast_id: CastID) -> Vec<Chops> {
+    pub async fn chop_it(&self, to_app_data: ASender<CastData>) -> Vec<Chops> {
         let max_contents_in_chop = 112;
         let mut chop_no: u8 = 0;
         let mut content_no: u8 = 0;
@@ -78,9 +78,10 @@ impl Chopper {
                 let c_vec = vec![
                     'c' as u8, 'p' as u8, 'l' as u8, 't' as u8, chop_no, content_no,
                 ];
+                // TODO: rework this to enable
                 let c_data = CastData::new(c_vec).unwrap();
-                let msg = ToAppData::BroadcastSend(cast_id, c_data);
-                let _res = to_app_data.send(msg).await;
+                // let msg = ToAppData::BroadcastSend(cast_id, c_data);
+                let _res = to_app_data.send(c_data).await;
             }
             if page_no > 0 && page_no % 128 == 0 || force_hash_conversion {
                 if force_hash_conversion {
@@ -211,8 +212,8 @@ impl Chopper {
             ];
             c_vec.append(&mut dta.bytes());
             let c_data = CastData::new(c_vec).unwrap();
-            let msg = ToAppData::BroadcastSend(cast_id, c_data);
-            let _res = to_app_data.send(msg).await;
+            // let msg = ToAppData::BroadcastSend(cast_id, c_data);
+            let _res = to_app_data.send(c_data).await;
             Timer::after(Duration::from_micros(200)).await;
             // sleep(Duration::from_micros(200));
             if _res.is_err() {
@@ -239,8 +240,8 @@ impl Chopper {
             'c' as u8, 'p' as u8, 'l' as u8, 't' as u8, chop_no, content_no,
         ];
         let c_data = CastData::new(c_vec).unwrap();
-        let msg = ToAppData::BroadcastSend(cast_id, c_data);
-        let _res = to_app_data.send(msg).await;
+        // let msg = ToAppData::BroadcastSend(cast_id, c_data);
+        let _res = to_app_data.send(c_data).await;
 
         // TODO: include remainder hashes
         if !hash_container.is_empty() {
@@ -498,7 +499,9 @@ pub async fn chopping_task(
     swarm_id: SwarmID,
     filepath: PathBuf,
     to_app_mgr: achannel::Sender<ToAppMgr>,
-    to_app_data: achannel::Sender<ToAppData>,
+    // to_app_data: achannel::Sender<ToAppData>,
+    data_sender: achannel::Sender<CastData>,
+    hash_sender: achannel::Sender<CastData>,
     data_cast_id: CastID,
     hash_cast_id: CastID,
 ) {
@@ -510,7 +513,7 @@ pub async fn chopping_task(
     // let (send, _recv) = unbounded();
 
     // TODO: Reading from file should also be done from a separate task.
-    let mut chops = chopper.chop_it(to_app_data.clone(), data_cast_id).await;
+    let mut chops = chopper.chop_it(data_sender.clone()).await;
     // TODO: handle resulting chops: put root_hashes in SyncMultipleContents.
     // TODO: decide what to do with leaf hashes - maybe we should send
     //       them in a separate BCast?
@@ -594,9 +597,10 @@ pub async fn chopping_task(
                 ];
                 h_vec.append(&mut bottom_hashes.bytes());
                 let h_data = CastData::new(h_vec).unwrap();
-                let msg = ToAppData::BroadcastSend(hash_cast_id, h_data);
-                let _res = to_app_data.send(msg).await;
+                // let msg = ToAppData::BroadcastSend(hash_cast_id, h_data);
+                let _res = hash_sender.send(h_data).await;
                 Timer::after(Duration::from_millis(80)).await;
+                eprintln!("ChopHash sent: {:?}", _res.is_ok());
                 // sleep(Duration::from_micros(200));
                 if !_res.is_ok() {
                     eprintln!("Failed sending bottom hashes: {:?}", _res.err().unwrap());
@@ -604,6 +608,12 @@ pub async fn chopping_task(
             }
         }
     }
+    // TODO: rework this quick fix for last hash batch getting stuck,
+    // since it probably only works for small files
+    let c_vec = vec!['c' as u8, 'p' as u8, 'l' as u8, 't' as u8, 255, 255];
+    let c_data = CastData::new(c_vec).unwrap();
+    // let msg = ToAppData::BroadcastSend(hash_cast_id, c_data);
+    let _res = hash_sender.send(c_data).await;
     eprintln!("out of nest");
     // TODO: start a broadcasting channel and push file Data there
     //       (preferably as a separate async task)

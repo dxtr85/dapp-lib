@@ -1,3 +1,4 @@
+use crate::chopcast::handle_chopcast;
 use crate::chopper::chopping_task;
 use crate::chopper::ChopData;
 use crate::content::data_to_link;
@@ -17,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 mod app_type;
+mod chopcast;
 mod chopper;
 mod config;
 mod content;
@@ -33,6 +35,7 @@ mod sync_message;
 use app_type::AppType;
 // use async_std::fs::create_dir_all;
 use smol::fs::create_dir_all;
+use smol::spawn;
 // use async_std::path::PathBuf;
 // use async_std::task::yield_now;
 use message::ChangeContentOperation;
@@ -270,8 +273,16 @@ pub enum LibRequest {
     PopHeap(SwarmID),
     NewStoragePolicy(Vec<(StorageCondition, StoragePolicy)>),
     SetPinned(SwarmID, bool),
-    ChopFile(SwarmID, PathBuf, CastID, CastID),
+    ChopFile(
+        SwarmID,
+        PathBuf,
+        ASender<CastData>,
+        ASender<CastData>,
+        CastID,
+        CastID,
+    ),
     StoreChopData(SwarmID, Vec<ChopData>),
+    HandleChopCast(SwarmID, AReceiver<CastData>),
 }
 #[derive(Debug)]
 pub enum LibResponse {
@@ -375,6 +386,7 @@ pub enum ToAppData {
     PolicyNotMetRcfg(u8, SyncData),
     SetStoragePolicy(PathBuf, StoragePolicy, Vec<u16>),
     StoreChopData(Vec<ChopData>),
+    HandleChopCast(AReceiver<CastData>),
     Terminate,
 }
 struct PartialHashes {
@@ -959,6 +971,11 @@ async fn serve_app_manager<'a>(
                     //TODO: find proper recipient & send
                     if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
                         let _ = sender.send(ToAppData::StoreChopData(ch_data)).await;
+                    }
+                }
+                ToAppMgr::FromApp(LibRequest::HandleChopCast(s_id, recv)) => {
+                    if let Some(sender) = app_mgr.app_data_store.get(&s_id) {
+                        let _ = sender.send(ToAppData::HandleChopCast(recv)).await;
                     }
                 }
                 ToAppMgr::FromDatastore(LibResponse::HeapData(s_id, app_msg, signed_by)) => {
@@ -2553,7 +2570,14 @@ async fn serve_app_manager<'a>(
                             .await;
                     }
                 }
-                ToAppMgr::FromApp(LibRequest::ChopFile(s_id, p_buf, d_cast_id, h_cast_id)) => {
+                ToAppMgr::FromApp(LibRequest::ChopFile(
+                    s_id,
+                    p_buf,
+                    d_cast,
+                    h_cast,
+                    d_cast_id,
+                    h_cast_id,
+                )) => {
                     // TODO
                     let to_d_store = app_mgr.app_data_store.get(&s_id).unwrap();
                     executor
@@ -2561,7 +2585,9 @@ async fn serve_app_manager<'a>(
                             s_id,
                             p_buf,
                             app_mgr.to_app_mgr.clone(),
-                            to_d_store.clone(),
+                            // to_d_store.clone(),
+                            d_cast,
+                            h_cast,
                             d_cast_id,
                             h_cast_id,
                         ))
@@ -3662,6 +3688,11 @@ async fn serve_app_data<'a>(
                     }
                 }
             }
+            ToAppData::HandleChopCast(recv) => {
+                _executor
+                    .spawn(handle_chopcast(recv, app_data_send.clone()))
+                    .detach();
+            }
             ToAppData::Terminate => {
                 eprintln!("AppData: Terminate");
                 // TODO: determine whether or not we want to store this Swarm on disk
@@ -4432,6 +4463,7 @@ impl ShelfData {
         }
         // self.waiting
         if self.mapping.contains_key(&root_hash) {
+            eprintln!("Mapping has key!");
             // TODO: return CTree
             let (_cid_o, c_tree, pg_missing) = self.mapping.remove(&root_hash).unwrap();
             // if pg_missing > 0 {
@@ -4445,6 +4477,7 @@ impl ShelfData {
             // }
             // return Some(c_tree);
         } else {
+            eprintln!("Adding new key to mapping");
             let _ = self.mapping.insert(
                 root_hash,
                 (Some(cid), ContentTree::Empty(root_hash), u16::MAX),
@@ -4610,10 +4643,10 @@ impl ShelfData {
                 eprintln!("Lookup {:?}: {:?}", k, v);
             }
             if let Some(p_vec) = self.lookup.get(&(ch_nr, cnt_nr)) {
-                eprintln!("found it!");
                 for (ct_hash, fst_hash) in p_vec {
                     if *fst_hash == f_hash {
                         our_hash = *ct_hash;
+                        eprintln!("found it!");
                         break;
                     }
                 }
@@ -4632,7 +4665,7 @@ impl ShelfData {
                 return None;
             }
             if our_hash == 0 {
-                eprintln!("hash 0");
+                eprintln!("not found: hash 0");
                 data.insert(
                     0,
                     ChopData::LeafData {
@@ -4657,30 +4690,53 @@ impl ShelfData {
             } else {
                 eprintln!("PG0  New hash: {} != {} old one", f_hash, f_hsh);
             }
+            eprintln!("{:?} Tree len: {}", cid_opt, c_tree.len());
             while !data.is_empty() {
                 // We can pop data, since it is indexed anyway
                 let cp_data = data.pop().unwrap();
                 let (_ch_nr, _cnt_nr, pg_nr, p_data) = cp_data.unpack_data().unwrap();
-                let e_hsh = c_tree.get_data_hash(pg_nr).unwrap(); //{
-                let new_hash = p_data.get_hash();
-                if e_hsh == new_hash {
-                    if let Ok(old_p) = c_tree.replace(pg_nr, p_data) {
-                        if old_p.is_empty() {
-                            *pg_missing -= 1;
-                            if *pg_missing % 1024 == 0 {
-                                eprintln!("still missing: {}", pg_missing);
+                if let Ok(e_hsh) = c_tree.get_data_hash(pg_nr) {
+                    let new_hash = p_data.get_hash();
+                    if e_hsh == new_hash {
+                        if let Ok(old_p) = c_tree.replace(pg_nr, p_data) {
+                            if old_p.is_empty() {
+                                *pg_missing -= 1;
+                                if *pg_missing % 1024 == 0 {
+                                    eprintln!("still missing: {}", pg_missing);
+                                }
                             }
                         }
+                    } else {
+                        eprintln!("PG#:{}   New hash: {} != {} old one", pg_nr, f_hash, f_hsh);
                     }
                 } else {
-                    eprintln!("PG#:{}   New hash: {} != {} old one", pg_nr, f_hash, f_hsh);
+                    eprintln!(
+                        "ERROR: unable to get pg hash: {}, ctree len: {}",
+                        pg_nr,
+                        c_tree.len()
+                    );
                 }
             }
             if cid_opt.is_some() {
                 if *pg_missing == 0 {
                     let (co, ct, _ct_len) = self.mapping.remove(&our_hash).unwrap();
+                    // TODO: remove from lookup
+                    if let Some(mut p_vec) = self.lookup.remove(&(ch_nr, cnt_nr)) {
+                        for _i in 0..p_vec.len() {
+                            let (rh, fh) = p_vec.remove(0);
+                            if rh == our_hash {
+                                eprintln!("dropped from lookup");
+                                break;
+                            }
+                            p_vec.push((fh, rh));
+                        }
+                    } else {
+                        eprintln!("Lookup search failed");
+                    }
                     let c = co.unwrap();
                     return Some((c, ct));
+                } else {
+                    eprintln!("But still {} PG missing", pg_missing);
                 }
             }
         } else {
